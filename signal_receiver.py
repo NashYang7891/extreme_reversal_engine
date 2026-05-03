@@ -25,7 +25,7 @@ def place_order(symbol, side, price, amount="0.01"):
     # TODO: 接入OKX API
 
 def main():
-    proc = subprocess.Popen(["./engine"], stdout=subprocess.PIPE, text=True)
+    proc = subprocess.Popen(["./build/engine"], stdout=subprocess.PIPE, text=True)
     send_tg("🤖 多币种极端反转引擎已启动")
     last_signal = {}
     for line in proc.stdout:
