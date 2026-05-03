@@ -7,7 +7,7 @@ import ccxt
 load_dotenv()
 API_KEY = os.getenv("BINANCE_API_KEY")
 SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
-TG_TOKEN = os.getenv("TG_BOT_TOKEN")   # 从 .env 读取
+TG_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHAT = "5372217316"
 
 exchange = ccxt.binance({
@@ -21,9 +21,7 @@ LEVERAGE = 3
 ORDER_USDT = 10.0
 
 def send_tg(msg):
-    if not TG_TOKEN:
-        print("TG_TOKEN 缺失")
-        return
+    if not TG_TOKEN: return
     try:
         import requests
         requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
@@ -45,23 +43,23 @@ def place_order(symbol, side, price):
         print(f"❌ 无效方向: {side}")
         return None
     try:
-        if not exchange.markets:
-            exchange.load_markets()
+        if not exchange.markets: exchange.load_markets()
         market = exchange.market(symbol)
-        amount = ORDER_USDT / price
+        ticker = exchange.fetch_ticker(symbol)
+        bid = ticker['bid'] if ticker['bid'] else price
+        ask = ticker['ask'] if ticker['ask'] else price
+        if side == 'buy':   order_price = min(price, ask * 1.0005)
+        else:               order_price = max(price, bid * 0.9995)
+        order_price = exchange.price_to_precision(symbol, order_price)
+        amount = ORDER_USDT / float(order_price)
         amount = exchange.amount_to_precision(symbol, amount)
-        price_str = exchange.price_to_precision(symbol, price)
         exchange.set_leverage(LEVERAGE, symbol)
         exchange.set_margin_mode('isolated', symbol)
         order = exchange.create_order(
-            symbol=symbol,
-            type='limit',
-            side=side,
-            amount=amount,
-            price=price_str,
+            symbol=symbol, type='limit', side=side, amount=amount, price=order_price,
             params={'timeInForce': 'GTX', 'postOnly': True}
         )
-        print(f"✅ 下单成功: {symbol} {side} @ {price_str} Qty:{amount}")
+        print(f"✅ 下单成功: {symbol} {side} @ {order_price} (推导:{price}) Qty:{amount}")
         return order
     except Exception as e:
         print(f"❌ 下单失败 {symbol}: {e}")
@@ -70,59 +68,47 @@ def place_order(symbol, side, price):
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     engine_path = os.path.join(script_dir, "build", "engine")
-    if not os.path.exists(engine_path):
-        print("engine 未编译，请先执行 cmake && make")
-        sys.exit(1)
-
+    if not os.path.exists(engine_path): sys.exit("engine 未编译")
     try:
         exchange.load_markets()
         print("✅ 市场数据已加载")
     except Exception as e:
-        print(f"⚠️ 加载市场数据失败: {e}")
+        print(f"⚠️ 市场加载失败: {e}")
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True)
-    send_tg("🤖 币安极端反转引擎已启动 (最终版)")
-    last_b_signal = {}      # 10分钟冷却
-    last_a_push = {}        # 5分钟去重
+    send_tg("🤖 币安极端反转引擎已启动 (带止盈止损)")
+    last_b_signal = {}      # 10 分钟冷却
+    last_a_push = {}        # 5 分钟去重
 
     for line in proc.stdout:
         line = line.strip()
         if not line: continue
-        try:
-            msg = json.loads(line)
-        except json.JSONDecodeError:
-            print("C++:", line)
-            continue
+        try: msg = json.loads(line)
+        except: print("C++:", line); continue
 
-        msg_type = msg.get("type", "")
+        t = msg.get("type", "")
         sym = msg.get("symbol", "")
 
-        if msg_type == "A_ACTIVE":
+        if t == "A_ACTIVE":
             now = time.time()
-            if sym in last_a_push and now - last_a_push[sym] < 300:
-                continue
-            price = msg.get("price", 0)
-            change = msg.get("change_pct", 0)
-            vol_ratio = msg.get("vol_ratio", 0)
-            dev = msg.get("dev", None)
-            dev_str = f" | 偏离度:{dev:.1f}" if dev is not None else ""
-            tg_text = f"🔥 {sym} 异动 | 价:{price:.4f} | 3m涨跌:{change:+.2f}% | 量比:{vol_ratio:.1f}x{dev_str}"
-            send_tg(tg_text)
+            if sym in last_a_push and now - last_a_push[sym] < 300: continue
+            price = msg.get("price",0); change = msg.get("change_pct",0)
+            vol_r = msg.get("vol_ratio",0); dev = msg.get("dev", None)
+            d = f" | 偏离度:{dev:.1f}" if dev is not None else ""
+            send_tg(f"🔥 {sym} 异动 | 价:{price:.4f} | 3m涨跌:{change:+.2f}% | 量比:{vol_r:.1f}x{d}")
             last_a_push[sym] = now
 
-        elif msg_type == "SIGNAL":
-            side = msg.get("side", "")
-            price = msg.get("price", 0)
-            score = msg.get("score", 0)
+        elif t == "SIGNAL":
+            side = msg.get("side",""); price = msg.get("price",0)
+            score = msg.get("score",0); stop = msg.get("stop_loss",0); profit = msg.get("take_profit",0)
             now = time.time()
-            if sym in last_b_signal and now - last_b_signal[sym] < 600:
-                print(f"⏰ {sym} B信号冷却中")
-                continue
-            if is_quiet_period():
-                print("🔇 静默期，跳过B信号")
-                continue
-            tg_text = f"🎯 {side.upper()} {sym} @ {price:.6f} 评分:{score:.1f}"
-            send_tg(tg_text)
+            if sym in last_b_signal and now - last_b_signal[sym] < 600: continue
+            if is_quiet_period(): continue
+            tg_msg = (
+                f"🎯 {side.upper()} {sym} @ {price:.6f} 评分:{score:.1f}\n"
+                f"🛑 止损: {stop:.6f} | 🎯 止盈: {profit:.6f}"
+            )
+            send_tg(tg_msg)
             place_order(sym, side, price)
             last_b_signal[sym] = now
 
