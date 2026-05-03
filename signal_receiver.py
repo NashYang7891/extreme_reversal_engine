@@ -7,8 +7,7 @@ import ccxt
 load_dotenv()
 API_KEY = os.getenv("BINANCE_API_KEY")
 SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
-
-TG_TOKEN = "8722422674:AAGrKmRurQ2G__j-Vxbh5451v0e9_u97CQY"
+TG_TOKEN = os.getenv("TG_BOT_TOKEN")   # 从 .env 读取
 TG_CHAT = "5372217316"
 
 exchange = ccxt.binance({
@@ -22,6 +21,9 @@ LEVERAGE = 3
 ORDER_USDT = 10.0
 
 def send_tg(msg):
+    if not TG_TOKEN:
+        print("TG_TOKEN 缺失")
+        return
     try:
         import requests
         requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
@@ -38,6 +40,10 @@ def is_quiet_period():
     return False
 
 def place_order(symbol, side, price):
+    side = side.lower()
+    if side not in ('buy', 'sell'):
+        print(f"❌ 无效方向: {side}")
+        return None
     try:
         if not exchange.markets:
             exchange.load_markets()
@@ -50,7 +56,7 @@ def place_order(symbol, side, price):
         order = exchange.create_order(
             symbol=symbol,
             type='limit',
-            side=side.lower(),
+            side=side,
             amount=amount,
             price=price_str,
             params={'timeInForce': 'GTX', 'postOnly': True}
@@ -75,9 +81,9 @@ def main():
         print(f"⚠️ 加载市场数据失败: {e}")
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True)
-    send_tg("🤖 币安极端反转引擎已启动 (动态参数)")
-    last_b_signal = {}      # B层冷却10分钟
-    last_a_push = {}        # A层5分钟去重
+    send_tg("🤖 币安极端反转引擎已启动 (最终版)")
+    last_b_signal = {}      # 10分钟冷却
+    last_a_push = {}        # 5分钟去重
 
     for line in proc.stdout:
         line = line.strip()
@@ -109,7 +115,6 @@ def main():
             price = msg.get("price", 0)
             score = msg.get("score", 0)
             now = time.time()
-            # 冷却缩短为 10 分钟 (600 秒)
             if sym in last_b_signal and now - last_b_signal[sym] < 600:
                 print(f"⏰ {sym} B信号冷却中")
                 continue
