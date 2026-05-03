@@ -75,8 +75,8 @@ def main():
         print(f"⚠️ 加载市场数据失败: {e}")
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True)
-    send_tg("🤖 币安极端反转引擎已启动 (调试版)")
-    last_b_signal = {}
+    send_tg("🤖 币安极端反转引擎已启动 (动态参数)")
+    last_b_signal = {}      # B层冷却10分钟
     last_a_push = {}        # A层5分钟去重
 
     for line in proc.stdout:
@@ -109,7 +109,8 @@ def main():
             price = msg.get("price", 0)
             score = msg.get("score", 0)
             now = time.time()
-            if sym in last_b_signal and now - last_b_signal[sym] < 3600:
+            # 冷却缩短为 10 分钟 (600 秒)
+            if sym in last_b_signal and now - last_b_signal[sym] < 600:
                 print(f"⏰ {sym} B信号冷却中")
                 continue
             if is_quiet_period():

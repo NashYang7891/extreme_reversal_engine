@@ -36,22 +36,28 @@ bool SignalDetector::check_momentum_decay(const std::string& side) {
     const auto& prices = ind_.prices();
     if (prices.size() < 6) return false;
 
+    // 最近两笔的速度和加速度
     double v0 = prices.back() - prices[prices.size()-2];
     double v1 = prices[prices.size()-2] - prices[prices.size()-3];
     double accel = v0 - v1;
 
     if (side == "LONG") {
+        // 下跌衰竭：当前价格已从低点回升（或加速度开始向上）
+        // 只要价格比15秒前高，或者加速度>0即认为衰竭开始
+        bool price_rising = prices.back() > prices[prices.size()-3];
         bool is_low = true;
         double cur = prices.back();
         for (size_t i = prices.size()-5; i < prices.size()-1; ++i)
             if (prices[i] < cur) { is_low = false; break; }
-        return accel > 0 && is_low;
+        return (accel > 0 || price_rising) && is_low;
     } else {
+        // 上涨衰竭：价格从高点回落，或加速度<0
+        bool price_falling = prices.back() < prices[prices.size()-3];
         bool is_high = true;
         double cur = prices.back();
         for (size_t i = prices.size()-5; i < prices.size()-1; ++i)
             if (prices[i] > cur) { is_high = false; break; }
-        return accel < 0 && is_high;
+        return (accel < 0 || price_falling) && is_high;
     }
 }
 
@@ -66,22 +72,31 @@ Signal SignalDetector::check(const OrderBook& ob) {
 
     double dev = (ema20 - price) / atr;
     double osc = ind_.composite_oscillator(ml_.get_w_rsi(), ml_.get_w_kdj(), ml_.get_w_cci());
-    double wall = ob.imbalance();
+    double wall_raw = ob.imbalance();
 
-    constexpr double LONG_DEV_THRESH  = 2.2;
-    constexpr double LONG_OSC_MAX     = 0.30;
-    constexpr double LONG_WALL_MIN    = 0.65;
-    constexpr double SHORT_DEV_THRESH = 2.2;
-    constexpr double SHORT_OSC_MIN    = 0.70;
-    constexpr double SHORT_WALL_MAX   = 0.35;
+    // 数据异常修正：当挂单壁为0或1时，视为数据缺失，使用中性值0.5
+    double wall = wall_raw;
+    if (wall_raw <= 0.001 || wall_raw >= 0.999) {
+        wall = 0.5;
+        spdlog::debug("wall异常值 {} 已修正为0.5", wall_raw);
+    }
+
+    // 低波动背景下适度放宽的阈值
+    constexpr double LONG_DEV_THRESH  = 1.9;   // 原 2.2
+    constexpr double LONG_OSC_MAX     = 0.35;  // 原 0.30
+    constexpr double LONG_WALL_MIN    = 0.6;   // 原 0.65
+    constexpr double SHORT_DEV_THRESH = 1.9;
+    constexpr double SHORT_OSC_MIN    = 0.65;  // 原 0.70
+    constexpr double SHORT_WALL_MAX   = 0.4;   // 原 0.35
 
     bool decay_long = check_momentum_decay("LONG");
     bool decay_short = check_momentum_decay("SHORT");
 
+    // 调试日志（每100次输出一次）
     static int log_cnt = 0;
     if (++log_cnt % 100 == 0) {
-        spdlog::info("B层检查: dev={:.2f} osc={:.2f} wall={:.2f} decay_long={} decay_short={}",
-                     dev, osc, wall, decay_long, decay_short);
+        spdlog::info("B层检查: dev={:.2f} osc={:.2f} wall_raw={:.2f} wall={:.2f} decay_long={} decay_short={}",
+                     dev, osc, wall_raw, wall, decay_long, decay_short);
     }
 
     if (dev > LONG_DEV_THRESH && osc < LONG_OSC_MAX && wall > LONG_WALL_MIN && decay_long) {

@@ -14,5 +14,5 @@ private:
     Indicators& ind_;
     double solve_critical_price(const OrderBook& ob, const std::string& side);
     double objective(const OrderBook& ob, double price, const std::string& side);
-    bool check_momentum_decay(const std::string& side);  // 加速度过零
+    bool check_momentum_decay(const std::string& side);
 };
