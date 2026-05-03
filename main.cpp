@@ -98,25 +98,21 @@ struct SymbolContext {
     Indicators indicators;
     MLOptimizer ml{3};
     SignalDetector detector{ml, indicators};
-    std::atomic<int64_t> last_active_time{0};  // 毫秒级时间戳，用于活跃标签
+    std::atomic<int64_t> last_active_time{0};   // 毫秒级时间戳
 };
 
 std::map<std::string, SymbolContext> contexts;
 std::shared_mutex contexts_mutex;
-std::map<std::string, int64_t> active_labels;  // 需在锁内使用
-const int64_t ACTIVE_VALID_MS = 15 * 60 * 1000; // 15分钟
 
-// ---------- A层：放宽的异动探测器 ----------
+// A层异动探测器 (放宽)
 bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, double& out_vol_ratio) {
     double change_3m = ind.price_change_pct(3 * 60);
-    if (std::abs(change_3m) < 0.012) return false;   // 1.2% 门槛
-
+    if (std::abs(change_3m) < 0.012) return false;    // 1.2% 门槛
     double recent_vol = ob.recent_volume(3 * 60 * 1000);
     double avg_vol = ind.get_volume_ema();
     if (avg_vol <= 0) return false;
     double vol_ratio = recent_vol / avg_vol;
-    if (vol_ratio < 1.5) return false;               // 1.5倍量
-
+    if (vol_ratio < 1.5) return false;                 // 1.5倍量
     ind.update_volume(recent_vol);
     out_change = change_3m;
     out_vol_ratio = vol_ratio;
@@ -198,8 +194,7 @@ void run_detection() {
                     double change_pct = 0.0, vol_ratio = 0.0;
                     // ---- A层 ----
                     if (active_layer(ctx.orderbook, ctx.indicators, change_pct, vol_ratio)) {
-                        ctx.last_active_time = now_ms;
-                        active_labels[sym] = now_ms;
+                        ctx.last_active_time = now_ms;   // atomic 存储
                         json a_msg;
                         a_msg["type"] = "A_ACTIVE";
                         a_msg["symbol"] = sym;
@@ -210,9 +205,9 @@ void run_detection() {
                         std::cout << a_msg.dump() << std::endl;
                     }
 
-                    // ---- B层：只在活跃标签未过期时执行 ----
+                    // ---- B层：仅在活跃标签未过期时执行 ----
                     int64_t last_active = ctx.last_active_time.load();
-                    if (last_active > 0 && (now_ms - last_active) < ACTIVE_VALID_MS) {
+                    if (last_active > 0 && (now_ms - last_active) < 15 * 60 * 1000) {
                         auto sig = ctx.detector.check(ctx.orderbook);
                         if (sig.valid) {
                             json b_msg;
@@ -223,9 +218,8 @@ void run_detection() {
                             b_msg["score"]  = sig.score;
                             b_msg["timestamp"] = std::time(nullptr);
                             std::cout << b_msg.dump() << std::endl;
-                            // 发出B层信号后，可立即清空活跃标签，避免重复触发
+                            // 触发后清空活跃标签，避免重复触发
                             ctx.last_active_time = 0;
-                            active_labels.erase(sym);
                         }
                     }
                 } catch (const std::exception& e) {
@@ -245,9 +239,14 @@ int main() {
     auto symbols = fetch_top_symbols(100, 30000000.0);
     {
         std::unique_lock lock(contexts_mutex);
-        for (auto& sym : symbols) contexts.emplace(sym, SymbolContext{});
+        for (auto& sym : symbols) {
+            // 使用分段构造避免拷贝/移动 atomic
+            contexts.emplace(std::piecewise_construct,
+                             std::forward_as_tuple(sym),
+                             std::forward_as_tuple());
+        }
     }
-    spdlog::info("引擎已成功启动，正在监控 {} 个合约 (分层策略)", symbols.size());
+    spdlog::info("引擎已成功启动，正在监控 {} 个合约 (雷达+狙击)", symbols.size());
 
     std::thread ws_thread(run_websocket, symbols);
     std::thread detect_thread(run_detection);
