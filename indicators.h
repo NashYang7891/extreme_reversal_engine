@@ -1,6 +1,7 @@
 #pragma once
 #include <deque>
 #include <vector>
+#include <cstddef>   // 必须添加，提供 size_t 定义
 
 class Indicators {
 public:
