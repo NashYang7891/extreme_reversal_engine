@@ -1,21 +1,40 @@
 #include "orderbook.h"
 #include <numeric>
 
-void OrderBook::update(const json& data) {
+void OrderBook::update_depth(const json& data) {
     bids.clear(); asks.clear();
-    for (auto& b : data["bids"]) bids[std::stod(b[0].get<std::string>())] = std::stod(b[1].get<std::string>());
-    for (auto& a : data["asks"]) asks[std::stod(a[0].get<std::string>())] = std::stod(a[1].get<std::string>());
+    for (auto& b : data["bids"]) {
+        double price = std::stod(b[0].get<std::string>());
+        double qty   = std::stod(b[1].get<std::string>());
+        bids[price] = qty;
+    }
+    for (auto& a : data["asks"]) {
+        double price = std::stod(a[0].get<std::string>());
+        double qty   = std::stod(a[1].get<std::string>());
+        asks[price] = qty;
+    }
 }
 
-void OrderBook::add_trade(bool is_buy, double volume) {
-    if (is_buy) { buy_trades.push_back(volume); cum_buy += volume; }
-    else { sell_trades.push_back(volume); cum_sell += volume; }
+void OrderBook::add_agg_trade(bool is_buy, double volume) {
+    if (is_buy) {
+        buy_trades.push_back(volume);
+        cum_buy += volume;
+    } else {
+        sell_trades.push_back(volume);
+        cum_sell += volume;
+    }
     prune();
 }
 
 void OrderBook::prune() {
-    while (buy_trades.size() > MAX_TRADE) { cum_buy -= buy_trades.front(); buy_trades.pop_front(); }
-    while (sell_trades.size() > MAX_TRADE) { cum_sell -= sell_trades.front(); sell_trades.pop_front(); }
+    while (buy_trades.size() > MAX_TRADE) {
+        cum_buy -= buy_trades.front();
+        buy_trades.pop_front();
+    }
+    while (sell_trades.size() > MAX_TRADE) {
+        cum_sell -= sell_trades.front();
+        sell_trades.pop_front();
+    }
 }
 
 double OrderBook::micro_price() const {
@@ -34,6 +53,9 @@ double OrderBook::imbalance() const {
     return total == 0 ? 0.5 : bv / total;
 }
 
+double OrderBook::best_bid() const { return bids.empty() ? 0.0 : bids.rbegin()->first; }
+double OrderBook::best_ask() const { return asks.empty() ? 0.0 : asks.begin()->first; }
+
 double OrderBook::buy_volume() const {
     return std::accumulate(bids.begin(), bids.end(), 0.0,
         [](double sum, const auto& p) { return sum + p.second; });
@@ -41,11 +63,4 @@ double OrderBook::buy_volume() const {
 double OrderBook::sell_volume() const {
     return std::accumulate(asks.begin(), asks.end(), 0.0,
         [](double sum, const auto& p) { return sum + p.second; });
-}
-double OrderBook::best_bid() const {
-    return bids.empty() ? 0.0 : bids.rbegin()->first;
-}
-
-double OrderBook::best_ask() const {
-    return asks.empty() ? 0.0 : asks.begin()->first;
 }

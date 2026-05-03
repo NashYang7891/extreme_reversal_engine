@@ -6,8 +6,8 @@ using json = nlohmann::json;
 
 class OrderBook {
 public:
-    void update(const json& data);          // books5 单条数据
-    void add_trade(bool is_buy, double volume);
+    void update_depth(const json& data);       // 币安 depth@100ms
+    void add_agg_trade(bool is_buy, double volume); // 聚合成交（买方主动 = true）
     double micro_price() const;
     double imbalance() const;
     double best_bid() const;
