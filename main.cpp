@@ -30,11 +30,13 @@ using tcp = net::ip::tcp;
 
 std::atomic<bool> keep_running{true};
 
+// libcurl 写回调
 static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
     ((std::string*)userp)->append((char*)contents, size * nmemb);
     return size * nmemb;
 }
 
+// 兜底合约列表（20个主流+高波动币种）
 const std::vector<std::string> ULTIMATE_FALLBACK = {
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "TRXUSDT",
     "BNBUSDT", "ZECUSDT", "BIOUSDT", "ORDIUSDT", "TSTUSDT", "BABYUSDT",
@@ -42,22 +44,26 @@ const std::vector<std::string> ULTIMATE_FALLBACK = {
     "TAGUSDT", "BSBUSDT", "GENIUSUSDT"
 };
 
+// 获取成交量前100的USDT永续合约（24h ≥ 3000万）
 std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 30000000.0) {
     CURL *curl = curl_easy_init();
     if (!curl) {
         spdlog::error("curl 初始化失败，返回兜底列表");
         return ULTIMATE_FALLBACK;
     }
+
     std::string response;
     curl_easy_setopt(curl, CURLOPT_URL, "https://fapi.binance.com/fapi/v1/ticker/24hr");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
     CURLcode res = curl_easy_perform(curl);
+
     if (res != CURLE_OK) {
         spdlog::error("获取 24hr ticker 失败: {}，使用兜底列表", curl_easy_strerror(res));
         curl_easy_cleanup(curl);
         return ULTIMATE_FALLBACK;
     }
+
     std::vector<std::pair<std::string, double>> tickers;
     try {
         auto data = json::parse(response);
@@ -75,8 +81,10 @@ std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 300
         return ULTIMATE_FALLBACK;
     }
     curl_easy_cleanup(curl);
+
     std::sort(tickers.begin(), tickers.end(),
               [](const auto& a, const auto& b) { return a.second > b.second; });
+
     std::vector<std::string> result;
     for (auto& [sym, vol] : tickers) {
         if (vol >= min_vol) {
@@ -104,28 +112,24 @@ struct SymbolContext {
 std::map<std::string, SymbolContext> contexts;
 std::shared_mutex contexts_mutex;
 
-// A层诊断版：降门槛 + 取消量比过滤（调试用）
-bool active_layer_diag(const OrderBook& ob, Indicators& ind, double& out_change) {
+// ---------- A层：异动探测器 (1.2% + 1.5x量比) ----------
+bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, double& out_vol_ratio) {
     double change_3m = ind.price_change_pct(3 * 60);
-    // 极度宽松：涨跌幅 >= 0.5% 即触发
-    if (std::abs(change_3m) < 0.005) return false;
+    if (std::abs(change_3m) < 0.012) return false;
 
-    // 计算量比，但不用于过滤，只用于输出
     double recent_vol = ob.recent_volume(3 * 60 * 1000);
-    // 平均值如果为 0，强行使用 recent_vol 避免死锁
     double avg_vol = ind.get_volume_ema();
     if (avg_vol <= 0) {
-        avg_vol = recent_vol;  // 紧急初始化
+        avg_vol = recent_vol;
         ind.update_volume(avg_vol);
     }
-    double vol_ratio = avg_vol > 0 ? recent_vol / avg_vol : 0.0;
-    // 更新成交量 EMA
+    double vol_ratio = recent_vol / avg_vol;
+    if (vol_ratio < 1.5) return false;
+
     ind.update_volume(recent_vol);
     out_change = change_3m;
-    // 打印调试信息（会出现在 Python 的非JSON输出中）
-    spdlog::debug("A层候选 {}: 涨跌幅={:.2f}%, 量比={:.2f}, 当前价={}", "sym",
-                  change_3m * 100, vol_ratio, ind.price());
-    return true;   // 无论量比多少，只要涨跌幅达标就通过
+    out_vol_ratio = vol_ratio;
+    return true;
 }
 
 void run_websocket(const std::vector<std::string>& symbols) {
@@ -137,6 +141,7 @@ void run_websocket(const std::vector<std::string>& symbols) {
                             ssl::context::no_sslv2 | ssl::context::no_sslv3);
             ctx.set_default_verify_paths();
             ctx.set_verify_mode(ssl::verify_peer);
+
             ws::stream<beast::ssl_stream<tcp::socket>> ws(ioc, ctx);
             tcp::resolver resolver(ioc);
             auto const results = resolver.resolve("fstream.binance.com", "443");
@@ -155,18 +160,10 @@ void run_websocket(const std::vector<std::string>& symbols) {
             ws.write(net::buffer(sub_msg.dump()));
 
             beast::flat_buffer buffer;
-            auto last_heartbeat = std::chrono::steady_clock::now();
             while (keep_running) {
                 ws.read(buffer);
                 auto msg = json::parse(beast::buffers_to_string(buffer.data()));
                 buffer.clear();
-                // 每 10 秒打印一次心跳，证明数据流正常
-                auto now = std::chrono::steady_clock::now();
-                if (now - last_heartbeat > std::chrono::seconds(10)) {
-                    spdlog::info("WebSocket 数据正常，时间戳 {}", std::time(nullptr));
-                    last_heartbeat = now;
-                }
-
                 if (msg.contains("stream") && msg.contains("data")) {
                     std::string stream = msg["stream"];
                     const auto& data = msg["data"];
@@ -178,6 +175,7 @@ void run_websocket(const std::vector<std::string>& symbols) {
                     std::unique_lock lock(contexts_mutex);
                     auto it = contexts.find(sym);
                     if (it == contexts.end()) continue;
+
                     if (stream.find("@depth") != std::string::npos) {
                         it->second.orderbook.update_depth(data);
                         double mp = it->second.orderbook.micro_price();
@@ -208,21 +206,27 @@ void run_detection() {
 
             for (auto& [sym, ctx] : contexts) {
                 try {
-                    double change_pct = 0.0;
-                    // ---- A层 (诊断宽松版) ----
-                    if (active_layer_diag(ctx.orderbook, ctx.indicators, change_pct)) {
+                    double change_pct = 0.0, vol_ratio = 0.0;
+                    // ---- A层 ----
+                    if (active_layer(ctx.orderbook, ctx.indicators, change_pct, vol_ratio)) {
                         ctx.last_active_time = now_ms;
                         json a_msg;
                         a_msg["type"] = "A_ACTIVE";
                         a_msg["symbol"] = sym;
                         a_msg["price"] = ctx.indicators.price();
                         a_msg["change_pct"] = change_pct * 100.0;
-                        a_msg["vol_ratio"] = 0.0;  // 不输出，避免混淆
+                        a_msg["vol_ratio"] = vol_ratio;
                         a_msg["timestamp"] = std::time(nullptr);
+                        // 附加偏离度 (dev)
+                        double atr = ctx.indicators.atr();
+                        if (atr > 0) {
+                            double dev = (ctx.indicators.ema20() - ctx.indicators.price()) / atr;
+                            a_msg["dev"] = dev;
+                        }
                         std::cout << a_msg.dump() << std::endl;
                     }
 
-                    // ---- B层（仅活跃标签未过期时） ----
+                    // ---- B层：仅在活跃标签未过期时执行 ----
                     int64_t last_active = ctx.last_active_time.load();
                     if (last_active > 0 && (now_ms - last_active) < 15 * 60 * 1000) {
                         auto sig = ctx.detector.check(ctx.orderbook);
@@ -235,7 +239,8 @@ void run_detection() {
                             b_msg["score"]  = sig.score;
                             b_msg["timestamp"] = std::time(nullptr);
                             std::cout << b_msg.dump() << std::endl;
-                            ctx.last_active_time = 0;   // 触发后清空
+                            // 触发后清空活跃标签，避免重复
+                            ctx.last_active_time = 0;
                         }
                     }
                 } catch (const std::exception& e) {
@@ -261,7 +266,7 @@ int main() {
                              std::forward_as_tuple());
         }
     }
-    spdlog::info("引擎已成功启动 (诊断模式)，正在监控 {} 个合约", symbols.size());
+    spdlog::info("引擎已成功启动，正在监控 {} 个合约 (A层+偏离度)", symbols.size());
 
     std::thread ws_thread(run_websocket, symbols);
     std::thread detect_thread(run_detection);
