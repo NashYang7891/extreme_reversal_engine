@@ -29,16 +29,68 @@ using tcp = net::ip::tcp;
 
 std::atomic<bool> keep_running{true};
 
+// libcurl 回调
 static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
     ((std::string*)userp)->append((char*)contents, size * nmemb);
     return size * nmemb;
 }
 
+// 获取币安 USDT 永续合约，按 24h 成交量过滤，取前 30 个
 std::vector<std::string> fetch_top_symbols(int top_n = 30, double min_vol = 30000000.0) {
-    // 之前已提供，保持原样（略）
-    // ...
+    std::vector<std::string> result;
+    CURL *curl = curl_easy_init();
+    if (!curl) return result;
+    std::string response;
+
+    // 1. 获取所有合约信息
+    curl_easy_setopt(curl, CURLOPT_URL, "https://fapi.binance.com/fapi/v1/exchangeInfo");
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+    curl_easy_perform(curl);
+    json exInfo = json::parse(response);
+    response.clear();
+
+    std::vector<std::string> all_symbols;
+    for (auto& s : exInfo["symbols"]) {
+        if (s["quoteAsset"] == "USDT" && s["contractType"] == "PERPETUAL" && s["status"] == "TRADING") {
+            all_symbols.push_back(s["symbol"]);
+        }
+    }
+
+    // 2. 获取每个合约的 24h 成交量
+    std::map<std::string, double> vol_map;
+    for (auto& sym : all_symbols) {
+        std::string url = "https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=" + sym;
+        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+        curl_easy_perform(curl);
+        try {
+            json ticker = json::parse(response);
+            double vol = std::stod(ticker["quoteVolume"].get<std::string>());
+            vol_map[sym] = vol;
+        } catch (...) {
+            vol_map[sym] = 0.0;
+        }
+        response.clear();
+    }
+    curl_easy_cleanup(curl);
+
+    // 3. 过滤并排序
+    std::vector<std::pair<std::string, double>> eligible;
+    for (auto& sym : all_symbols) {
+        if (vol_map[sym] >= min_vol)
+            eligible.emplace_back(sym, vol_map[sym]);
+    }
+    std::sort(eligible.begin(), eligible.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    for (int i = 0; i < std::min(top_n, (int)eligible.size()); ++i)
+        result.push_back(eligible[i].first);
+    spdlog::info("将监控 {} 个合约, 前3: {}", result.size(),
+                 result.size()>0 ? result[0] : "无");
+    return result;
 }
 
+// 每个合约的完整状态
 struct SymbolContext {
     OrderBook orderbook;
     Indicators indicators;
@@ -46,6 +98,7 @@ struct SymbolContext {
     SignalDetector detector{ml, indicators};
 };
 
+// WebSocket 线程函数（自动重连）
 void run_websocket(std::map<std::string, SymbolContext>& contexts, const std::vector<std::string>& symbols) {
     while (keep_running) {
         try {
@@ -54,7 +107,7 @@ void run_websocket(std::map<std::string, SymbolContext>& contexts, const std::ve
             ctx.set_options(ssl::context::default_workarounds |
                             ssl::context::no_sslv2 |
                             ssl::context::no_sslv3);
-            ctx.set_verify_mode(ssl::verify_none);
+            ctx.set_verify_mode(ssl::verify_none); // 测试环境，生产请用默认验证
 
             ws::stream<beast::ssl_stream<tcp::socket>> ws(ioc, ctx);
             tcp::resolver resolver(ioc);
@@ -63,6 +116,7 @@ void run_websocket(std::map<std::string, SymbolContext>& contexts, const std::ve
             ws.next_layer().handshake(ssl::stream_base::client);
             ws.handshake("fstream.binance.com", "/stream");
 
+            // 构造订阅流（转为小写）
             std::vector<std::string> streams;
             for (auto& sym : symbols) {
                 std::string s = sym;
@@ -117,8 +171,10 @@ int main() {
     std::map<std::string, SymbolContext> contexts;
     for (auto& sym : symbols) contexts.emplace(sym, SymbolContext{});
 
+    // 启动 WebSocket 线程（自动重连）
     std::thread ws_thread(run_websocket, std::ref(contexts), symbols);
 
+    // 检测线程（每 100ms 遍历所有合约，带异常保护）
     std::thread detect_thread([&](){
         while (keep_running) {
             auto start = std::chrono::steady_clock::now();
