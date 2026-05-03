@@ -10,6 +10,10 @@ void Indicators::update(double micro_price) {
     prices_.push_back(micro_price);
     if (prices_.size() > max_size_) prices_.pop_front();
     update_ema();
+
+    // 记录时间戳
+    auto now = std::chrono::system_clock::now().time_since_epoch();
+    last_update_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
 }
 
 void Indicators::update_ema() {

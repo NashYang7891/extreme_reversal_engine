@@ -44,7 +44,7 @@ const std::vector<std::string> ULTIMATE_FALLBACK = {
 
 std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 30000000.0) {
     CURL *curl = curl_easy_init();
-    if (!curl) { spdlog::error("curl fail"); return ULTIMATE_FALLBACK; }
+    if (!curl) { spdlog::error("curl init fail"); return ULTIMATE_FALLBACK; }
     std::string response;
     curl_easy_setopt(curl, CURLOPT_URL, "https://fapi.binance.com/fapi/v1/ticker/24hr");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
@@ -160,60 +160,84 @@ void run_detection() {
             std::shared_lock lock(contexts_mutex);
             auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
+
             for (auto& [sym, ctx] : contexts) {
+                // 时效性检查：丢弃超过 5 秒未更新的币种
+                if (ctx.indicators.is_stale(5000)) continue;
+
                 try {
-                    double change_pct=0.0, vol_ratio=0.0;
+                    double change_pct = 0.0, vol_ratio = 0.0;
+                    // ---- A层 ----
                     if (active_layer(ctx.orderbook, ctx.indicators, change_pct, vol_ratio)) {
                         ctx.last_active_time = now_ms;
-                        json a; a["type"]="A_ACTIVE"; a["symbol"]=sym;
-                        a["price"]=ctx.indicators.price();
-                        a["change_pct"]=change_pct*100.0; a["vol_ratio"]=vol_ratio;
-                        a["timestamp"]=std::time(nullptr);
+                        json a_msg;
+                        a_msg["type"] = "A_ACTIVE";
+                        a_msg["symbol"] = sym;
+                        a_msg["price"] = ctx.indicators.price();
+                        a_msg["change_pct"] = change_pct * 100.0;
+                        a_msg["vol_ratio"] = vol_ratio;
+                        a_msg["timestamp"] = std::time(nullptr);
                         double atr = ctx.indicators.atr();
-                        if (atr>0) a["dev"]=(ctx.indicators.ema20()-ctx.indicators.price())/atr;
-                        std::cout << a.dump() << std::endl;
+                        if (atr > 0) {
+                            double dev = (ctx.indicators.ema20() - ctx.indicators.price()) / atr;
+                            a_msg["dev"] = dev;
+                        }
+                        std::cout << a_msg.dump() << std::endl;
                     }
+
+                    // ---- B层（带时效性）----
                     int64_t last_active = ctx.last_active_time.load();
-                    if (last_active>0 && (now_ms-last_active) < 15*60*1000) {
+                    if (last_active > 0 && (now_ms - last_active) < 15 * 60 * 1000) {
                         auto sig = ctx.detector.check(ctx.orderbook);
                         if (sig.valid) {
-                            json b; b["type"]="SIGNAL"; b["symbol"]=sym;
-                            b["side"]=sig.side; b["price"]=sig.price; b["score"]=sig.score;
-                            b["timestamp"]=std::time(nullptr);
-                            // 计算止损止盈
+                            json b_msg;
+                            b_msg["type"] = "SIGNAL";
+                            b_msg["symbol"] = sym;
+                            b_msg["side"]   = sig.side;
+                            b_msg["price"]  = sig.price;
+                            b_msg["score"]  = sig.score;
+                            b_msg["timestamp"] = std::time(nullptr);
                             double atr = ctx.indicators.atr();
-                            double entry = sig.price;
                             if (atr > 0) {
                                 if (sig.side == "LONG") {
-                                    b["stop_loss"] = entry - atr * 2.0;
-                                    b["take_profit"] = entry + atr * 3.0;
+                                    b_msg["stop_loss"] = sig.price - atr * 2.0;
+                                    b_msg["take_profit"] = sig.price + atr * 3.0;
                                 } else {
-                                    b["stop_loss"] = entry + atr * 2.0;
-                                    b["take_profit"] = entry - atr * 3.0;
+                                    b_msg["stop_loss"] = sig.price + atr * 2.0;
+                                    b_msg["take_profit"] = sig.price - atr * 3.0;
                                 }
                             }
-                            std::cout << b.dump() << std::endl;
+                            std::cout << b_msg.dump() << std::endl;
                             ctx.last_active_time = 0;
                         }
                     }
                 } catch (const std::exception& e) {
                     spdlog::error("检测 {} 异常: {}", sym, e.what());
-                } catch (...) { spdlog::error("检测 {} 未知异常", sym); }
+                } catch (...) {
+                    spdlog::error("检测 {} 未知异常", sym);
+                }
             }
         }
         auto elapsed = std::chrono::steady_clock::now() - start;
-        if (elapsed < std::chrono::milliseconds(100))
-            std::this_thread::sleep_for(std::chrono::milliseconds(100) - elapsed);
+        // 检测间隔 5ms，保证极低延迟
+        if (elapsed < std::chrono::milliseconds(5))
+            std::this_thread::sleep_for(std::chrono::milliseconds(5) - elapsed);
     }
 }
 
 int main() {
     auto symbols = fetch_top_symbols(100, 30000000.0);
-    { std::unique_lock lock(contexts_mutex);
-      for (auto& sym : symbols) contexts.emplace(std::piecewise_construct, std::forward_as_tuple(sym), std::forward_as_tuple()); }
-    spdlog::info("引擎启动，监控 {} 个合约", symbols.size());
+    {
+        std::unique_lock lock(contexts_mutex);
+        for (auto& sym : symbols) contexts.emplace(std::piecewise_construct,
+                                                   std::forward_as_tuple(sym),
+                                                   std::forward_as_tuple());
+    }
+    spdlog::info("引擎启动，监控 {} 个合约 (实时版)", symbols.size());
+
     std::thread ws_thread(run_websocket, symbols);
     std::thread detect_thread(run_detection);
-    ws_thread.join(); detect_thread.join();
+    ws_thread.join();
+    detect_thread.join();
     return 0;
 }

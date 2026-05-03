@@ -41,15 +41,16 @@ def place_order(symbol, side, price):
     side = side.lower()
     if side not in ('buy', 'sell'):
         print(f"❌ 无效方向: {side}")
-        return None
+        return None, None
     try:
         if not exchange.markets: exchange.load_markets()
-        market = exchange.market(symbol)
         ticker = exchange.fetch_ticker(symbol)
         bid = ticker['bid'] if ticker['bid'] else price
         ask = ticker['ask'] if ticker['ask'] else price
-        if side == 'buy':   order_price = min(price, ask * 1.0005)
-        else:               order_price = max(price, bid * 0.9995)
+        if side == 'buy':
+            order_price = min(price, ask * 1.0005)
+        else:
+            order_price = max(price, bid * 0.9995)
         order_price = exchange.price_to_precision(symbol, order_price)
         amount = ORDER_USDT / float(order_price)
         amount = exchange.amount_to_precision(symbol, amount)
@@ -60,10 +61,10 @@ def place_order(symbol, side, price):
             params={'timeInForce': 'GTX', 'postOnly': True}
         )
         print(f"✅ 下单成功: {symbol} {side} @ {order_price} (推导:{price}) Qty:{amount}")
-        return order
+        return order_price, order
     except Exception as e:
         print(f"❌ 下单失败 {symbol}: {e}")
-        return None
+        return None, None
 
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -72,13 +73,13 @@ def main():
     try:
         exchange.load_markets()
         print("✅ 市场数据已加载")
-    except Exception as e:
-        print(f"⚠️ 市场加载失败: {e}")
+    except: pass
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True)
-    send_tg("🤖 币安极端反转引擎已启动 (带止盈止损)")
-    last_b_signal = {}      # 10 分钟冷却
-    last_a_push = {}        # 5 分钟去重
+    send_tg("🤖 实时极端反转引擎启动 (埋单+止盈止损)")
+    last_b_signal = {}      # B层 10 分钟冷却
+    last_a_push = {}        # A层 5 分钟去重
+    last_a_order = {}       # A层 30 分钟不重复下单
 
     for line in proc.stdout:
         line = line.strip()
@@ -94,23 +95,46 @@ def main():
             if sym in last_a_push and now - last_a_push[sym] < 300: continue
             price = msg.get("price",0); change = msg.get("change_pct",0)
             vol_r = msg.get("vol_ratio",0); dev = msg.get("dev", None)
-            d = f" | 偏离度:{dev:.1f}" if dev is not None else ""
-            send_tg(f"🔥 {sym} 异动 | 价:{price:.4f} | 3m涨跌:{change:+.2f}% | 量比:{vol_r:.1f}x{d}")
+            d_str = f" | 偏离度:{dev:.1f}" if dev else ""
+            send_tg(f"🔥 {sym} 异动 | 价:{price:.4f} | 涨跌:{change:+.2f}% | 量比:{vol_r:.1f}x{d_str}")
             last_a_push[sym] = now
 
+            # ---- A 层实时埋单（抢跑） ----
+            # 当偏离度满足一定条件时，提前挂限价单，不等 B 层确认
+            if dev is not None and abs(dev) > 1.3:
+                # 根据偏离度方向确定做多/做空
+                side = "buy" if dev > 0 else "sell"
+                # 30 分钟内同一方向不重复下单
+                order_key = f"{sym}_{side}"
+                if order_key in last_a_order and now - last_a_order[order_key] < 1800:
+                    continue
+                # 下单（盘口修正自动处理）
+                actual_price, _ = place_order(sym, side, price)
+                if actual_price:
+                    last_a_order[order_key] = now
+                    send_tg(f"⚡ A层埋单 {side.upper()} {sym} @ {actual_price:.6f} (偏离度:{dev:.1f})")
+
         elif t == "SIGNAL":
-            side = msg.get("side",""); price = msg.get("price",0)
-            score = msg.get("score",0); stop = msg.get("stop_loss",0); profit = msg.get("take_profit",0)
+            side = msg.get("side",""); price_derived = msg.get("price",0)
+            score = msg.get("score",0)
+            stop_loss = msg.get("stop_loss",0); take_profit = msg.get("take_profit",0)
             now = time.time()
             if sym in last_b_signal and now - last_b_signal[sym] < 600: continue
             if is_quiet_period(): continue
-            tg_msg = (
-                f"🎯 {side.upper()} {sym} @ {price:.6f} 评分:{score:.1f}\n"
-                f"🛑 止损: {stop:.6f} | 🎯 止盈: {profit:.6f}"
-            )
-            send_tg(tg_msg)
-            place_order(sym, side, price)
-            last_b_signal[sym] = now
+
+            # B 层下单
+            actual_price, _ = place_order(sym, side, price_derived)
+
+            tg_lines = [f"🎯 {side.upper()} {sym} 评分:{score:.1f}"]
+            if actual_price:
+                tg_lines.append(f"✅ 下单成功: {actual_price:.6f}")
+            else:
+                tg_lines.append(f"❌ 下单失败")
+            tg_lines.append(f"🛑 止损: {stop_loss:.6f} | 🎯 止盈: {take_profit:.6f}")
+            send_tg("\n".join(tg_lines))
+
+            if actual_price:
+                last_b_signal[sym] = now
 
 if __name__ == "__main__":
     main()
