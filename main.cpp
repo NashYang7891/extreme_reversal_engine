@@ -114,11 +114,18 @@ std::shared_mutex contexts_mutex;
 bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, double& out_vol_ratio) {
     double change_3m = ind.price_change_pct(3 * 60);
     if (std::abs(change_3m) < 0.02) return false;
+
     double recent_vol = ob.recent_volume(3 * 60 * 1000);
     double avg_vol = ind.get_volume_ema();
-    double vol_ratio = avg_vol > 0 ? recent_vol / avg_vol : 0.0;
-    if (avg_vol > 0 && vol_ratio < 3.0) return false;
+
+    // 成交量 EMA 必须已初始化，且量比达到 3 倍
+    if (avg_vol <= 0) return false;
+    double vol_ratio = recent_vol / avg_vol;
+    if (vol_ratio < 3.0) return false;
+
+    // 更新成交量 EMA（平滑用于下次判断）
     ind.update_volume(recent_vol);
+
     out_change = change_3m;
     out_vol_ratio = vol_ratio;
     return true;
