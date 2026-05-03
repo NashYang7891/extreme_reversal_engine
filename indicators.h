@@ -12,7 +12,7 @@ public:
     double kdj_j(int period = 9);
     double cci(int period = 20) const;
     double ema20() const;
-    double composite_oscillator(double w_rsi, double w_kdj, double w_cci) const;
+    double composite_oscillator(double w_rsi, double w_kdj, double w_cci);
     const std::deque<double>& prices() const { return prices_; }
     double price() const { return prices_.empty() ? 0.0 : prices_.back(); }
 private:
@@ -20,7 +20,6 @@ private:
     double ema20_ = 0.0;
     size_t max_size_;
     void update_ema();
-    // KDJ 平滑状态（每个实例独立）
     double k_ = 50.0;
     double d_ = 50.0;
 };

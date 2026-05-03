@@ -6,7 +6,7 @@
 Indicators::Indicators(size_t max_size) : max_size_(max_size) {}
 
 void Indicators::update(double micro_price) {
-    if (micro_price <= 0) return;  // 非法价格忽略
+    if (micro_price <= 0) return;
     prices_.push_back(micro_price);
     if (prices_.size() > max_size_) prices_.pop_front();
     update_ema();
@@ -49,7 +49,6 @@ double Indicators::kdj_j(int period) {
     double high = *std::max_element(prices_.end() - period, prices_.end());
     if (high == low) return 50.0;
     double rsv = (prices_.back() - low) / (high - low) * 100.0;
-    // 使用成员变量，去除 static
     k_ = 0.6667 * k_ + 0.3333 * rsv;
     d_ = 0.6667 * d_ + 0.3333 * k_;
     return 3.0 * k_ - 2.0 * d_;
@@ -66,7 +65,7 @@ double Indicators::cci(int period) const {
     return (tp.back() - ma) / (0.015 * md);
 }
 
-double Indicators::composite_oscillator(double w_rsi, double w_kdj, double w_cci) const {
+double Indicators::composite_oscillator(double w_rsi, double w_kdj, double w_cci) {
     double r = rsi() / 100.0;
     double k = kdj_j() / 100.0;
     double c = (cci() + 200.0) / 400.0;
