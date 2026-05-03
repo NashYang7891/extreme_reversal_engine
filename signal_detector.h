@@ -14,5 +14,5 @@ private:
     Indicators& ind_;
     double solve_critical_price(const OrderBook& ob, const std::string& side);
     double objective(const OrderBook& ob, double price, const std::string& side);
-    bool check_momentum_slowing(const std::string& side);   // 15分钟斜率衰减
+    bool check_momentum_decay(const std::string& side);  // 新函数名
 };
