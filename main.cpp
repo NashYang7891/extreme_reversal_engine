@@ -30,13 +30,11 @@ using tcp = net::ip::tcp;
 
 std::atomic<bool> keep_running{true};
 
-// libcurl 写回调
 static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
     ((std::string*)userp)->append((char*)contents, size * nmemb);
     return size * nmemb;
 }
 
-// 兜底合约列表（20个主流+高波动币种）
 const std::vector<std::string> ULTIMATE_FALLBACK = {
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "TRXUSDT",
     "BNBUSDT", "ZECUSDT", "BIOUSDT", "ORDIUSDT", "TSTUSDT", "BABYUSDT",
@@ -44,26 +42,22 @@ const std::vector<std::string> ULTIMATE_FALLBACK = {
     "TAGUSDT", "BSBUSDT", "GENIUSUSDT"
 };
 
-// 获取成交量前100的USDT永续合约（24h ≥ 3000万）
 std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 30000000.0) {
     CURL *curl = curl_easy_init();
     if (!curl) {
         spdlog::error("curl 初始化失败，返回兜底列表");
         return ULTIMATE_FALLBACK;
     }
-
     std::string response;
     curl_easy_setopt(curl, CURLOPT_URL, "https://fapi.binance.com/fapi/v1/ticker/24hr");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
     CURLcode res = curl_easy_perform(curl);
-
     if (res != CURLE_OK) {
         spdlog::error("获取 24hr ticker 失败: {}，使用兜底列表", curl_easy_strerror(res));
         curl_easy_cleanup(curl);
         return ULTIMATE_FALLBACK;
     }
-
     std::vector<std::pair<std::string, double>> tickers;
     try {
         auto data = json::parse(response);
@@ -81,10 +75,8 @@ std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 300
         return ULTIMATE_FALLBACK;
     }
     curl_easy_cleanup(curl);
-
     std::sort(tickers.begin(), tickers.end(),
               [](const auto& a, const auto& b) { return a.second > b.second; });
-
     std::vector<std::string> result;
     for (auto& [sym, vol] : tickers) {
         if (vol >= min_vol) {
@@ -112,23 +104,27 @@ struct SymbolContext {
 std::map<std::string, SymbolContext> contexts;
 std::shared_mutex contexts_mutex;
 
-// ---------- A层：异动探测器 (1.2% + 1.5x量比) ----------
+// ---------- 调试版 A 层（极宽松，仅用于确认链路）----------
 bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, double& out_vol_ratio) {
     double change_3m = ind.price_change_pct(3 * 60);
-    // 过滤明显异常涨跌幅（可能是数据错乱）
-    if (std::abs(change_3m) > 0.20) return false;
-    if (std::abs(change_3m) < 0.012) return false;
+    // 过滤明显异常值（比如 >50% 视为数据错误）
+    if (std::abs(change_3m) > 0.50) return false;
+    // 涨跌幅 >= 0.1% 即通过（极低门槛）
+    if (std::abs(change_3m) < 0.001) return false;
 
     double recent_vol = ob.recent_volume(3 * 60 * 1000);
     double avg_vol = ind.get_volume_ema();
+    double vol_ratio = 0.0;
     if (avg_vol <= 0) {
         avg_vol = recent_vol;
         ind.update_volume(avg_vol);
+        vol_ratio = 1.0;
+    } else {
+        vol_ratio = recent_vol / avg_vol;
+        // 调试期不检查量比
+        ind.update_volume(recent_vol);
     }
-    double vol_ratio = recent_vol / avg_vol;
-    if (vol_ratio < 1.5) return false;
 
-    ind.update_volume(recent_vol);
     out_change = change_3m;
     out_vol_ratio = vol_ratio;
     return true;
@@ -177,7 +173,6 @@ void run_websocket(const std::vector<std::string>& symbols) {
                     std::unique_lock lock(contexts_mutex);
                     auto it = contexts.find(sym);
                     if (it == contexts.end()) continue;
-
                     if (stream.find("@depth") != std::string::npos) {
                         it->second.orderbook.update_depth(data);
                         double mp = it->second.orderbook.micro_price();
@@ -219,7 +214,7 @@ void run_detection() {
                         a_msg["change_pct"] = change_pct * 100.0;
                         a_msg["vol_ratio"] = vol_ratio;
                         a_msg["timestamp"] = std::time(nullptr);
-                        // 附加偏离度 (dev)
+                        // 附加偏离度
                         double atr = ctx.indicators.atr();
                         if (atr > 0) {
                             double dev = (ctx.indicators.ema20() - ctx.indicators.price()) / atr;
@@ -268,7 +263,7 @@ int main() {
                              std::forward_as_tuple());
         }
     }
-    spdlog::info("引擎已成功启动，正在监控 {} 个合约 (A层+偏离度)", symbols.size());
+    spdlog::info("引擎已成功启动，正在监控 {} 个合约 (调试版A层)", symbols.size());
 
     std::thread ws_thread(run_websocket, symbols);
     std::thread detect_thread(run_detection);

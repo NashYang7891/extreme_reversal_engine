@@ -75,8 +75,8 @@ def main():
         print(f"⚠️ 加载市场数据失败: {e}")
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True)
-    send_tg("🤖 币安极端反转引擎已启动 (A层去重+B层加速)")
-    last_b_signal = {}      # B层1小时冷却
+    send_tg("🤖 币安极端反转引擎已启动 (调试版)")
+    last_b_signal = {}
     last_a_push = {}        # A层5分钟去重
 
     for line in proc.stdout:
@@ -93,7 +93,7 @@ def main():
 
         if msg_type == "A_ACTIVE":
             now = time.time()
-            if sym in last_a_push and now - last_a_push[sym] < 300:   # 5分钟内同一币种不重复推送
+            if sym in last_a_push and now - last_a_push[sym] < 300:
                 continue
             price = msg.get("price", 0)
             change = msg.get("change_pct", 0)

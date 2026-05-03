@@ -38,17 +38,15 @@ bool SignalDetector::check_momentum_decay(const std::string& side) {
 
     double v0 = prices.back() - prices[prices.size()-2];
     double v1 = prices[prices.size()-2] - prices[prices.size()-3];
-    double accel = v0 - v1;   // 加速度
+    double accel = v0 - v1;
 
     if (side == "LONG") {
-        // 价格处于近5个点最低位，且加速度>0（下跌衰竭）
         bool is_low = true;
         double cur = prices.back();
         for (size_t i = prices.size()-5; i < prices.size()-1; ++i)
             if (prices[i] < cur) { is_low = false; break; }
         return accel > 0 && is_low;
     } else {
-        // 价格处于近5个点最高位，且加速度<0（上涨衰竭）
         bool is_high = true;
         double cur = prices.back();
         for (size_t i = prices.size()-5; i < prices.size()-1; ++i)
@@ -70,7 +68,6 @@ Signal SignalDetector::check(const OrderBook& ob) {
     double osc = ind_.composite_oscillator(ml_.get_w_rsi(), ml_.get_w_kdj(), ml_.get_w_cci());
     double wall = ob.imbalance();
 
-    // 参数：偏离度2.2σ，振荡器0.3/0.7，挂单壁0.65/0.35
     constexpr double LONG_DEV_THRESH  = 2.2;
     constexpr double LONG_OSC_MAX     = 0.30;
     constexpr double LONG_WALL_MIN    = 0.65;
@@ -81,7 +78,6 @@ Signal SignalDetector::check(const OrderBook& ob) {
     bool decay_long = check_momentum_decay("LONG");
     bool decay_short = check_momentum_decay("SHORT");
 
-    // 每100次检查打印一次偏离度、振荡器，便于调试
     static int log_cnt = 0;
     if (++log_cnt % 100 == 0) {
         spdlog::info("B层检查: dev={:.2f} osc={:.2f} wall={:.2f} decay_long={} decay_short={}",
