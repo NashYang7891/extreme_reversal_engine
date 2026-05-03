@@ -4,6 +4,7 @@
 #include <boost/asio/ip/tcp.hpp>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <iostream>
 #include <thread>
 #include <atomic>
 #include <map>

@@ -4,7 +4,7 @@
 
 class Indicators {
 public:
-    explicit Indicators(size_t max_size = 300);
+    Indicators(size_t max_size = 300);
     void update(double micro_price);
     double atr(int period = 14) const;
     double rsi(int period = 14) const;
