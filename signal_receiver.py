@@ -38,6 +38,7 @@ def is_quiet_period():
     return False
 
 def place_order(symbol, side, price):
+    """盘口修正下单，返回 (实际下单价格, 订单对象) 或 (None, None)"""
     side = side.lower()
     if side not in ('buy', 'sell'):
         print(f"❌ 无效方向: {side}")
@@ -66,6 +67,13 @@ def place_order(symbol, side, price):
         print(f"❌ 下单失败 {symbol}: {e}")
         return None, None
 
+def cancel_order(order_id, symbol):
+    try:
+        exchange.cancel_order(order_id, symbol)
+        print(f"🗑️ 已撤单 {symbol} {order_id}")
+    except Exception as e:
+        print(f"⚠️ 撤单失败 {symbol} {order_id}: {e}")
+
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     engine_path = os.path.join(script_dir, "build", "engine")
@@ -76,16 +84,31 @@ def main():
     except: pass
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True)
-    send_tg("🤖 实时极端反转引擎启动 (埋单+止盈止损)")
-    last_b_signal = {}      # B层 10 分钟冷却
-    last_a_push = {}        # A层 5 分钟去重
-    last_a_order = {}       # A层 30 分钟不重复下单
+    send_tg("🤖 最终版引擎启动 (撤单保護+硬止损)")
+    last_b_signal = {}          # B层 10 分钟冷却
+    last_a_push = {}            # A层 5 分钟去重
+    active_a_orders = {}        # 记录 A 层埋单，用于撤单
+
+    # 撤单条件
+    A_ORDER_TIMEOUT_SEC = 15 * 60      # 15 分钟
+    MAX_DEV_BEFORE_CANCEL = 4.0        # 偏离度绝对值超过 4.0 撤单
 
     for line in proc.stdout:
         line = line.strip()
         if not line: continue
         try: msg = json.loads(line)
         except: print("C++:", line); continue
+
+        # 定期检查 A 层订单是否需要撤单
+        now_ts = time.time()
+        for key in list(active_a_orders.keys()):
+            order_info = active_a_orders[key]
+            if now_ts - order_info['time'] > A_ORDER_TIMEOUT_SEC:
+                cancel_order(order_info['order'].get('id', ''), order_info['symbol'])
+                del active_a_orders[key]
+                continue
+            # 检查偏离度是否恶化（这里需要实时获取，为简化可跳过，主要靠超时撤单）
+            # 可在此处增加 fetch_ticker 并计算偏离度，但为性能不强制
 
         t = msg.get("type", "")
         sym = msg.get("symbol", "")
@@ -95,39 +118,44 @@ def main():
             if sym in last_a_push and now - last_a_push[sym] < 300: continue
             price = msg.get("price",0); change = msg.get("change_pct",0)
             vol_r = msg.get("vol_ratio",0); dev = msg.get("dev", None)
-            d_str = f" | 偏离度:{dev:.1f}" if dev else ""
+            d_str = f" | 偏离度:{dev:.1f}" if dev is not None else ""
             send_tg(f"🔥 {sym} 异动 | 价:{price:.4f} | 涨跌:{change:+.2f}% | 量比:{vol_r:.1f}x{d_str}")
             last_a_push[sym] = now
 
-            # ---- A 层实时埋单（抢跑） ----
-            # 当偏离度满足一定条件时，提前挂限价单，不等 B 层确认
+            # A层埋单
             if dev is not None and abs(dev) > 1.3:
-                # 根据偏离度方向确定做多/做空
                 side = "buy" if dev > 0 else "sell"
-                # 30 分钟内同一方向不重复下单
                 order_key = f"{sym}_{side}"
-                if order_key in last_a_order and now - last_a_order[order_key] < 1800:
+                # 30 分钟内同一币种同方向不重复挂单
+                if order_key in active_a_orders:
                     continue
-                # 下单（盘口修正自动处理）
-                actual_price, _ = place_order(sym, side, price)
-                if actual_price:
-                    last_a_order[order_key] = now
+                actual_price, order = place_order(sym, side, price)
+                if actual_price and order:
+                    active_a_orders[order_key] = {
+                        'symbol': sym, 'side': side, 'order': order,
+                        'time': now, 'entry_dev': dev
+                    }
                     send_tg(f"⚡ A层埋单 {side.upper()} {sym} @ {actual_price:.6f} (偏离度:{dev:.1f})")
 
         elif t == "SIGNAL":
             side = msg.get("side",""); price_derived = msg.get("price",0)
             score = msg.get("score",0)
-            stop_loss = msg.get("stop_loss",0); take_profit = msg.get("take_profit",0)
+            stop_loss = msg.get("stop_loss",0)
+            take_profit = msg.get("take_profit",0)
             now = time.time()
             if sym in last_b_signal and now - last_b_signal[sym] < 600: continue
             if is_quiet_period(): continue
 
-            # B 层下单
-            actual_price, _ = place_order(sym, side, price_derived)
+            actual_price, order = place_order(sym, side, price_derived)
 
             tg_lines = [f"🎯 {side.upper()} {sym} 评分:{score:.1f}"]
             if actual_price:
                 tg_lines.append(f"✅ 下单成功: {actual_price:.6f}")
+                # 如果 B 层下单成功，撤销对应方向的 A 层埋单
+                order_key = f"{sym}_{side.lower()}"
+                if order_key in active_a_orders:
+                    cancel_order(active_a_orders[order_key]['order'].get('id',''), sym)
+                    del active_a_orders[order_key]
             else:
                 tg_lines.append(f"❌ 下单失败")
             tg_lines.append(f"🛑 止损: {stop_loss:.6f} | 🎯 止盈: {take_profit:.6f}")

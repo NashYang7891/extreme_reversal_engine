@@ -84,7 +84,7 @@ struct SymbolContext {
 std::map<std::string, SymbolContext> contexts;
 std::shared_mutex contexts_mutex;
 
-// A层（正式）
+// A层
 bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, double& out_vol_ratio) {
     double change_3m = ind.price_change_pct(3*60);
     if (std::abs(change_3m) > 0.20) return false;
@@ -162,12 +162,9 @@ void run_detection() {
                 std::chrono::system_clock::now().time_since_epoch()).count();
 
             for (auto& [sym, ctx] : contexts) {
-                // 时效性检查：丢弃超过 5 秒未更新的币种
                 if (ctx.indicators.is_stale(5000)) continue;
-
                 try {
                     double change_pct = 0.0, vol_ratio = 0.0;
-                    // ---- A层 ----
                     if (active_layer(ctx.orderbook, ctx.indicators, change_pct, vol_ratio)) {
                         ctx.last_active_time = now_ms;
                         json a_msg;
@@ -185,7 +182,6 @@ void run_detection() {
                         std::cout << a_msg.dump() << std::endl;
                     }
 
-                    // ---- B层（带时效性）----
                     int64_t last_active = ctx.last_active_time.load();
                     if (last_active > 0 && (now_ms - last_active) < 15 * 60 * 1000) {
                         auto sig = ctx.detector.check(ctx.orderbook);
@@ -199,11 +195,13 @@ void run_detection() {
                             b_msg["timestamp"] = std::time(nullptr);
                             double atr = ctx.indicators.atr();
                             if (atr > 0) {
+                                double raw_stop = atr * 2.0;
+                                double hard_limit = sig.price * 0.03; // 3%
                                 if (sig.side == "LONG") {
-                                    b_msg["stop_loss"] = sig.price - atr * 2.0;
+                                    b_msg["stop_loss"] = std::min(raw_stop, hard_limit);
                                     b_msg["take_profit"] = sig.price + atr * 3.0;
                                 } else {
-                                    b_msg["stop_loss"] = sig.price + atr * 2.0;
+                                    b_msg["stop_loss"] = std::min(raw_stop, hard_limit);
                                     b_msg["take_profit"] = sig.price - atr * 3.0;
                                 }
                             }
@@ -219,7 +217,6 @@ void run_detection() {
             }
         }
         auto elapsed = std::chrono::steady_clock::now() - start;
-        // 检测间隔 5ms，保证极低延迟
         if (elapsed < std::chrono::milliseconds(5))
             std::this_thread::sleep_for(std::chrono::milliseconds(5) - elapsed);
     }
@@ -233,8 +230,7 @@ int main() {
                                                    std::forward_as_tuple(sym),
                                                    std::forward_as_tuple());
     }
-    spdlog::info("引擎启动，监控 {} 个合约 (实时版)", symbols.size());
-
+    spdlog::info("引擎启动，监控 {} 个合约 (最终版)", symbols.size());
     std::thread ws_thread(run_websocket, symbols);
     std::thread detect_thread(run_detection);
     ws_thread.join();
