@@ -98,25 +98,34 @@ struct SymbolContext {
     Indicators indicators;
     MLOptimizer ml{3};
     SignalDetector detector{ml, indicators};
-    std::atomic<int64_t> last_active_time{0};   // 毫秒级时间戳
+    std::atomic<int64_t> last_active_time{0};
 };
 
 std::map<std::string, SymbolContext> contexts;
 std::shared_mutex contexts_mutex;
 
-// A层异动探测器 (放宽)
-bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, double& out_vol_ratio) {
+// A层诊断版：降门槛 + 取消量比过滤（调试用）
+bool active_layer_diag(const OrderBook& ob, Indicators& ind, double& out_change) {
     double change_3m = ind.price_change_pct(3 * 60);
-    if (std::abs(change_3m) < 0.012) return false;    // 1.2% 门槛
+    // 极度宽松：涨跌幅 >= 0.5% 即触发
+    if (std::abs(change_3m) < 0.005) return false;
+
+    // 计算量比，但不用于过滤，只用于输出
     double recent_vol = ob.recent_volume(3 * 60 * 1000);
+    // 平均值如果为 0，强行使用 recent_vol 避免死锁
     double avg_vol = ind.get_volume_ema();
-    if (avg_vol <= 0) return false;
-    double vol_ratio = recent_vol / avg_vol;
-    if (vol_ratio < 1.5) return false;                 // 1.5倍量
+    if (avg_vol <= 0) {
+        avg_vol = recent_vol;  // 紧急初始化
+        ind.update_volume(avg_vol);
+    }
+    double vol_ratio = avg_vol > 0 ? recent_vol / avg_vol : 0.0;
+    // 更新成交量 EMA
     ind.update_volume(recent_vol);
     out_change = change_3m;
-    out_vol_ratio = vol_ratio;
-    return true;
+    // 打印调试信息（会出现在 Python 的非JSON输出中）
+    spdlog::debug("A层候选 {}: 涨跌幅={:.2f}%, 量比={:.2f}, 当前价={}", "sym",
+                  change_3m * 100, vol_ratio, ind.price());
+    return true;   // 无论量比多少，只要涨跌幅达标就通过
 }
 
 void run_websocket(const std::vector<std::string>& symbols) {
@@ -146,10 +155,18 @@ void run_websocket(const std::vector<std::string>& symbols) {
             ws.write(net::buffer(sub_msg.dump()));
 
             beast::flat_buffer buffer;
+            auto last_heartbeat = std::chrono::steady_clock::now();
             while (keep_running) {
                 ws.read(buffer);
                 auto msg = json::parse(beast::buffers_to_string(buffer.data()));
                 buffer.clear();
+                // 每 10 秒打印一次心跳，证明数据流正常
+                auto now = std::chrono::steady_clock::now();
+                if (now - last_heartbeat > std::chrono::seconds(10)) {
+                    spdlog::info("WebSocket 数据正常，时间戳 {}", std::time(nullptr));
+                    last_heartbeat = now;
+                }
+
                 if (msg.contains("stream") && msg.contains("data")) {
                     std::string stream = msg["stream"];
                     const auto& data = msg["data"];
@@ -191,21 +208,21 @@ void run_detection() {
 
             for (auto& [sym, ctx] : contexts) {
                 try {
-                    double change_pct = 0.0, vol_ratio = 0.0;
-                    // ---- A层 ----
-                    if (active_layer(ctx.orderbook, ctx.indicators, change_pct, vol_ratio)) {
-                        ctx.last_active_time = now_ms;   // atomic 存储
+                    double change_pct = 0.0;
+                    // ---- A层 (诊断宽松版) ----
+                    if (active_layer_diag(ctx.orderbook, ctx.indicators, change_pct)) {
+                        ctx.last_active_time = now_ms;
                         json a_msg;
                         a_msg["type"] = "A_ACTIVE";
                         a_msg["symbol"] = sym;
                         a_msg["price"] = ctx.indicators.price();
                         a_msg["change_pct"] = change_pct * 100.0;
-                        a_msg["vol_ratio"] = vol_ratio;
+                        a_msg["vol_ratio"] = 0.0;  // 不输出，避免混淆
                         a_msg["timestamp"] = std::time(nullptr);
                         std::cout << a_msg.dump() << std::endl;
                     }
 
-                    // ---- B层：仅在活跃标签未过期时执行 ----
+                    // ---- B层（仅活跃标签未过期时） ----
                     int64_t last_active = ctx.last_active_time.load();
                     if (last_active > 0 && (now_ms - last_active) < 15 * 60 * 1000) {
                         auto sig = ctx.detector.check(ctx.orderbook);
@@ -218,8 +235,7 @@ void run_detection() {
                             b_msg["score"]  = sig.score;
                             b_msg["timestamp"] = std::time(nullptr);
                             std::cout << b_msg.dump() << std::endl;
-                            // 触发后清空活跃标签，避免重复触发
-                            ctx.last_active_time = 0;
+                            ctx.last_active_time = 0;   // 触发后清空
                         }
                     }
                 } catch (const std::exception& e) {
@@ -240,13 +256,12 @@ int main() {
     {
         std::unique_lock lock(contexts_mutex);
         for (auto& sym : symbols) {
-            // 使用分段构造避免拷贝/移动 atomic
             contexts.emplace(std::piecewise_construct,
                              std::forward_as_tuple(sym),
                              std::forward_as_tuple());
         }
     }
-    spdlog::info("引擎已成功启动，正在监控 {} 个合约 (雷达+狙击)", symbols.size());
+    spdlog::info("引擎已成功启动 (诊断模式)，正在监控 {} 个合约", symbols.size());
 
     std::thread ws_thread(run_websocket, symbols);
     std::thread detect_thread(run_detection);
