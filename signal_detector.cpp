@@ -60,7 +60,6 @@ Signal SignalDetector::check(const OrderBook& ob) {
     bool decay_long = check_momentum_decay(ob, "LONG");
     bool decay_short = check_momentum_decay(ob, "SHORT");
 
-    // 平衡参数表
     constexpr double LONG_DEV_THRESH  = 2.3;
     constexpr double LONG_OSC_MAX     = 0.30;
     constexpr double LONG_WALL_MIN    = 0.65;
@@ -72,13 +71,10 @@ Signal SignalDetector::check(const OrderBook& ob) {
         sig.valid = true; sig.side = "LONG";
         sig.price = solve_critical_price(ob, "LONG");
         sig.score = dev * 30.0 + (1.0 - osc) * 30.0 + wall * 40.0;
-        spdlog::debug("{} LONG dev={:.2f} osc={:.2f} wall={:.2f}", "sym", dev, osc, wall);
     } else if (dev < -SHORT_DEV_THRESH && osc > SHORT_OSC_MIN && wall < SHORT_WALL_MAX && decay_short) {
         sig.valid = true; sig.side = "SHORT";
         sig.price = solve_critical_price(ob, "SHORT");
         sig.score = (-dev) * 30.0 + osc * 30.0 + (1.0 - wall) * 40.0;
-        spdlog::debug("{} SHORT dev={:.2f} osc={:.2f} wall={:.2f}", "sym", dev, osc, wall);
     }
-
     return sig;
 }
