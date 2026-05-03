@@ -1,7 +1,7 @@
 #pragma once
 #include <deque>
 #include <vector>
-#include <cstddef>   // 必须添加，提供 size_t 定义
+#include <cstddef>
 
 class Indicators {
 public:
@@ -9,7 +9,7 @@ public:
     void update(double micro_price);
     double atr(int period = 14) const;
     double rsi(int period = 14) const;
-    double kdj_j(int period = 9) const;
+    double kdj_j(int period = 9);
     double cci(int period = 20) const;
     double ema20() const;
     double composite_oscillator(double w_rsi, double w_kdj, double w_cci) const;
@@ -20,4 +20,7 @@ private:
     double ema20_ = 0.0;
     size_t max_size_;
     void update_ema();
+    // KDJ 平滑状态（每个实例独立）
+    double k_ = 50.0;
+    double d_ = 50.0;
 };

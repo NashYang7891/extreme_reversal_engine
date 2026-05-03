@@ -43,17 +43,16 @@ double Indicators::rsi(int period) const {
     return 100.0 - (100.0 / (1.0 + rs));
 }
 
-double Indicators::kdj_j(int period) const {
+double Indicators::kdj_j(int period) {
     if (prices_.size() < static_cast<size_t>(period)) return 50.0;
     double low = *std::min_element(prices_.end() - period, prices_.end());
     double high = *std::max_element(prices_.end() - period, prices_.end());
     if (high == low) return 50.0;
     double rsv = (prices_.back() - low) / (high - low) * 100.0;
-    // 注意：static 变量在多线程下不安全，但我们的检测线程是单例，暂时保留
-    static double k = 50.0, d = 50.0;
-    k = 0.6667 * k + 0.3333 * rsv;
-    d = 0.6667 * d + 0.3333 * k;
-    return 3.0 * k - 2.0 * d;
+    // 使用成员变量，去除 static
+    k_ = 0.6667 * k_ + 0.3333 * rsv;
+    d_ = 0.6667 * d_ + 0.3333 * k_;
+    return 3.0 * k_ - 2.0 * d_;
 }
 
 double Indicators::cci(int period) const {
