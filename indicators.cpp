@@ -71,3 +71,19 @@ double Indicators::composite_oscillator(double w_rsi, double w_kdj, double w_cci
     double c = (cci() + 200.0) / 400.0;
     return w_rsi * r + w_kdj * k + w_cci * c;
 }
+
+double Indicators::price_change_pct(int window_sec, int offset_sec) const {
+    size_t total = prices_.size();
+    if (total < static_cast<size_t>(window_sec + offset_sec + 1)) return 0.0;
+    size_t cur_idx = total - 1 - offset_sec;
+    size_t prev_idx = cur_idx - window_sec;
+    if (prev_idx >= total) return 0.0;
+    double prev_price = prices_[prev_idx];
+    if (prev_price == 0.0) return 0.0;
+    return (prices_[cur_idx] - prev_price) / prev_price;
+}
+
+void Indicators::update_volume(double volume) {
+    if (vol_ema_ == 0.0) vol_ema_ = volume;
+    else vol_ema_ = VOL_EMA_ALPHA * volume + (1.0 - VOL_EMA_ALPHA) * vol_ema_;
+}

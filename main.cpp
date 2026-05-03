@@ -35,7 +35,7 @@ static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *use
     return size * nmemb;
 }
 
-// 终极兜底列表（去重后20个主流+高波动品种）
+// 兜底合约列表（20个主流+高波动币种）
 const std::vector<std::string> ULTIMATE_FALLBACK = {
     "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "TRXUSDT",
     "BNBUSDT", "ZECUSDT", "BIOUSDT", "ORDIUSDT", "TSTUSDT", "BABYUSDT",
@@ -43,7 +43,8 @@ const std::vector<std::string> ULTIMATE_FALLBACK = {
     "TAGUSDT", "BSBUSDT", "GENIUSUSDT"
 };
 
-std::vector<std::string> fetch_top_symbols(int top_n = 30, double min_vol = 30000000.0) {
+// 获取成交量前100的USDT永续合约（24h ≥ 3000万）
+std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 30000000.0) {
     CURL *curl = curl_easy_init();
     if (!curl) {
         spdlog::error("curl 初始化失败，返回兜底列表");
@@ -66,11 +67,11 @@ std::vector<std::string> fetch_top_symbols(int top_n = 30, double min_vol = 3000
     try {
         auto data = json::parse(response);
         for (auto& item : data) {
-            std::string symbol = item["symbol"];
-            if (symbol.size() > 4 && symbol.compare(symbol.size()-4, 4, "USDT") == 0 &&
-                symbol.find('_') == std::string::npos && symbol != "USDCUSDT") {
+            std::string sym = item["symbol"];
+            if (sym.size() > 4 && sym.compare(sym.size()-4, 4, "USDT") == 0 &&
+                sym.find('_') == std::string::npos && sym != "USDCUSDT") {
                 double vol = std::stod(item["quoteVolume"].get<std::string>());
-                tickers.emplace_back(symbol, vol);
+                tickers.emplace_back(sym, vol);
             }
         }
     } catch (const std::exception& e) {
@@ -90,12 +91,10 @@ std::vector<std::string> fetch_top_symbols(int top_n = 30, double min_vol = 3000
             if ((int)result.size() >= top_n) break;
         }
     }
-
     if (result.empty()) {
         spdlog::warn("无合约满足成交量门槛，使用兜底列表");
         result = ULTIMATE_FALLBACK;
     }
-
     spdlog::info("将监控 {} 个合约, 前3: {}", result.size(),
                  result.size() >= 3 ? result[0]+","+result[1]+","+result[2] : "");
     return result;
@@ -108,9 +107,22 @@ struct SymbolContext {
     SignalDetector detector{ml, indicators};
 };
 
-// 全局上下文 + 读写锁
 std::map<std::string, SymbolContext> contexts;
 std::shared_mutex contexts_mutex;
+
+// A层异动探测器：返回true且填充涨跌幅、量比
+bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, double& out_vol_ratio) {
+    double change_3m = ind.price_change_pct(3 * 60);
+    if (std::abs(change_3m) < 0.02) return false;
+    double recent_vol = ob.recent_volume(3 * 60 * 1000);
+    double avg_vol = ind.get_volume_ema();
+    double vol_ratio = avg_vol > 0 ? recent_vol / avg_vol : 0.0;
+    if (avg_vol > 0 && vol_ratio < 3.0) return false;
+    ind.update_volume(recent_vol);
+    out_change = change_3m;
+    out_vol_ratio = vol_ratio;
+    return true;
+}
 
 void run_websocket(const std::vector<std::string>& symbols) {
     while (keep_running) {
@@ -164,7 +176,8 @@ void run_websocket(const std::vector<std::string>& symbols) {
                         double price = std::stod(data["p"].get<std::string>());
                         double qty   = std::stod(data["q"].get<std::string>());
                         bool isMaker = data["m"];
-                        it->second.orderbook.add_agg_trade(!isMaker, qty);
+                        int64_t trade_time = std::stoll(data["T"].get<std::string>());
+                        it->second.orderbook.add_agg_trade(!isMaker, qty, trade_time);
                     }
                 }
             }
@@ -179,18 +192,33 @@ void run_detection() {
     while (keep_running) {
         auto start = std::chrono::steady_clock::now();
         {
-            std::shared_lock lock(contexts_mutex);   // 读锁
+            std::shared_lock lock(contexts_mutex);
             for (auto& [sym, ctx] : contexts) {
                 try {
+                    double change_pct = 0.0, vol_ratio = 0.0;
+                    // A层检测
+                    bool a_active = active_layer(ctx.orderbook, ctx.indicators, change_pct, vol_ratio);
+                    if (a_active) {
+                        json a_msg;
+                        a_msg["type"] = "A_ACTIVE";
+                        a_msg["symbol"] = sym;
+                        a_msg["price"] = ctx.indicators.price();
+                        a_msg["change_pct"] = change_pct * 100.0;
+                        a_msg["vol_ratio"] = vol_ratio;
+                        a_msg["timestamp"] = std::time(nullptr);
+                        std::cout << a_msg.dump() << std::endl;
+                    }
+                    // B层检测
                     auto sig = ctx.detector.check(ctx.orderbook);
                     if (sig.valid) {
-                        json out;
-                        out["symbol"] = sym;
-                        out["side"]   = sig.side;
-                        out["price"]  = sig.price;
-                        out["score"]  = sig.score;
-                        out["timestamp"] = std::time(nullptr);
-                        std::cout << out.dump() << std::endl;
+                        json b_msg;
+                        b_msg["type"] = "SIGNAL";
+                        b_msg["symbol"] = sym;
+                        b_msg["side"]   = sig.side;
+                        b_msg["price"]  = sig.price;
+                        b_msg["score"]  = sig.score;
+                        b_msg["timestamp"] = std::time(nullptr);
+                        std::cout << b_msg.dump() << std::endl;
                     }
                 } catch (const std::exception& e) {
                     spdlog::error("检测 {} 时异常: {}", sym, e.what());
@@ -206,13 +234,11 @@ void run_detection() {
 }
 
 int main() {
-    auto symbols = fetch_top_symbols(30, 30000000.0);
-    // 初始化 contexts（写锁）
+    auto symbols = fetch_top_symbols(100, 30000000.0);
     {
         std::unique_lock lock(contexts_mutex);
         for (auto& sym : symbols) contexts.emplace(sym, SymbolContext{});
     }
-
     spdlog::info("引擎已成功启动，正在监控 {} 个合约", symbols.size());
 
     std::thread ws_thread(run_websocket, symbols);

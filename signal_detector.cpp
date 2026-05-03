@@ -1,7 +1,6 @@
 #include "signal_detector.h"
 #include <spdlog/spdlog.h>
 #include <cmath>
-#include <algorithm>
 
 SignalDetector::SignalDetector(MLOptimizer& ml, Indicators& ind) : ml_(ml), ind_(ind) {}
 
@@ -32,22 +31,20 @@ double SignalDetector::solve_critical_price(const OrderBook& ob, const std::stri
     return (lo + hi) / 2.0;
 }
 
-bool SignalDetector::check_momentum_decay(const OrderBook& ob, const std::string& side) {
-    const auto& prices = ind_.prices();
-    if (prices.size() < 6) return false;
-    std::vector<double> diffs;
-    for (size_t i = prices.size() - 5; i < prices.size(); ++i)
-        diffs.push_back(prices[i] - prices[i-1]);
-    double accel = diffs.back() - diffs[diffs.size()-2];
+bool SignalDetector::check_momentum_slowing(const std::string& side) {
+    // 斜率变缓：当前5分钟涨跌幅 < 前一个5分钟涨跌幅的一半
+    double cur_change = ind_.price_change_pct(5 * 60);          // 最近5分钟
+    double prev_change = ind_.price_change_pct(5 * 60, 5 * 60); // 前一个5分钟
+    if (std::abs(prev_change) < 1e-6) return false;
     if (side == "LONG")
-        return prices.back() <= *std::min_element(prices.begin(), prices.end()-2) && accel > 0;
+        return (cur_change - prev_change) < -0.5 * std::abs(prev_change); // 上涨速度锐减
     else
-        return prices.back() >= *std::max_element(prices.begin(), prices.end()-2) && accel < 0;
+        return (cur_change - prev_change) > 0.5 * std::abs(prev_change);  // 下跌速度锐减
 }
 
 Signal SignalDetector::check(const OrderBook& ob) {
     Signal sig;
-    if (ind_.prices().size() < 20) return sig;
+    if (ind_.prices().size() < 60) return sig;
     double atr = ind_.atr();
     if (atr <= 0) return sig;
     double ema20 = ind_.ema20();
@@ -57,9 +54,8 @@ Signal SignalDetector::check(const OrderBook& ob) {
     double dev = (ema20 - price) / atr;
     double osc = ind_.composite_oscillator(ml_.get_w_rsi(), ml_.get_w_kdj(), ml_.get_w_cci());
     double wall = ob.imbalance();
-    bool decay_long = check_momentum_decay(ob, "LONG");
-    bool decay_short = check_momentum_decay(ob, "SHORT");
 
+    // 黄金平衡版参数
     constexpr double LONG_DEV_THRESH  = 2.3;
     constexpr double LONG_OSC_MAX     = 0.30;
     constexpr double LONG_WALL_MIN    = 0.65;
@@ -67,11 +63,14 @@ Signal SignalDetector::check(const OrderBook& ob) {
     constexpr double SHORT_OSC_MIN    = 0.70;
     constexpr double SHORT_WALL_MAX   = 0.35;
 
-    if (dev > LONG_DEV_THRESH && osc < LONG_OSC_MAX && wall > LONG_WALL_MIN && decay_long) {
+    bool slow_long = check_momentum_slowing("LONG");
+    bool slow_short = check_momentum_slowing("SHORT");
+
+    if (dev > LONG_DEV_THRESH && osc < LONG_OSC_MAX && wall > LONG_WALL_MIN && slow_long) {
         sig.valid = true; sig.side = "LONG";
         sig.price = solve_critical_price(ob, "LONG");
         sig.score = dev * 30.0 + (1.0 - osc) * 30.0 + wall * 40.0;
-    } else if (dev < -SHORT_DEV_THRESH && osc > SHORT_OSC_MIN && wall < SHORT_WALL_MAX && decay_short) {
+    } else if (dev < -SHORT_DEV_THRESH && osc > SHORT_OSC_MIN && wall < SHORT_WALL_MAX && slow_short) {
         sig.valid = true; sig.side = "SHORT";
         sig.price = solve_critical_price(ob, "SHORT");
         sig.score = (-dev) * 30.0 + osc * 30.0 + (1.0 - wall) * 40.0;
