@@ -1,5 +1,7 @@
 #pragma once
+#include <cstddef>   // 加上这一行！
 #include <deque>
+#include <vector>
 
 class MLOptimizer {
 public:
