@@ -115,6 +115,8 @@ std::shared_mutex contexts_mutex;
 // ---------- A层：异动探测器 (1.2% + 1.5x量比) ----------
 bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, double& out_vol_ratio) {
     double change_3m = ind.price_change_pct(3 * 60);
+    // 过滤明显异常涨跌幅（可能是数据错乱）
+    if (std::abs(change_3m) > 0.20) return false;
     if (std::abs(change_3m) < 0.012) return false;
 
     double recent_vol = ob.recent_volume(3 * 60 * 1000);

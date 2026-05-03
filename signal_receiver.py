@@ -75,8 +75,9 @@ def main():
         print(f"⚠️ 加载市场数据失败: {e}")
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True)
-    send_tg("🤖 诊断模式启动 (查看异动恢复)")
-    last_b_signal = {}
+    send_tg("🤖 币安极端反转引擎已启动 (A层去重+B层加速)")
+    last_b_signal = {}      # B层1小时冷却
+    last_a_push = {}        # A层5分钟去重
 
     for line in proc.stdout:
         line = line.strip()
@@ -84,7 +85,6 @@ def main():
         try:
             msg = json.loads(line)
         except json.JSONDecodeError:
-            # 打印所有非 JSON 输出（包含心跳和调试信息）
             print("C++:", line)
             continue
 
@@ -92,12 +92,17 @@ def main():
         sym = msg.get("symbol", "")
 
         if msg_type == "A_ACTIVE":
-            # 诊断期间不加去重，允许频繁推送
+            now = time.time()
+            if sym in last_a_push and now - last_a_push[sym] < 300:   # 5分钟内同一币种不重复推送
+                continue
             price = msg.get("price", 0)
             change = msg.get("change_pct", 0)
-            tg_text = f"🔥 {sym} 异动 | 价:{price:.4f} | 3m涨跌:{change:+.2f}%"
+            vol_ratio = msg.get("vol_ratio", 0)
+            dev = msg.get("dev", None)
+            dev_str = f" | 偏离度:{dev:.1f}" if dev is not None else ""
+            tg_text = f"🔥 {sym} 异动 | 价:{price:.4f} | 3m涨跌:{change:+.2f}% | 量比:{vol_ratio:.1f}x{dev_str}"
             send_tg(tg_text)
-            print(f"A层推送: {sym} change={change:.2f}%")
+            last_a_push[sym] = now
 
         elif msg_type == "SIGNAL":
             side = msg.get("side", "")
