@@ -8,6 +8,7 @@ find_package(Boost REQUIRED COMPONENTS system)
 find_package(nlohmann_json REQUIRED)
 find_package(spdlog REQUIRED)
 find_package(CURL REQUIRED)
+find_package(OpenSSL REQUIRED)
 
 add_executable(engine
     main.cpp
@@ -23,5 +24,7 @@ target_link_libraries(engine
     nlohmann_json::nlohmann_json
     spdlog::spdlog
     CURL::libcurl
+    OpenSSL::SSL
+    OpenSSL::Crypto
     pthread
 )
