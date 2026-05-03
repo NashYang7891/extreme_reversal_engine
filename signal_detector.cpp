@@ -32,9 +32,9 @@ double SignalDetector::solve_critical_price(const OrderBook& ob, const std::stri
 }
 
 bool SignalDetector::check_momentum_slowing(const std::string& side) {
-    // 斜率变缓：当前5分钟涨跌幅 < 前一个5分钟涨跌幅的一半
-    double cur_change = ind_.price_change_pct(5 * 60);          // 最近5分钟
-    double prev_change = ind_.price_change_pct(5 * 60, 5 * 60); // 前一个5分钟
+    // 15分钟斜率衰减：当前15分钟涨跌幅 < 前15分钟涨幅的一半
+    double cur_change = ind_.price_change_pct(15 * 60);           // 最近15分钟
+    double prev_change = ind_.price_change_pct(15 * 60, 15 * 60); // 前一个15分钟
     if (std::abs(prev_change) < 1e-6) return false;
     if (side == "LONG")
         return (cur_change - prev_change) < -0.5 * std::abs(prev_change); // 上涨速度锐减
@@ -55,7 +55,6 @@ Signal SignalDetector::check(const OrderBook& ob) {
     double osc = ind_.composite_oscillator(ml_.get_w_rsi(), ml_.get_w_kdj(), ml_.get_w_cci());
     double wall = ob.imbalance();
 
-    // 黄金平衡版参数
     constexpr double LONG_DEV_THRESH  = 2.3;
     constexpr double LONG_OSC_MAX     = 0.30;
     constexpr double LONG_WALL_MIN    = 0.65;
