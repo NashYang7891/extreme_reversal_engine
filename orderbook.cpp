@@ -3,15 +3,19 @@
 
 void OrderBook::update_depth(const json& data) {
     bids.clear(); asks.clear();
-    for (auto& b : data["bids"]) {
-        double price = std::stod(b[0].get<std::string>());
-        double qty   = std::stod(b[1].get<std::string>());
-        bids[price] = qty;
+    if (data.contains("b")) {                   // 币安用 "b" 表示 bids
+        for (auto& b : data["b"]) {
+            double price = std::stod(b[0].get<std::string>());
+            double qty   = std::stod(b[1].get<std::string>());
+            bids[price] = qty;
+        }
     }
-    for (auto& a : data["asks"]) {
-        double price = std::stod(a[0].get<std::string>());
-        double qty   = std::stod(a[1].get<std::string>());
-        asks[price] = qty;
+    if (data.contains("a")) {                   // 币安用 "a" 表示 asks
+        for (auto& a : data["a"]) {
+            double price = std::stod(a[0].get<std::string>());
+            double qty   = std::stod(a[1].get<std::string>());
+            asks[price] = qty;
+        }
     }
 }
 
