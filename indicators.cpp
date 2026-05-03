@@ -67,3 +67,6 @@ double Indicators::composite_oscillator(double w_rsi, double w_kdj, double w_cci
     double c = (cci() + 200.0) / 400.0;
     return w_rsi * r + w_kdj * k + w_cci * c;
 }
+double Indicators::ema20() const {
+    return ema20_;
+}

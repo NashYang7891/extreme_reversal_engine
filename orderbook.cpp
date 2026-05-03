@@ -42,3 +42,10 @@ double OrderBook::sell_volume() const {
     return std::accumulate(asks.begin(), asks.end(), 0.0,
         [](double sum, const auto& p) { return sum + p.second; });
 }
+double OrderBook::best_bid() const {
+    return bids.empty() ? 0.0 : bids.rbegin()->first;
+}
+
+double OrderBook::best_ask() const {
+    return asks.empty() ? 0.0 : asks.begin()->first;
+}
