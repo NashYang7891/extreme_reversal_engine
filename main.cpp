@@ -29,20 +29,18 @@ using tcp = net::ip::tcp;
 
 std::atomic<bool> keep_running{true};
 
-// libcurl 回调
 static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
     ((std::string*)userp)->append((char*)contents, size * nmemb);
     return size * nmemb;
 }
 
-// 获取币安 USDT 永续合约列表，按24h成交量过滤，取前30个
+// 获取币安 USDT 永续合约，成交量前 30
 std::vector<std::string> fetch_top_symbols(int top_n = 30, double min_vol = 30000000.0) {
     std::vector<std::string> result;
     CURL *curl = curl_easy_init();
     if (!curl) return result;
     std::string response;
 
-    // 1. 获取所有合约信息
     curl_easy_setopt(curl, CURLOPT_URL, "https://fapi.binance.com/fapi/v1/exchangeInfo");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
@@ -53,12 +51,10 @@ std::vector<std::string> fetch_top_symbols(int top_n = 30, double min_vol = 3000
     std::vector<std::string> symbols;
     for (auto& s : exInfo["symbols"]) {
         if (s["quoteAsset"] == "USDT" && s["contractType"] == "PERPETUAL" && s["status"] == "TRADING") {
-            std::string sym = s["symbol"];                     // 例如 "BTCUSDT"
-            symbols.push_back(sym);
+            symbols.push_back(s["symbol"]);
         }
     }
 
-    // 2. 获取每个 symbol 的24h成交量
     std::map<std::string, double> vol_map;
     for (auto& sym : symbols) {
         std::string url = "https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=" + sym;
@@ -76,7 +72,6 @@ std::vector<std::string> fetch_top_symbols(int top_n = 30, double min_vol = 3000
     }
     curl_easy_cleanup(curl);
 
-    // 3. 过滤并排序
     std::vector<std::pair<std::string, double>> eligible;
     for (auto& sym : symbols) {
         if (vol_map[sym] >= min_vol)
@@ -91,7 +86,6 @@ std::vector<std::string> fetch_top_symbols(int top_n = 30, double min_vol = 3000
     return result;
 }
 
-// 每个合约的完整状态
 struct SymbolContext {
     OrderBook orderbook;
     Indicators indicators;
@@ -107,31 +101,26 @@ int main() {
     }
 
     std::map<std::string, SymbolContext> contexts;
-    // 注意：SymbolContext 需要默认构造函数
     for (auto& sym : symbols) contexts.emplace(sym, SymbolContext{});
 
-    // ----- SSL WebSocket 连接 -----
+    // SSL WebSocket 连接
     net::io_context ioc;
     ssl::context ctx{ssl::context::tls_client};
     ctx.set_options(ssl::context::default_workarounds |
                     ssl::context::no_sslv2 |
                     ssl::context::no_sslv3);
-    ctx.set_verify_mode(ssl::verify_none);   // 测试环境，生产请用 set_default_verify_paths()
+    ctx.set_verify_mode(ssl::verify_none); // 测试用
 
     ws::stream<beast::ssl_stream<tcp::socket>> ws(ioc, ctx);
     tcp::resolver resolver(ioc);
     auto const results = resolver.resolve("fstream.binance.com", "443");
     net::connect(ws.next_layer().next_layer(), results.begin(), results.end());
-
-    // SSL 握手 + WebSocket 握手
     ws.next_layer().handshake(ssl::stream_base::client);
     ws.handshake("fstream.binance.com", "/stream");
 
-    // 构造订阅参数（所有 symbol 转为小写）
     std::vector<std::string> streams;
     for (auto& sym : symbols) {
         std::string s = sym;
-        // 转换为小写
         for (char& c : s) c = std::tolower(c);
         streams.push_back(s + "@depth@100ms");
         streams.push_back(s + "@aggTrade");
@@ -150,11 +139,9 @@ int main() {
                 if (msg.contains("stream") && msg.contains("data")) {
                     std::string stream = msg["stream"];
                     const auto& data = msg["data"];
-                    // 从 stream 名称提取 symbol（例如 "btcusdt@depth@100ms" -> "btcusdt"）
                     size_t pos = stream.find('@');
                     if (pos == std::string::npos) continue;
                     std::string sym = stream.substr(0, pos);
-                    // 转回大写以便匹配 contexts 的 key
                     for (char& c : sym) c = std::toupper(c);
                     auto it = contexts.find(sym);
                     if (it == contexts.end()) continue;
@@ -166,8 +153,8 @@ int main() {
                     } else if (stream.find("@aggTrade") != std::string::npos) {
                         double price = std::stod(data["p"].get<std::string>());
                         double qty   = std::stod(data["q"].get<std::string>());
-                        bool isMaker = data["m"];   // true 表示卖方主动（卖出），false 是买方主动（买入）
-                        it->second.orderbook.add_agg_trade(!isMaker, qty); // 买方主动 -> 增加买方量
+                        bool isMaker = data["m"];
+                        it->second.orderbook.add_agg_trade(!isMaker, qty);
                     }
                 }
             } catch (std::exception const& e) {
@@ -177,20 +164,26 @@ int main() {
         }
     });
 
-    // 检测线程：每 100ms 检查所有合约
+    // 检测线程 (带异常保护)
     std::thread detect_thread([&](){
         while (keep_running) {
             auto start = std::chrono::steady_clock::now();
             for (auto& [sym, ctx] : contexts) {
-                auto sig = ctx.detector.check(ctx.orderbook);
-                if (sig.valid) {
-                    json out;
-                    out["symbol"] = sym;
-                    out["side"]   = sig.side;
-                    out["price"]  = sig.price;
-                    out["score"]  = sig.score;
-                    out["timestamp"] = std::time(nullptr);
-                    std::cout << out.dump() << std::endl;
+                try {
+                    auto sig = ctx.detector.check(ctx.orderbook);
+                    if (sig.valid) {
+                        json out;
+                        out["symbol"] = sym;
+                        out["side"]   = sig.side;
+                        out["price"]  = sig.price;
+                        out["score"]  = sig.score;
+                        out["timestamp"] = std::time(nullptr);
+                        std::cout << out.dump() << std::endl;
+                    }
+                } catch (const std::exception& e) {
+                    spdlog::error("检测 {} 时异常: {}", sym, e.what());
+                } catch (...) {
+                    spdlog::error("检测 {} 时未知异常", sym);
                 }
             }
             auto elapsed = std::chrono::steady_clock::now() - start;
@@ -199,6 +192,7 @@ int main() {
         }
     });
 
+    spdlog::info("引擎已成功启动，正在监控 {} 个合约", symbols.size());
     ws_thread.join();
     detect_thread.join();
     return 0;
