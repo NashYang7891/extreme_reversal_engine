@@ -289,6 +289,9 @@ void run_detection() {
 }
 
 int main() {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    std::cout.setf(std::ios::unitbuf);
+        
     signal(SIGSEGV, signal_handler);
     signal(SIGABRT, signal_handler);
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
