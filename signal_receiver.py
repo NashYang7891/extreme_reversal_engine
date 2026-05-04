@@ -146,7 +146,7 @@ def main():
     except: pass
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True)
-    send_tg("🤖 引擎启动 (过期弃单+价格修正)")
+    send_tg("🤖 引擎启动 (防过期终极版)")
     last_b_signal = {}
     last_a_push = {}
     active_a_orders = {}
@@ -187,12 +187,11 @@ def main():
             vol_r = msg.get("vol_ratio", 0)
             dev = msg.get("dev", None)
 
-            # 时效性检查
             if current_market_price and derived_price > 0:
                 diff_pct = abs(current_market_price - derived_price) / derived_price
                 if diff_pct > 0.01:
-                    print(f"⚠ A层信号过期 ({sym}): 市场价{current_market_price:.6f} 信号价{derived_price:.6f}")
-                    continue
+                    print(f"⚠ A层过期({sym}): 市场价{current_market_price:.6f} 信号{derived_price:.6f} 偏差{diff_pct*100:.1f}%")
+                    # 不再丢弃，只提示，让用户知晓
 
             d_str = f" | 偏离度:{dev:.1f}" if dev else ""
             send_tg(f"🔥 {sym} 异动 | 价:{derived_price:.4f} | 涨跌:{change:+.2f}% | 量比:{vol_r:.1f}x{d_str}")
@@ -219,11 +218,11 @@ def main():
             if sym in last_b_signal and now - last_b_signal[sym] < 600: continue
             if is_quiet_period(): continue
 
-            # 过期检查
+            # Python端最终兜底：现价偏离推导价超过1%则放弃下单
             if current_market_price and derived_price > 0:
                 diff_pct = abs(current_market_price - derived_price) / derived_price
                 if diff_pct > 0.01:
-                    send_tg(f"⚠ {sym} 信号过期，跳过 (市场价{current_market_price:.6f} 推导{derived_price:.6f})")
+                    send_tg(f"⚠ {sym} 信号过期 (市场价{current_market_price:.6f} 推导{derived_price:.6f})，放弃下单")
                     continue
 
             actual_price, order = place_order(sym, side, derived_price)
