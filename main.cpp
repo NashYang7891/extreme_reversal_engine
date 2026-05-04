@@ -16,7 +16,6 @@
 #include <cctype>
 #include <shared_mutex>
 #include <curl/curl.h>
-#include <csignal>
 #include "orderbook.h"
 #include "indicators.h"
 #include "signal_detector.h"
@@ -30,43 +29,12 @@ namespace ssl  = boost::asio::ssl;
 using tcp = net::ip::tcp;
 
 std::atomic<bool> keep_running{true};
-std::atomic<int64_t> last_data_time_ms{0};
 
-void signal_handler(int sig) {
-    spdlog::critical("*** 信号 {} 退出 ***", sig);
-    keep_running = false;
-    std::exit(sig);
-}
-
-static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
-    ((std::string*)userp)->append((char*)contents, size * nmemb);
-    return size * nmemb;
-}
-
-int64_t safe_get_int64(const json& j, const std::string& key) {
-    if (!j.contains(key)) return 0;
-    if (j[key].is_number()) return j[key].get<int64_t>();
-    if (j[key].is_string()) return std::stoll(j[key].get<std::string>());
-    return 0;
-}
-double safe_get_double(const json& j, const std::string& key) {
-    if (!j.contains(key)) return 0.0;
-    if (j[key].is_number()) return j[key].get<double>();
-    if (j[key].is_string()) return std::stod(j[key].get<std::string>());
-    return 0.0;
-}
-
-const std::vector<std::string> ULTIMATE_FALLBACK = {
-    "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","TRXUSDT",
-    "BNBUSDT","ZECUSDT","BIOUSDT","ORDIUSDT","TSTUSDT","BABYUSDT",
-    "FHEUSDT","BUSDT","AIGENSYNUSDT","AKTUSDT","PARTIUSDT",
-    "TAGUSDT","BSBUSDT","GENIUSUSDT"
+// 绝对兜底列表（10个主流币）
+const std::vector<std::string> SYMBOLS = {
+    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
+    "TRXUSDT", "BNBUSDT", "LINKUSDT", "LTCUSDT", "ADAUSDT"
 };
-
-std::vector<std::string> fetch_top_symbols(int top_n = 10, double min_vol = 30000000.0) {
-    // 当前使用离线模式，稳定后可恢复在线
-    return {ULTIMATE_FALLBACK.begin(), ULTIMATE_FALLBACK.begin() + std::min(top_n, (int)ULTIMATE_FALLBACK.size())};
-}
 
 struct SymbolContext {
     OrderBook orderbook;
@@ -74,17 +42,19 @@ struct SymbolContext {
     MLOptimizer ml{3};
     SignalDetector detector{ml, indicators};
     std::atomic<int64_t> last_active_time{0};
-    std::atomic<int64_t> last_a_push_5s_ms{0};
 };
 
 std::map<std::string, SymbolContext> contexts;
 std::shared_mutex contexts_mutex;
 
+// A层（数据不足60点不输出）
 bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, double& out_vol_ratio) {
     if (ind.prices().size() < 60) return false;
+
     double change_3m = ind.price_change_pct(3*60);
     if (std::abs(change_3m) > 0.20) return false;
     if (std::abs(change_3m) < 0.012) return false;
+
     double recent_vol = ob.recent_volume(3*60*1000);
     double avg_vol = ind.get_volume_ema();
     if (avg_vol <= 1e-9) {
@@ -93,8 +63,10 @@ bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, doub
         out_vol_ratio = 1.0;
         return true;
     }
+
     double vol_ratio = recent_vol / avg_vol;
     if (vol_ratio < 1.5) return false;
+
     ind.update_volume(recent_vol);
     out_change = change_3m;
     out_vol_ratio = vol_ratio;
@@ -103,35 +75,27 @@ bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, doub
 
 void process_json_msg(const json& msg) {
     if (!msg.contains("stream") || !msg.contains("data")) return;
+
     std::string stream = msg["stream"];
     auto& data = msg["data"];
-    int64_t ts = 0;
-    if (data.contains("T")) ts = safe_get_int64(data, "T");
-    else if (data.contains("E")) ts = safe_get_int64(data, "E");
-    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                  std::chrono::system_clock::now().time_since_epoch()).count();
-    last_data_time_ms = now_ms;
-    if (ts > 0 && std::abs(now_ms - ts) > 1500) return;
+
     size_t pos = stream.find('@');
     if (pos == std::string::npos) return;
     std::string sym = stream.substr(0, pos);
     for (char& c : sym) c = std::toupper(c);
+
     std::unique_lock lock(contexts_mutex);
     auto it = contexts.find(sym);
     if (it == contexts.end()) return;
+
     try {
         if (stream.find("@depth") != std::string::npos) {
             it->second.orderbook.update_depth(data);
             double mp = it->second.orderbook.micro_price();
             if (mp > 0) it->second.indicators.update(mp);
-        } else if (stream.find("@aggTrade") != std::string::npos) {
-            double p = safe_get_double(data, "p");
-            double q = safe_get_double(data, "q");
-            bool isMaker = data["m"].get<bool>();
-            it->second.orderbook.add_agg_trade(!isMaker, q, ts);
         }
     } catch (const std::exception& e) {
-        spdlog::error("数据处理异常 [{}]: {}", sym, e.what());
+        spdlog::warn("数据处理异常 [{}]: {}", sym, e.what());
     }
 }
 
@@ -153,12 +117,11 @@ void run_websocket(const std::vector<std::string>& symbols) {
             for (const auto& sym : symbols) {
                 std::string s = sym;
                 for (char& c : s) c = std::tolower(c);
-                streams.push_back(s + "@depth@100ms");
-                streams.push_back(s + "@aggTrade");
+                streams.push_back(s + "@depth@500ms");
             }
             json sub_msg = {{"method","SUBSCRIBE"}, {"params",streams}, {"id",1}};
             ws_stream.write(net::buffer(sub_msg.dump()));
-            spdlog::info("WebSocket 连接成功，订阅 {} 个流", streams.size());
+            spdlog::info("WebSocket 连接成功，已订阅 {} 个流", streams.size());
 
             beast::flat_buffer buffer;
             while (keep_running) {
@@ -168,14 +131,13 @@ void run_websocket(const std::vector<std::string>& symbols) {
                 process_json_msg(msg);
             }
         } catch (const std::exception& e) {
-            spdlog::error("WebSocket 异常: {}，3秒后重连", e.what());
-            std::this_thread::sleep_for(std::chrono::seconds(3));
+            spdlog::error("WebSocket 异常: {}，10秒后重连", e.what());
+            std::this_thread::sleep_for(std::chrono::seconds(10));
         }
     }
 }
 
 void run_detection() {
-    auto last_heartbeat = std::chrono::steady_clock::now();
     while (keep_running) {
         auto start = std::chrono::steady_clock::now();
         {
@@ -183,23 +145,11 @@ void run_detection() {
             auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
 
-            auto now_steady = std::chrono::steady_clock::now();
-            if (now_steady - last_heartbeat > std::chrono::minutes(30)) {
-                json hb;
-                hb["type"] = "HEARTBEAT";
-                hb["symbols"] = contexts.size();
-                hb["timestamp"] = std::time(nullptr);
-                std::cout << hb.dump() << std::endl;
-                last_heartbeat = now_steady;
-            }
-
             for (auto& [sym, ctx] : contexts) {
                 if (ctx.indicators.is_stale(60000)) continue;
                 try {
                     double change_pct = 0.0, vol_ratio = 0.0;
                     if (active_layer(ctx.orderbook, ctx.indicators, change_pct, vol_ratio)) {
-                        if (now_ms - ctx.last_a_push_5s_ms.load() < 5000) continue;
-                        ctx.last_a_push_5s_ms = now_ms;
                         ctx.last_active_time = now_ms;
 
                         json a_msg;
@@ -233,33 +183,22 @@ void run_detection() {
 
                             double atr = ctx.indicators.atr();
                             double p   = sig.price;
-                            double raw_atr_stop = (atr > 1e-9) ? (atr * 2.0) : (p * 0.02);
-                            double pct_stop     = p * 0.02;
-                            double stop_dist    = std::max(raw_atr_stop, pct_stop);
+                            double stop_dist = std::max(atr * 2.0, p * 0.02);
                             if (stop_dist < p * 0.01) stop_dist = p * 0.01;
-                            double tp_atr = (atr > 1e-9) ? (p + atr * 3.0) : (p * 1.03);
-                            double tp_pct_up   = p * 1.03;
-                            double tp_pct_down = p * 0.98;
 
                             if (sig.side == "LONG") {
                                 b_msg["stop_loss"]   = p - stop_dist;
-                                b_msg["take_profit"] = std::max(tp_atr, tp_pct_up);
-                                if (b_msg["stop_loss"] < p * 0.95) b_msg["stop_loss"] = p * 0.95;
-                                if (b_msg["take_profit"] <= p) b_msg["take_profit"] = p * 1.02;
+                                b_msg["take_profit"] = p + atr * 3.0;
                             } else {
                                 b_msg["stop_loss"]   = p + stop_dist;
-                                b_msg["take_profit"] = std::min(tp_atr, tp_pct_down);
-                                if (b_msg["stop_loss"] > p * 1.05) b_msg["stop_loss"] = p * 1.05;
-                                if (b_msg["take_profit"] >= p) b_msg["take_profit"] = p * 0.98;
+                                b_msg["take_profit"] = p - atr * 3.0;
                             }
                             std::cout << b_msg.dump() << std::endl;
                             ctx.last_active_time = 0;
                         }
                     }
                 } catch (const std::exception& e) {
-                    spdlog::error("检测 {} 异常: {}", sym, e.what());
-                } catch (...) {
-                    spdlog::error("检测 {} 未知异常", sym);
+                    spdlog::warn("检测异常 [{}]: {}", sym, e.what());
                 }
             }
         }
@@ -270,45 +209,32 @@ void run_detection() {
 }
 
 int main() {
+    // 强制 stdout 无缓冲，让 Python 实时接收
     setvbuf(stdout, NULL, _IONBF, 0);
     std::cout.setf(std::ios::unitbuf);
-    signal(SIGSEGV, signal_handler);
-    signal(SIGABRT, signal_handler);
+
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
-    spdlog::info(">>> 极端反转引擎 [最终无退出版] 启动...");
+    spdlog::info(">>> 极端反转引擎 [最终稳定版] 启动...");
 
-    try {
-        auto symbols = fetch_top_symbols(10, 0);
-        if (symbols.empty()) {
-            spdlog::critical("无可用合约");
-            return 1;
-        }
-        {
-            std::unique_lock lock(contexts_mutex);
-            for (const auto& sym : symbols)
-                contexts.emplace(std::piecewise_construct, std::forward_as_tuple(sym), std::forward_as_tuple());
-        }
-        spdlog::info("引擎启动，监控 {} 个合约", symbols.size());
-
-        std::thread ws_thread(run_websocket, symbols);
-        std::thread detect_thread(run_detection);
-        spdlog::info("✅ 所有线程已启动");
-
-        // 主线程长期保活，不退出
-        while (keep_running) {
-            std::this_thread::sleep_for(std::chrono::seconds(60));
-            static auto last_alive = std::chrono::steady_clock::now();
-            if (std::chrono::steady_clock::now() - last_alive > std::chrono::seconds(60)) {
-                spdlog::info("💓 保活心跳，上下文数 {}", contexts.size());
-                last_alive = std::chrono::steady_clock::now();
-            }
-        }
-
-        if (ws_thread.joinable()) ws_thread.join();
-        if (detect_thread.joinable()) detect_thread.join();
-    } catch (const std::exception& e) {
-        spdlog::error("主线程异常: {}", e.what());
-        return 1;
+    auto symbols = SYMBOLS;
+    {
+        std::unique_lock lock(contexts_mutex);
+        for (const auto& sym : symbols)
+            contexts.emplace(std::piecewise_construct, std::forward_as_tuple(sym), std::forward_as_tuple());
     }
+    spdlog::info("引擎启动，监控 {} 个合约", symbols.size());
+
+    std::thread ws_thread(run_websocket, symbols);
+    std::thread detect_thread(run_detection);
+    spdlog::info("✅ 所有线程已启动");
+
+    // 永久保活
+    while (keep_running) {
+        std::this_thread::sleep_for(std::chrono::seconds(30));
+        spdlog::info("💓 保活心跳, 监控 {} 个合约", contexts.size());
+    }
+
+    if (ws_thread.joinable()) ws_thread.join();
+    if (detect_thread.joinable()) detect_thread.join();
     return 0;
 }

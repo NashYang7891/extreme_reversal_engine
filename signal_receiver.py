@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
 import subprocess, json, time, os, sys
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from dotenv import load_dotenv
 import ccxt
-basedir = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(basedir, '.env'))
 
-load_dotenv()
+# 强制加载 .env 绝对路径
+basedir = Path(__file__).resolve().parent
+load_dotenv(basedir / '.env')
+
 API_KEY = os.getenv("BINANCE_API_KEY")
 SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
 TG_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHAT = "5372217316"
+
+if not TG_TOKEN:
+    print("❌ TG_BOT_TOKEN 未设置，请检查 .env")
+    sys.exit(1)
 
 exchange = ccxt.binance({
     'apiKey': API_KEY,
@@ -21,21 +27,14 @@ exchange = ccxt.binance({
 
 LEVERAGE = 3
 ORDER_USDT = 10.0
-MAX_ACTIVE_ORDERS = 5
-
-TRAILING_ACTIVATION_PCT = 3.0
-TRAILING_CALLBACK_PCT = 1.2
-TRAILING_CALLBACK_PCT_SHORT = 1.2
-
-positions = {}
 
 def send_tg(msg):
-    if not TG_TOKEN: return
     try:
         import requests
         requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
                       json={"chat_id": TG_CHAT, "text": msg, "parse_mode": "Markdown"}, timeout=8)
-    except: pass
+    except Exception as e:
+        print(f"TG推送失败: {e}")
 
 def is_quiet_period():
     now = datetime.now(timezone.utc)
@@ -54,16 +53,10 @@ def place_order(symbol, side, price):
         print(f"❌ 无效方向: {side}")
         return None, None
     try:
-        balance = exchange.fetch_balance()
-        free = balance.get('USDT', {}).get('free', 0)
-        if free < ORDER_USDT:
-            print(f"❌ 余额不足 ({free:.2f}U)")
-            return None, f"余额不足({free:.2f}U)"
-
         if not exchange.markets: exchange.load_markets()
         ticker = exchange.fetch_ticker(symbol)
-        bid = ticker.get('bid', price)
-        ask = ticker.get('ask', price)
+        bid = ticker['bid'] if ticker['bid'] else price
+        ask = ticker['ask'] if ticker['ask'] else price
         if side == 'buy':
             order_price = min(price, ask * 1.0005)
         else:
@@ -81,181 +74,61 @@ def place_order(symbol, side, price):
         return order_price, order
     except Exception as e:
         print(f"❌ 下单失败 {symbol}: {e}")
-        return None, str(e)[:100]
-
-def cancel_order(order_id, symbol):
-    try:
-        exchange.cancel_order(order_id, symbol)
-        print(f"🗑 已撤单 {symbol} {order_id}")
-    except Exception as e:
-        print(f"⚠ 撤单失败 {symbol} {order_id}: {e}")
-
-def update_positions_after_fill(symbol, side, entry_price, order):
-    try:
-        qty = float(order['info'].get('executedQty', 0))
-        if qty == 0: qty = float(order.get('filled', 0))
-    except:
-        qty = 0
-    pos_side = "LONG" if side == "buy" else "SHORT"
-    positions[symbol] = {
-        'side': pos_side,
-        'entry_price': entry_price,
-        'qty': qty,
-        'highest_price': entry_price,
-        'lowest_price': entry_price,
-        'trailing_activated': False
-    }
-    print(f"📊 持仓记录: {symbol} {pos_side} @ {entry_price:.6f} 数量:{qty}")
-
-def check_and_trail_positions():
-    if not positions: return
-    for sym in list(positions.keys()):
-        pos = positions[sym]
-        try:
-            ticker = exchange.fetch_ticker(sym)
-            current_price = ticker['last']
-            if not current_price: continue
-        except: continue
-        side = pos['side']
-        entry = pos['entry_price']
-        qty = pos['qty']
-        if side == 'LONG':
-            if current_price > pos['highest_price']: pos['highest_price'] = current_price
-            pnl_pct = (current_price - entry) / entry * 100
-            if pnl_pct >= TRAILING_ACTIVATION_PCT: pos['trailing_activated'] = True
-            if pos['trailing_activated']:
-                stop_price = pos['highest_price'] * (1 - TRAILING_CALLBACK_PCT/100)
-                if current_price <= stop_price:
-                    send_tg(f"🛑 移动止损平仓 {sym} LONG @ {current_price:.6f}")
-                    exchange.create_order(symbol=sym, type='market', side='sell',
-                                          amount=exchange.amount_to_precision(sym, qty),
-                                          params={'reduceOnly': True})
-                    del positions[sym]
-                    continue
-        else:
-            if current_price < pos['lowest_price']: pos['lowest_price'] = current_price
-            pnl_pct = (entry - current_price) / entry * 100
-            if pnl_pct >= TRAILING_ACTIVATION_PCT: pos['trailing_activated'] = True
-            if pos['trailing_activated']:
-                stop_price = pos['lowest_price'] * (1 + TRAILING_CALLBACK_PCT_SHORT/100)
-                if current_price >= stop_price:
-                    send_tg(f"🛑 移动止损平仓 {sym} SHORT @ {current_price:.6f}")
-                    exchange.create_order(symbol=sym, type='market', side='buy',
-                                          amount=exchange.amount_to_precision(sym, qty),
-                                          params={'reduceOnly': True})
-                    del positions[sym]
+        return None, None
 
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     engine_path = os.path.join(script_dir, "build", "engine")
-    if not os.path.exists(engine_path): sys.exit("engine 未编译")
+    if not os.path.exists(engine_path):
+        print("engine 未编译")
+        sys.exit(1)
+
     try:
         exchange.load_markets()
         print("✅ 市场数据已加载")
-    except: pass
+    except Exception as e:
+        print(f"⚠ 加载市场失败: {e}")
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True, bufsize=1)
-    send_tg("🤖 引擎启动 (时间戳对齐版)")
+    send_tg("🤖 极端反转引擎已启动 (稳定版)")
+
     last_b_signal = {}
     last_a_push = {}
-    active_a_orders = {}
-    A_ORDER_TIMEOUT_SEC = 15 * 60
-    last_trail_check = time.time()
-    TRAIL_CHECK_INTERVAL = 60
 
     for line in proc.stdout:
         line = line.strip()
         if not line: continue
         try: msg = json.loads(line)
-        except json.JSONDecodeError: continue
-
-        # ---------- 管道时间戳对齐 ----------
-        msg_ts = msg.get("timestamp", 0)
-        if msg_ts > 0 and (time.time() - msg_ts) > 2.0:
-            # 在管道中排队超过2秒的信号，直接丢弃
-            continue
-
-        now = time.time()
-        if now - last_trail_check > TRAIL_CHECK_INTERVAL:
-            try:
-                check_and_trail_positions()
-            except Exception as e:
-                print(f"⚠ 跟踪止损故障: {e}")
-            last_trail_check = now
+        except: print("C++:", line); continue
 
         t = msg.get("type", "")
         sym = msg.get("symbol", "")
-        current_price = msg.get("current_price", None)
-
-        if t == "HEARTBEAT":
-            syms = msg.get("symbols", 0)
-            send_tg(f"💓 心跳 | 合约: {syms}")
-            continue
-
-        skip_a_order = (len(active_a_orders) >= MAX_ACTIVE_ORDERS)
 
         if t == "A_ACTIVE":
             now = time.time()
             if sym in last_a_push and now - last_a_push[sym] < 300: continue
-            derived_price = msg.get("price", 0)
+            price = msg.get("price", 0)
             change = msg.get("change_pct", 0)
             vol_r = msg.get("vol_ratio", 0)
             dev = msg.get("dev", None)
-
             d_str = f" | 偏离度:{dev:.1f}" if dev else ""
-            send_tg(f"🔥 {sym} 异动 | 价:{derived_price:.4f} | 涨跌:{change:+.2f}% | 量比:{vol_r:.1f}x{d_str}")
+            send_tg(f"🔥 {sym} 异动 | 价:{price:.4f} | 涨跌:{change:+.2f}% | 量比:{vol_r:.1f}x{d_str}")
             last_a_push[sym] = now
 
-            if not skip_a_order and dev is not None and abs(dev) > 1.3:
-                side = "buy" if dev > 0 else "sell"
-                order_key = f"{sym}_{side}"
-                if order_key in active_a_orders: continue
-                actual_price, order = place_order(sym, side, derived_price)
-                if actual_price and order:
-                    active_a_orders[order_key] = {
-                        'symbol': sym, 'side': side, 'order': order,
-                        'time': now, 'entry_dev': dev
-                    }
-                    send_tg(f"⚡ A层埋单 {side.upper()} {sym} @ {actual_price:.6f}")
-                    update_positions_after_fill(sym, side, actual_price, order)
-
         elif t == "SIGNAL":
-            side = msg.get("side",""); derived_price = msg.get("price",0)
-            score = msg.get("score",0)
-            stop_loss = msg.get("stop_loss",0); take_profit = msg.get("take_profit",0)
+            side = msg.get("side", "")
+            price = msg.get("price", 0)
+            score = msg.get("score", 0)
+            stop_loss = msg.get("stop_loss", 0)
+            take_profit = msg.get("take_profit", 0)
             now = time.time()
             if sym in last_b_signal and now - last_b_signal[sym] < 600: continue
             if is_quiet_period(): continue
 
-            if current_price and derived_price > 0:
-                diff_pct = abs(current_price - derived_price) / derived_price
-                if diff_pct > 0.01:
-                    send_tg(f"⚠ {sym} 信号过期 (实时{current_price:.6f} 推导{derived_price:.6f})，放弃下单")
-                    continue
-
-            actual_price, order = place_order(sym, side, derived_price)
-            tg_lines = [f"🎯 {side.upper()} {sym} 评分:{score:.1f}"]
-            if current_price:
-                tg_lines.append(f"💰 实时价: {current_price:.6f}")
-            tg_lines.append(f"📍 推导入场: {derived_price:.6f}")
-            if actual_price:
-                tg_lines.append(f"✅ 实际下单: {actual_price:.6f}")
-                order_key = f"{sym}_{side.lower()}"
-                if order_key in active_a_orders:
-                    cancel_order(active_a_orders[order_key]['order'].get('id',''), sym)
-                    del active_a_orders[order_key]
-                update_positions_after_fill(sym, side, actual_price, order)
-                last_b_signal[sym] = now
-            else:
-                tg_lines.append(f"❌ 下单失败: {order[:80] if isinstance(order,str) else '未知'}")
-            tg_lines.append(f"🛑 止损: {stop_loss:.6f} | 🎯 止盈: {take_profit:.6f}")
-            send_tg("\n".join(tg_lines))
-
-        # 清理过期A层订单
-        for key in list(active_a_orders.keys()):
-            if time.time() - active_a_orders[key]['time'] > A_ORDER_TIMEOUT_SEC:
-                cancel_order(active_a_orders[key]['order'].get('id',''), active_a_orders[key]['symbol'])
-                del active_a_orders[key]
+            tg_msg = f"🎯 {side.upper()} {sym} @ {price:.6f} 评分:{score:.1f}\n🛑 止损: {stop_loss:.6f} | 🎯 止盈: {take_profit:.6f}"
+            send_tg(tg_msg)
+            place_order(sym, side, price)
+            last_b_signal[sym] = now
 
 if __name__ == "__main__":
     main()
