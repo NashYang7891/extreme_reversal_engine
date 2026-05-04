@@ -35,41 +35,56 @@ static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *use
     return size * nmemb;
 }
 
-const std::vector<std::string> ULTIMATE_FALLBACK = {
-    "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","TRXUSDT",
-    "BNBUSDT","ZECUSDT","BIOUSDT","ORDIUSDT","TSTUSDT","BABYUSDT",
-    "FHEUSDT","BUSDT","AIGENSYNUSDT","AKTUSDT","PARTIUSDT",
-    "TAGUSDT","BSBUSDT","GENIUSUSDT"
-};
-
+// 获取成交量前100且≥3000万的USDT永续合约（无兜底）
 std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 30000000.0) {
+    std::vector<std::string> result;
     CURL *curl = curl_easy_init();
-    if (!curl) { spdlog::error("curl init fail"); return ULTIMATE_FALLBACK; }
+    if (!curl) {
+        spdlog::error("curl 初始化失败，无法获取合约");
+        return result;
+    }
     std::string response;
     curl_easy_setopt(curl, CURLOPT_URL, "https://fapi.binance.com/fapi/v1/ticker/24hr");
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
     CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK) { spdlog::error("ticker fail"); curl_easy_cleanup(curl); return ULTIMATE_FALLBACK; }
+    if (res != CURLE_OK) {
+        spdlog::error("获取 24hr ticker 失败: {}，引擎将无合约可监控", curl_easy_strerror(res));
+        curl_easy_cleanup(curl);
+        return result;
+    }
     std::vector<std::pair<std::string, double>> tickers;
     try {
         auto data = json::parse(response);
         for (auto& item : data) {
             std::string sym = item["symbol"];
-            if (sym.size()>4 && sym.compare(sym.size()-4,4,"USDT")==0 &&
-                sym.find('_')==std::string::npos && sym!="USDCUSDT") {
-                tickers.emplace_back(sym, std::stod(item["quoteVolume"].get<std::string>()));
+            if (sym.size() > 4 && sym.compare(sym.size()-4, 4, "USDT") == 0 &&
+                sym.find('_') == std::string::npos && sym != "USDCUSDT") {
+                double vol = std::stod(item["quoteVolume"].get<std::string>());
+                tickers.emplace_back(sym, vol);
             }
         }
-    } catch (...) { spdlog::error("parse fail"); curl_easy_cleanup(curl); return ULTIMATE_FALLBACK; }
+    } catch (const std::exception& e) {
+        spdlog::error("解析 ticker 失败: {}，引擎将无合约可监控", e.what());
+        curl_easy_cleanup(curl);
+        return result;
+    }
     curl_easy_cleanup(curl);
+
     std::sort(tickers.begin(), tickers.end(),
               [](const auto& a, const auto& b) { return a.second > b.second; });
-    std::vector<std::string> result;
-    for (auto& [sym,vol] : tickers) { if (vol >= min_vol) { result.push_back(sym); if ((int)result.size() >= top_n) break; } }
-    if (result.empty()) { spdlog::warn("no symbols"); result = ULTIMATE_FALLBACK; }
-    spdlog::info("监控 {} 个合约, 前3: {}", result.size(),
-                 result.size()>=3 ? result[0]+","+result[1]+","+result[2] : "");
+
+    for (auto& [sym, vol] : tickers) {
+        if (vol >= min_vol) {
+            result.push_back(sym);
+            if ((int)result.size() >= top_n) break;
+        }
+    }
+    if (result.empty()) {
+        spdlog::warn("当前无任何合约满足 {} 万 USDT 成交量门槛", min_vol / 10000.0);
+    }
+    spdlog::info("最终监控 {} 个合约, 前3: {}", result.size(),
+                 result.size() >= 3 ? result[0]+","+result[1]+","+result[2] : "无");
     return result;
 }
 
@@ -85,23 +100,25 @@ struct SymbolContext {
 std::map<std::string, SymbolContext> contexts;
 std::shared_mutex contexts_mutex;
 
-// ---------- A层（参数还原版）----------
+// ---------- A层（修复冷启动死锁，涨跌幅≥1.2%、量比≥1.5）----------
 bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, double& out_vol_ratio) {
     double change_3m = ind.price_change_pct(3*60);
-    // 过滤明显异常涨跌
     if (std::abs(change_3m) > 0.20) return false;
-    // 涨跌幅 ≥ 1.2%
     if (std::abs(change_3m) < 0.012) return false;
 
     double recent_vol = ob.recent_volume(3*60*1000);
     double avg_vol = ind.get_volume_ema();
-    // EMA 未初始化时跳过
+
     if (avg_vol <= 1e-9) {
+        // EMA 未初始化：用当前量作为初值，并将量比设为门槛 1.5 直接放行（避免冷启动无信号）
         ind.update_volume(recent_vol);
-        return false;
+        out_change = change_3m;
+        out_vol_ratio = 1.5;   // 刚好越过门槛，赋予中性的量比显示
+        spdlog::debug("A层冷启动放行: 量比置为1.5");
+        return true;
     }
+
     double vol_ratio = recent_vol / avg_vol;
-    // 量比 ≥ 1.5
     if (vol_ratio < 1.5) return false;
 
     ind.update_volume(recent_vol);
@@ -130,7 +147,8 @@ void run_websocket(const std::vector<std::string>& symbols) {
                 streams.push_back(s+"@depth@100ms");
                 streams.push_back(s+"@aggTrade");
             }
-            ws.write(net::buffer(json{{"method","SUBSCRIBE"},{"params",streams},{"id",1}}.dump()));
+            json sub_msg = {{"method","SUBSCRIBE"}, {"params",streams}, {"id",1}};
+            ws.write(net::buffer(sub_msg.dump()));
             beast::flat_buffer buffer;
             while (keep_running) {
                 ws.read(buffer);
@@ -172,6 +190,7 @@ void run_detection() {
             auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
 
+            // 每30分钟心跳
             if (std::chrono::steady_clock::now() - last_heartbeat > std::chrono::minutes(30)) {
                 json hb;
                 hb["type"] = "HEARTBEAT";
@@ -186,7 +205,8 @@ void run_detection() {
                 try {
                     double change_pct = 0.0, vol_ratio = 0.0;
                     if (active_layer(ctx.orderbook, ctx.indicators, change_pct, vol_ratio)) {
-                        if (now_ms - ctx.last_a_push_ms.load() < 120000) continue;
+                        // A层去重：180秒内同一币种不重复推送（平衡信号数量）
+                        if (now_ms - ctx.last_a_push_ms.load() < 180000) continue;
                         ctx.last_a_push_ms = now_ms;
                         ctx.last_active_time = now_ms;
                         json a_msg;
@@ -257,13 +277,17 @@ void run_detection() {
 
 int main() {
     auto symbols = fetch_top_symbols(100, 30000000.0);
+    if (symbols.empty()) {
+        spdlog::critical("没有符合条件的合约，引擎退出");
+        return 1;
+    }
     {
         std::unique_lock lock(contexts_mutex);
         for (auto& sym : symbols) contexts.emplace(std::piecewise_construct,
                                                    std::forward_as_tuple(sym),
                                                    std::forward_as_tuple());
     }
-    spdlog::info("引擎启动，监控 {} 个合约 (A层1.2%/1.5x)", symbols.size());
+    spdlog::info("引擎启动，监控 {} 个合约 (冷启动修复版)", symbols.size());
     std::thread ws_thread(run_websocket, symbols);
     std::thread detect_thread(run_detection);
     ws_thread.join();
