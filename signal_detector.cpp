@@ -9,7 +9,9 @@ double SignalDetector::objective(const OrderBook& ob, double price, const std::s
     double atr = ind_.atr();
     if (atr <= 0) return 0.0;
     double dev = (ind_.ema20() - price) / atr;
-    double osc = ind_.composite_oscillator(ml_.get_w_rsi(), ml_.get_w_kdj(), ml_.get_w_cci());
+    double r = ind_.rsi() / 100.0;
+    double c = (ind_.cci() + 200.0) / 400.0;
+    double osc = (r + c) / 2.0;
     double wall = ob.imbalance();
     if (side == "LONG") return dev * 0.4 + (1.0 - osc) * 0.4 + wall * 0.2;
     else return (-dev) * 0.4 + osc * 0.4 + (1.0 - wall) * 0.2;
@@ -29,15 +31,12 @@ double SignalDetector::solve_critical_price(const OrderBook& ob, const std::stri
 
 bool SignalDetector::check_momentum_decay(const std::string& side) {
     const auto& prices = ind_.prices();
-    if (prices.size() < 7) return false;  // 需要更多数据计算两个加速度
-
-    // 计算两个连续加速度
+    if (prices.size() < 7) return false;
     double v0 = prices.back() - prices[prices.size()-2];
     double v1 = prices[prices.size()-2] - prices[prices.size()-3];
     double v2 = prices[prices.size()-3] - prices[prices.size()-4];
     double accel0 = v0 - v1;
     double accel1 = v1 - v2;
-
     bool price_rising = prices.back() > prices[prices.size()-5];
     bool price_falling = prices.back() < prices[prices.size()-5];
 
@@ -46,15 +45,13 @@ bool SignalDetector::check_momentum_decay(const std::string& side) {
         double cur = prices.back();
         for (size_t i = prices.size()-5; i < prices.size()-1; ++i)
             if (prices[i] < cur) { is_low = false; break; }
-        // 连续两个加速度均为正，或价格回升
-        return (accel0 > 0 && accel1 > 0) || price_rising && is_low;
+        return (accel0 > 0 && accel1 > 0) || (price_rising && is_low);
     } else {
         bool is_high = true;
         double cur = prices.back();
         for (size_t i = prices.size()-5; i < prices.size()-1; ++i)
             if (prices[i] > cur) { is_high = false; break; }
-        // 连续两个加速度均为负，或价格回落
-        return (accel0 < 0 && accel1 < 0) || price_falling && is_high;
+        return (accel0 < 0 && accel1 < 0) || (price_falling && is_high);
     }
 }
 
@@ -66,7 +63,9 @@ Signal SignalDetector::check(const OrderBook& ob) {
     if (price <= 0) return sig;
 
     double dev = (ema20 - price) / atr;
-    double osc = ind_.composite_oscillator(ml_.get_w_rsi(), ml_.get_w_kdj(), ml_.get_w_cci());
+    double r = ind_.rsi() / 100.0;
+    double c = (ind_.cci() + 200.0) / 400.0;
+    double osc = (r + c) / 2.0;
     double wall_raw = ob.imbalance();
     double wall = wall_raw;
     if (wall_raw <= 0.001 || wall_raw >= 0.999) wall = 0.5;
@@ -80,11 +79,6 @@ Signal SignalDetector::check(const OrderBook& ob) {
 
     bool decay_long = check_momentum_decay("LONG");
     bool decay_short = check_momentum_decay("SHORT");
-
-    static int log_cnt = 0;
-    if (++log_cnt % 100 == 0)
-        spdlog::info("B层: dev={:.2f} osc={:.2f} wall={:.2f} decay_long={} decay_short={}",
-                     dev, osc, wall, decay_long, decay_short);
 
     if (dev > LONG_DEV_THRESH && osc < LONG_OSC_MAX && wall > LONG_WALL_MIN && decay_long) {
         sig.valid = true; sig.side = "LONG";

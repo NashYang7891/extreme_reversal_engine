@@ -70,10 +70,8 @@ std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 300
         return result;
     }
     curl_easy_cleanup(curl);
-
     std::sort(tickers.begin(), tickers.end(),
               [](const auto& a, const auto& b) { return a.second > b.second; });
-
     for (auto& [sym, vol] : tickers) {
         if (vol >= min_vol) {
             result.push_back(sym);
@@ -100,7 +98,7 @@ struct SymbolContext {
 std::map<std::string, SymbolContext> contexts;
 std::shared_mutex contexts_mutex;
 
-// A层（纯只读，冷启动放行）
+// A层（纯只读，冷启动放行，涨跌幅≥1.2%、量比≥1.5）
 bool active_layer(const OrderBook& ob, const Indicators& ind, double& out_change, double& out_vol_ratio) {
     double change_3m = ind.price_change_pct(3*60);
     if (std::abs(change_3m) > 0.20) return false;
@@ -109,7 +107,6 @@ bool active_layer(const OrderBook& ob, const Indicators& ind, double& out_change
     double recent_vol = ob.recent_volume(3*60*1000);
     double avg_vol = ind.get_volume_ema();
     if (avg_vol <= 1e-9) {
-        // EMA 未初始化：放行，量比记为 1.5
         out_change = change_3m;
         out_vol_ratio = 1.5;
         return true;
@@ -146,34 +143,43 @@ void run_websocket(const std::vector<std::string>& symbols) {
             ws.write(net::buffer(sub_msg.dump()));
             beast::flat_buffer buffer;
             while (keep_running) {
-                ws.read(buffer);
-                auto msg = json::parse(beast::buffers_to_string(buffer.data()));
-                buffer.clear();
-                if (msg.contains("stream") && msg.contains("data")) {
-                    std::string stream = msg["stream"]; auto& data = msg["data"];
-                    size_t pos = stream.find('@'); if (pos==std::string::npos) continue;
-                    std::string sym = stream.substr(0,pos);
-                    for (char& c : sym) c = std::toupper(c);
-                    std::unique_lock lock(contexts_mutex);
-                    auto it = contexts.find(sym); if (it==contexts.end()) continue;
-                    if (stream.find("@depth")!=std::string::npos) {
-                        it->second.orderbook.update_depth(data);
-                        double mp = it->second.orderbook.micro_price();
-                        if (mp > 0) it->second.indicators.update(mp);
-                    } else if (stream.find("@aggTrade")!=std::string::npos) {
-                        double price = std::stod(data["p"].get<std::string>());
-                        double qty   = std::stod(data["q"].get<std::string>());
-                        bool isMaker = data["m"];
-                        int64_t trade_time = std::stoll(data["T"].get<std::string>());
-                        it->second.orderbook.add_agg_trade(!isMaker, qty, trade_time);
-                        // 每次成交更新成交量 EMA（写锁内安全）
-                        double recent_vol = it->second.orderbook.recent_volume(3*60*1000);
-                        it->second.indicators.update_volume(recent_vol);
+                try {
+                    ws.read(buffer);
+                    auto msg = json::parse(beast::buffers_to_string(buffer.data()));
+                    buffer.clear();
+                    if (msg.contains("stream") && msg.contains("data")) {
+                        std::string stream = msg["stream"]; auto& data = msg["data"];
+                        size_t pos = stream.find('@'); if (pos==std::string::npos) continue;
+                        std::string sym = stream.substr(0,pos);
+                        for (char& c : sym) c = std::toupper(c);
+                        std::unique_lock lock(contexts_mutex);
+                        auto it = contexts.find(sym); if (it==contexts.end()) continue;
+                        if (stream.find("@depth")!=std::string::npos) {
+                            it->second.orderbook.update_depth(data);
+                            double mp = it->second.orderbook.micro_price();
+                            if (mp > 0) it->second.indicators.update(mp);
+                        } else if (stream.find("@aggTrade")!=std::string::npos) {
+                            double price = std::stod(data["p"].get<std::string>());
+                            double qty   = std::stod(data["q"].get<std::string>());
+                            bool isMaker = data["m"];
+                            int64_t trade_time = std::stoll(data["T"].get<std::string>());
+                            it->second.orderbook.add_agg_trade(!isMaker, qty, trade_time);
+                            double recent_vol = it->second.orderbook.recent_volume(3*60*1000);
+                            it->second.indicators.update_volume(recent_vol);
+                        }
                     }
+                } catch (const std::exception& e) {
+                    spdlog::error("数据解析异常: {}，跳过本条消息", e.what());
+                    // 继续读取下一条，不断开连接
+                } catch (...) {
+                    spdlog::error("未知数据异常，跳过本条消息");
                 }
             }
         } catch (std::exception const& e) {
-            spdlog::error("WS异常: {}，3s后重连", e.what());
+            spdlog::error("WS连接异常: {}，3秒后重连...", e.what());
+            std::this_thread::sleep_for(std::chrono::seconds(3));
+        } catch (...) {
+            spdlog::error("WS未知异常，3秒后重连...");
             std::this_thread::sleep_for(std::chrono::seconds(3));
         }
     }
@@ -188,7 +194,6 @@ void run_detection() {
             auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
 
-            // 每30分钟心跳
             if (std::chrono::steady_clock::now() - last_heartbeat > std::chrono::minutes(30)) {
                 json hb;
                 hb["type"] = "HEARTBEAT";
