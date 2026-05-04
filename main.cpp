@@ -70,8 +70,10 @@ std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 300
         return result;
     }
     curl_easy_cleanup(curl);
+
     std::sort(tickers.begin(), tickers.end(),
               [](const auto& a, const auto& b) { return a.second > b.second; });
+
     for (auto& [sym, vol] : tickers) {
         if (vol >= min_vol) {
             result.push_back(sym);
@@ -98,7 +100,7 @@ struct SymbolContext {
 std::map<std::string, SymbolContext> contexts;
 std::shared_mutex contexts_mutex;
 
-// A层（纯只读，冷启动放行，涨跌幅≥1.2%、量比≥1.5）
+// A层（冷启动放行，涨跌幅≥1.2%、量比≥1.5）
 bool active_layer(const OrderBook& ob, const Indicators& ind, double& out_change, double& out_vol_ratio) {
     double change_3m = ind.price_change_pct(3*60);
     if (std::abs(change_3m) > 0.20) return false;
@@ -107,6 +109,7 @@ bool active_layer(const OrderBook& ob, const Indicators& ind, double& out_change
     double recent_vol = ob.recent_volume(3*60*1000);
     double avg_vol = ind.get_volume_ema();
     if (avg_vol <= 1e-9) {
+        // EMA 未初始化：直接放行，量比记为 1.5
         out_change = change_3m;
         out_vol_ratio = 1.5;
         return true;
@@ -158,28 +161,29 @@ void run_websocket(const std::vector<std::string>& symbols) {
                             it->second.orderbook.update_depth(data);
                             double mp = it->second.orderbook.micro_price();
                             if (mp > 0) it->second.indicators.update(mp);
+                            // 深度更新不处理成交量 EMA
                         } else if (stream.find("@aggTrade")!=std::string::npos) {
                             double price = std::stod(data["p"].get<std::string>());
                             double qty   = std::stod(data["q"].get<std::string>());
                             bool isMaker = data["m"];
                             int64_t trade_time = std::stoll(data["T"].get<std::string>());
                             it->second.orderbook.add_agg_trade(!isMaker, qty, trade_time);
+                            // 仅成交时更新成交量 EMA
                             double recent_vol = it->second.orderbook.recent_volume(3*60*1000);
                             it->second.indicators.update_volume(recent_vol);
                         }
                     }
                 } catch (const std::exception& e) {
-                    spdlog::error("数据解析异常: {}，跳过本条消息", e.what());
-                    // 继续读取下一条，不断开连接
+                    spdlog::error("数据解析异常: {}，跳过本条", e.what());
                 } catch (...) {
-                    spdlog::error("未知数据异常，跳过本条消息");
+                    spdlog::error("未知数据异常，跳过本条");
                 }
             }
         } catch (std::exception const& e) {
-            spdlog::error("WS连接异常: {}，3秒后重连...", e.what());
+            spdlog::error("WS连接异常: {}，3秒后重连", e.what());
             std::this_thread::sleep_for(std::chrono::seconds(3));
         } catch (...) {
-            spdlog::error("WS未知异常，3秒后重连...");
+            spdlog::error("WS未知异常，3秒后重连");
             std::this_thread::sleep_for(std::chrono::seconds(3));
         }
     }
@@ -293,7 +297,7 @@ int main() {
                                                    std::forward_as_tuple(sym),
                                                    std::forward_as_tuple());
     }
-    spdlog::info("引擎启动，监控 {} 个合约 (极稳版)", symbols.size());
+    spdlog::info("引擎启动，监控 {} 个合约 (终极稳定版)", symbols.size());
     std::thread ws_thread(run_websocket, symbols);
     std::thread detect_thread(run_detection);
     ws_thread.join();
