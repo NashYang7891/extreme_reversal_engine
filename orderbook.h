@@ -15,10 +15,12 @@ public:
     double best_ask() const;
     double buy_volume() const;
     double sell_volume() const;
-    // 获取最近 window_ms 内的累计成交量
     double recent_volume(int window_ms) const;
+
 private:
     std::map<double, double> bids, asks;
+    double cum_buy = 0;
+    double cum_sell = 0;
     struct Trade { double volume; int64_t timestamp_ms; };
     std::deque<Trade> trades;
     static constexpr size_t MAX_TRADE = 1000;

@@ -4,53 +4,42 @@
 
 void OrderBook::update_depth(const json& data) {
     try {
-        // 确定数据源（增量格式使用 "b"/"a"，快照格式使用 "bids"/"asks"）
         const json* bids_json = nullptr;
         const json* asks_json = nullptr;
 
         if (data.contains("b") && data.contains("a")) {
-            // 增量格式
             bids_json = &data["b"];
             asks_json = &data["a"];
         } else if (data.contains("bids") && data.contains("asks")) {
-            // 全量快照格式（depth5）
             bids.clear();
             asks.clear();
             bids_json = &data["bids"];
             asks_json = &data["asks"];
         } else {
-            // 无法识别的格式，直接丢弃
             static int err_count = 0;
             if (++err_count % 100 == 1)
-                spdlog::warn("未知的深度推送格式，已跳过");
+                spdlog::warn("无法识别的深度推送格式，已跳过");
             return;
         }
 
-        // 更新买盘
-        for (auto& item : *bids_json) {
-            try {
-                double price = std::stod(item[0].get<std::string>());
-                double qty   = std::stod(item[1].get<std::string>());
-                if (qty > 0)
-                    bids[price] = qty;
-                else
-                    bids.erase(price);
-            } catch (...) {
-                // 单条数据异常，忽略
+        if (bids_json) {
+            for (auto& item : *bids_json) {
+                try {
+                    double price = std::stod(item[0].get<std::string>());
+                    double qty   = std::stod(item[1].get<std::string>());
+                    if (qty > 0) bids[price] = qty;
+                    else bids.erase(price);
+                } catch (...) {}
             }
         }
-
-        // 更新卖盘
-        for (auto& item : *asks_json) {
-            try {
-                double price = std::stod(item[0].get<std::string>());
-                double qty   = std::stod(item[1].get<std::string>());
-                if (qty > 0)
-                    asks[price] = qty;
-                else
-                    asks.erase(price);
-            } catch (...) {
-                // 单条数据异常，忽略
+        if (asks_json) {
+            for (auto& item : *asks_json) {
+                try {
+                    double price = std::stod(item[0].get<std::string>());
+                    double qty   = std::stod(item[1].get<std::string>());
+                    if (qty > 0) asks[price] = qty;
+                    else asks.erase(price);
+                } catch (...) {}
             }
         }
     } catch (const std::exception& e) {
@@ -73,7 +62,6 @@ void OrderBook::add_agg_trade(bool is_buy, double volume, int64_t trade_time_ms)
 
 void OrderBook::prune() {
     while (trades.size() > MAX_TRADE) {
-        // 此处为简化，未精确扣除 cum_buy/sell，但只影响 long-term 统计，不参与核心定价
         trades.pop_front();
     }
 }
@@ -85,8 +73,7 @@ double OrderBook::micro_price() const {
     double bv = buy_volume();
     double sv = sell_volume();
     double total = bv + sv;
-    if (total <= 1e-12)   // 防止除零
-        return (best_bid_ + best_ask_) / 2.0;
+    if (total <= 1e-12) return (best_bid_ + best_ask_) / 2.0;
     return (best_ask_ * bv + best_bid_ * sv) / total;
 }
 
@@ -94,7 +81,7 @@ double OrderBook::imbalance() const {
     double bv = buy_volume();
     double sv = sell_volume();
     double total = bv + sv;
-    if (total <= 1e-12) return 0.5;   // 中性值
+    if (total <= 1e-12) return 0.5;
     return bv / total;
 }
 
