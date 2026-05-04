@@ -111,7 +111,7 @@ struct SymbolContext {
     MLOptimizer ml{3};
     SignalDetector detector{ml, indicators};
     std::atomic<int64_t> last_active_time{0};
-    std::atomic<int64_t> last_a_push_5s_ms{0};   // 5秒去重
+    std::atomic<int64_t> last_a_push_5s_ms{0};
 };
 
 std::map<std::string, SymbolContext> contexts;
@@ -188,6 +188,7 @@ void process_json_msg(const json& msg) {
 }
 
 void run_websocket(const std::vector<std::string>& symbols) {
+    int reconnect_attempt = 0;
     while (keep_running) {
         try {
             net::io_context ioc;
@@ -205,12 +206,14 @@ void run_websocket(const std::vector<std::string>& symbols) {
             for (const auto& sym : symbols) {
                 std::string s = sym;
                 for (char& c : s) c = std::tolower(c);
-                streams.push_back(s + "@depth@500ms");
+                streams.push_back(s + "@depth@100ms");      // 改为标准 100ms
                 streams.push_back(s + "@aggTrade");
             }
             json sub_msg = {{"method","SUBSCRIBE"}, {"params",streams}, {"id",1}};
             ws_stream.write(net::buffer(sub_msg.dump()));
             spdlog::info("WebSocket 连接成功，已订阅 {} 个流", streams.size());
+
+            reconnect_attempt = 0;   // 成功连接后重置重试计数
 
             beast::flat_buffer buffer;
             while (keep_running) {
@@ -230,11 +233,15 @@ void run_websocket(const std::vector<std::string>& symbols) {
                 process_json_msg(msg);
             }
         } catch (const std::exception& e) {
-            spdlog::error("WebSocket 线程异常: {}，5秒后重连", e.what());
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+            spdlog::error("WebSocket 线程异常: {}，{}秒后重连 (尝试 {})", e.what(), 5 + reconnect_attempt * 2, reconnect_attempt);
         } catch (...) {
-            spdlog::error("WebSocket 未知异常，5秒后重连");
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+            spdlog::error("WebSocket 未知异常，{}秒后重连 (尝试 {})", 5 + reconnect_attempt * 2, reconnect_attempt);
+        }
+        if (keep_running) {
+            int wait_sec = 5 + reconnect_attempt * 2;   // 逐步延长等待时间
+            if (wait_sec > 60) wait_sec = 60;
+            std::this_thread::sleep_for(std::chrono::seconds(wait_sec));
+            reconnect_attempt++;
         }
     }
 }
@@ -263,7 +270,6 @@ void run_detection() {
                 try {
                     double change_pct = 0.0, vol_ratio = 0.0;
                     if (active_layer(ctx.orderbook, ctx.indicators, change_pct, vol_ratio)) {
-                        // 5秒去重：同一币种最近5秒内已经推送过则跳过
                         if (now_ms - ctx.last_a_push_5s_ms.load() < 5000) continue;
                         ctx.last_a_push_5s_ms = now_ms;
                         ctx.last_active_time = now_ms;
@@ -343,10 +349,11 @@ void run_detection() {
 
 int main() {
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
-    spdlog::info(">>> 极端反转引擎 [时间戳对齐版] 启动中...");
+    spdlog::info(">>> 极端反转引擎 [连接修复版] 启动中...");
 
     try {
-        auto symbols = fetch_top_symbols(100, 30000000.0);
+        // 临时降为 20 个合约，确保连接稳定
+        auto symbols = fetch_top_symbols(20, 30000000.0);
         if (symbols.empty()) {
             spdlog::critical("无可用合约，引擎退出");
             return 1;
