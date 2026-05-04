@@ -30,11 +30,64 @@ using tcp = net::ip::tcp;
 
 std::atomic<bool> keep_running{true};
 
-// 绝对兜底列表（10个主流币）
-const std::vector<std::string> SYMBOLS = {
-    "BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
-    "TRXUSDT", "BNBUSDT", "LINKUSDT", "LTCUSDT", "ADAUSDT"
+static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
+    ((std::string*)userp)->append((char*)contents, size * nmemb);
+    return size * nmemb;
+}
+
+// 兜底列表（20个主流币）
+const std::vector<std::string> ULTIMATE_FALLBACK = {
+    "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","TRXUSDT",
+    "BNBUSDT","ZECUSDT","BIOUSDT","ORDIUSDT","TSTUSDT","BABYUSDT",
+    "FHEUSDT","BUSDT","AIGENSYNUSDT","AKTUSDT","PARTIUSDT",
+    "TAGUSDT","BSBUSDT","GENIUSUSDT"
 };
+
+// 获取成交量前100的USDT永续合约，失败时回退到兜底列表
+std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 30000000.0) {
+    std::vector<std::pair<std::string, double>> tickers;
+    CURL *curl = curl_easy_init();
+    if (curl) {
+        std::string response;
+        curl_easy_setopt(curl, CURLOPT_URL, "https://fapi.binance.com/fapi/v1/ticker/24hr");
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+        CURLcode res = curl_easy_perform(curl);
+        if (res == CURLE_OK) {
+            try {
+                auto data = json::parse(response);
+                for (auto& item : data) {
+                    std::string sym = item["symbol"];
+                    if (sym.size()>4 && sym.compare(sym.size()-4,4,"USDT")==0 &&
+                        sym.find('_')==std::string::npos && sym!="USDCUSDT") {
+                        double vol = std::stod(item["quoteVolume"].get<std::string>());
+                        if (vol >= min_vol) tickers.emplace_back(sym, vol);
+                    }
+                }
+            } catch (...) { spdlog::error("解析 ticker 失败，使用兜底列表"); }
+        } else {
+            spdlog::error("获取 ticker 失败: {}，使用兜底列表", curl_easy_strerror(res));
+        }
+        curl_easy_cleanup(curl);
+    } else {
+        spdlog::error("curl 初始化失败，使用兜底列表");
+    }
+
+    std::sort(tickers.begin(), tickers.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+
+    std::vector<std::string> result;
+    for (size_t i = 0; i < tickers.size() && i < (size_t)top_n; ++i)
+        result.push_back(tickers[i].first);
+
+    if (result.size() < 10) {
+        spdlog::warn("实时合约不足 10 个，切换为兜底列表");
+        return ULTIMATE_FALLBACK;
+    }
+    spdlog::info("最终监控 {} 个合约, 前3: {}", result.size(),
+                 result.size()>=3 ? result[0]+","+result[1]+","+result[2] : "");
+    return result;
+}
 
 struct SymbolContext {
     OrderBook orderbook;
@@ -209,14 +262,14 @@ void run_detection() {
 }
 
 int main() {
-    // 强制 stdout 无缓冲，让 Python 实时接收
     setvbuf(stdout, NULL, _IONBF, 0);
     std::cout.setf(std::ios::unitbuf);
 
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
-    spdlog::info(">>> 极端反转引擎 [最终稳定版] 启动...");
+    spdlog::info(">>> 极端反转引擎 [100合约版] 启动...");
 
-    auto symbols = SYMBOLS;
+    // 尝试在线获取100个合约，失败则使用兜底列表
+    auto symbols = fetch_top_symbols(100, 30000000.0);
     {
         std::unique_lock lock(contexts_mutex);
         for (const auto& sym : symbols)
@@ -228,7 +281,6 @@ int main() {
     std::thread detect_thread(run_detection);
     spdlog::info("✅ 所有线程已启动");
 
-    // 永久保活
     while (keep_running) {
         std::this_thread::sleep_for(std::chrono::seconds(30));
         spdlog::info("💓 保活心跳, 监控 {} 个合约", contexts.size());
