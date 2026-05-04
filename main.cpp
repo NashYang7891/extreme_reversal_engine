@@ -29,7 +29,6 @@ namespace ssl  = boost::asio::ssl;
 using tcp = net::ip::tcp;
 
 std::atomic<bool> keep_running{true};
-// 用于主线程健康检查：记录最后一次数据到达的时间戳
 std::atomic<int64_t> last_data_time_ms{0};
 
 static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
@@ -60,7 +59,7 @@ const std::vector<std::string> ULTIMATE_FALLBACK = {
     "TAGUSDT","BSBUSDT","GENIUSUSDT"
 };
 
-// 获取合约列表，失败时回退到兜底列表，保证永不返回空
+// 获取合约列表，失败时回退到兜底列表
 std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 30000000.0) {
     std::vector<std::pair<std::string, double>> tickers;
     CURL *curl = curl_easy_init();
@@ -112,6 +111,7 @@ struct SymbolContext {
     MLOptimizer ml{3};
     SignalDetector detector{ml, indicators};
     std::atomic<int64_t> last_active_time{0};
+    std::atomic<int64_t> last_a_push_5s_ms{0};   // 5秒去重
 };
 
 std::map<std::string, SymbolContext> contexts;
@@ -157,7 +157,6 @@ void process_json_msg(const json& msg) {
     auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::system_clock::now().time_since_epoch()).count();
 
-    // 更新最后数据时间（用于健康检查）
     last_data_time_ms = now_ms;
 
     // 丢弃超过 1.5 秒的积压数据
@@ -219,7 +218,6 @@ void run_websocket(const std::vector<std::string>& symbols) {
                 auto msg = json::parse(beast::buffers_to_string(buffer.data()));
                 buffer.clear();
 
-                // 积压清理，上限 5 次
                 int cleanup_limit = 5;
                 while (cleanup_limit-- > 0 && ws_stream.next_layer().next_layer().available() > 0) {
                     beast::error_code ec;
@@ -265,7 +263,11 @@ void run_detection() {
                 try {
                     double change_pct = 0.0, vol_ratio = 0.0;
                     if (active_layer(ctx.orderbook, ctx.indicators, change_pct, vol_ratio)) {
+                        // 5秒去重：同一币种最近5秒内已经推送过则跳过
+                        if (now_ms - ctx.last_a_push_5s_ms.load() < 5000) continue;
+                        ctx.last_a_push_5s_ms = now_ms;
                         ctx.last_active_time = now_ms;
+
                         json a_msg;
                         a_msg["type"] = "A_ACTIVE";
                         a_msg["symbol"] = sym;
@@ -341,7 +343,7 @@ void run_detection() {
 
 int main() {
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
-    spdlog::info(">>> 极端反转引擎 [健康检查版] 启动中...");
+    spdlog::info(">>> 极端反转引擎 [时间戳对齐版] 启动中...");
 
     try {
         auto symbols = fetch_top_symbols(100, 30000000.0);
@@ -364,8 +366,7 @@ int main() {
 
         spdlog::info("✅ 所有线程已启动，进入健康监控模式...");
 
-        // 主线程健康检查：每30秒检查一次数据更新情况
-        const int64_t STALE_THRESHOLD_MS = 300000; // 5分钟无数据则认为网络已彻底中断
+        const int64_t STALE_THRESHOLD_MS = 300000; // 5分钟无数据主动退出
         while (keep_running) {
             std::this_thread::sleep_for(std::chrono::seconds(30));
             auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(

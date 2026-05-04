@@ -19,12 +19,11 @@ exchange = ccxt.binance({
 
 LEVERAGE = 3
 ORDER_USDT = 10.0
-MAX_ACTIVE_ORDERS = 5          # 最多同时挂 5 个限价单
+MAX_ACTIVE_ORDERS = 5
 
-# 跟踪止盈止损参数
-TRAILING_ACTIVATION_PCT = 3.0  # 盈利超过 3% 激活移动止损
-TRAILING_CALLBACK_PCT = 1.2    # 从最高点回撤 1.2% 触发平仓（做多）
-TRAILING_CALLBACK_PCT_SHORT = 1.2  # 做空：从最低点反弹 1.2% 触发平仓
+TRAILING_ACTIVATION_PCT = 3.0
+TRAILING_CALLBACK_PCT = 1.2
+TRAILING_CALLBACK_PCT_SHORT = 1.2
 
 positions = {}
 
@@ -46,7 +45,6 @@ def is_quiet_period():
     return False
 
 def place_order(symbol, side, price):
-    """下单（仅在下单时获取一次实时价格用于盘口修正）"""
     side = side.lower()
     if side == "long": side = "buy"
     elif side == "short": side = "sell"
@@ -61,7 +59,6 @@ def place_order(symbol, side, price):
             return None, f"余额不足({free:.2f}U)"
 
         if not exchange.markets: exchange.load_markets()
-        # 只在真正准备下单时才获取一次 ticker
         ticker = exchange.fetch_ticker(symbol)
         bid = ticker.get('bid', price)
         ask = ticker.get('ask', price)
@@ -109,7 +106,6 @@ def update_positions_after_fill(symbol, side, entry_price, order):
     print(f"📊 持仓记录: {symbol} {pos_side} @ {entry_price:.6f} 数量:{qty}")
 
 def check_and_trail_positions():
-    """使用 C++ 引擎传来的 {'type':'HEARTBEAT'} 里不会包含价格，所以这里还是得主动获取。但我们把频率降到 60 秒"""
     if not positions: return
     for sym in list(positions.keys()):
         pos = positions[sym]
@@ -157,13 +153,12 @@ def main():
     except: pass
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True, bufsize=1)
-    send_tg("🤖 引擎启动 (稳定版, 依赖C++实时价)")
+    send_tg("🤖 引擎启动 (时间戳对齐版)")
     last_b_signal = {}
     last_a_push = {}
     active_a_orders = {}
     A_ORDER_TIMEOUT_SEC = 15 * 60
     last_trail_check = time.time()
-    # 跟踪检查频率改为 60 秒，减少交易所压力
     TRAIL_CHECK_INTERVAL = 60
 
     for line in proc.stdout:
@@ -171,6 +166,12 @@ def main():
         if not line: continue
         try: msg = json.loads(line)
         except json.JSONDecodeError: continue
+
+        # ---------- 管道时间戳对齐 ----------
+        msg_ts = msg.get("timestamp", 0)
+        if msg_ts > 0 and (time.time() - msg_ts) > 2.0:
+            # 在管道中排队超过2秒的信号，直接丢弃
+            continue
 
         now = time.time()
         if now - last_trail_check > TRAIL_CHECK_INTERVAL:
@@ -182,8 +183,6 @@ def main():
 
         t = msg.get("type", "")
         sym = msg.get("symbol", "")
-
-        # 直接使用 C++ 引擎传来的 current_price（已是最新微价格）
         current_price = msg.get("current_price", None)
 
         if t == "HEARTBEAT":
@@ -191,7 +190,6 @@ def main():
             send_tg(f"💓 心跳 | 合约: {syms}")
             continue
 
-        # 挂单满时，只限制新开 A 层埋单，不限制 B 层信号
         skip_a_order = (len(active_a_orders) >= MAX_ACTIVE_ORDERS)
 
         if t == "A_ACTIVE":
@@ -219,7 +217,7 @@ def main():
                     send_tg(f"⚡ A层埋单 {side.upper()} {sym} @ {actual_price:.6f}")
                     update_positions_after_fill(sym, side, actual_price, order)
 
-        elif t == "SIGNAL":   # B层信号，不受挂单数量限制，可撤旧换新
+        elif t == "SIGNAL":
             side = msg.get("side",""); derived_price = msg.get("price",0)
             score = msg.get("score",0)
             stop_loss = msg.get("stop_loss",0); take_profit = msg.get("take_profit",0)
@@ -227,7 +225,6 @@ def main():
             if sym in last_b_signal and now - last_b_signal[sym] < 600: continue
             if is_quiet_period(): continue
 
-            # 过期检查使用 C++ 传来的实时价，无需额外 fetch
             if current_price and derived_price > 0:
                 diff_pct = abs(current_price - derived_price) / derived_price
                 if diff_pct > 0.01:
