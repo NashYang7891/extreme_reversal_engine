@@ -35,6 +35,22 @@ static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *use
     return size * nmemb;
 }
 
+// ---------- 安全类型转换 (你的贡献) ----------
+int64_t safe_get_int64(const json& j, const std::string& key) {
+    if (!j.contains(key)) return 0;
+    if (j[key].is_number()) return j[key].get<int64_t>();
+    if (j[key].is_string()) return std::stoll(j[key].get<std::string>());
+    return 0;
+}
+
+double safe_get_double(const json& j, const std::string& key) {
+    if (!j.contains(key)) return 0.0;
+    if (j[key].is_number()) return j[key].get<double>();
+    if (j[key].is_string()) return std::stod(j[key].get<std::string>());
+    return 0.0;
+}
+
+// 兜底合约列表
 const std::vector<std::string> ULTIMATE_FALLBACK = {
     "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","TRXUSDT",
     "BNBUSDT","ZECUSDT","BIOUSDT","ORDIUSDT","TSTUSDT","BABYUSDT",
@@ -42,33 +58,48 @@ const std::vector<std::string> ULTIMATE_FALLBACK = {
     "TAGUSDT","BSBUSDT","GENIUSUSDT"
 };
 
+// 获取 top_n 个合约，失败或不足时回退到兜底列表
 std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 30000000.0) {
-    CURL *curl = curl_easy_init();
-    if (!curl) { spdlog::error("curl init fail"); return ULTIMATE_FALLBACK; }
-    std::string response;
-    curl_easy_setopt(curl, CURLOPT_URL, "https://fapi.binance.com/fapi/v1/ticker/24hr");
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    CURLcode res = curl_easy_perform(curl);
-    if (res != CURLE_OK) { spdlog::error("ticker fail"); curl_easy_cleanup(curl); return ULTIMATE_FALLBACK; }
     std::vector<std::pair<std::string, double>> tickers;
-    try {
-        auto data = json::parse(response);
-        for (auto& item : data) {
-            std::string sym = item["symbol"];
-            if (sym.size()>4 && sym.compare(sym.size()-4,4,"USDT")==0 &&
-                sym.find('_')==std::string::npos && sym!="USDCUSDT") {
-                tickers.emplace_back(sym, std::stod(item["quoteVolume"].get<std::string>()));
-            }
+    CURL *curl = curl_easy_init();
+    if (curl) {
+        std::string response;
+        curl_easy_setopt(curl, CURLOPT_URL, "https://fapi.binance.com/fapi/v1/ticker/24hr");
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+        CURLcode res = curl_easy_perform(curl);
+        if (res == CURLE_OK) {
+            try {
+                auto data = json::parse(response);
+                for (auto& item : data) {
+                    std::string sym = item["symbol"];
+                    if (sym.size()>4 && sym.compare(sym.size()-4,4,"USDT")==0 &&
+                        sym.find('_')==std::string::npos && sym!="USDCUSDT") {
+                        double vol = std::stod(item["quoteVolume"].get<std::string>());
+                        if (vol >= min_vol) tickers.emplace_back(sym, vol);
+                    }
+                }
+            } catch (...) { spdlog::error("解析 ticker 失败，将使用兜底列表"); }
+        } else {
+            spdlog::error("获取 ticker 失败: {}，将使用兜底列表", curl_easy_strerror(res));
         }
-    } catch (...) { spdlog::error("parse fail"); curl_easy_cleanup(curl); return ULTIMATE_FALLBACK; }
-    curl_easy_cleanup(curl);
+        curl_easy_cleanup(curl);
+    } else {
+        spdlog::error("curl 初始化失败，将使用兜底列表");
+    }
+
     std::sort(tickers.begin(), tickers.end(),
               [](const auto& a, const auto& b) { return a.second > b.second; });
+
     std::vector<std::string> result;
-    for (auto& [sym,vol] : tickers) { if (vol >= min_vol) { result.push_back(sym); if ((int)result.size() >= top_n) break; } }
-    if (result.empty()) { spdlog::warn("no symbols"); result = ULTIMATE_FALLBACK; }
-    spdlog::info("监控 {} 个合约, 前3: {}", result.size(),
+    for (size_t i = 0; i < tickers.size() && i < (size_t)top_n; ++i)
+        result.push_back(tickers[i].first);
+
+    if (result.size() < 10) {
+        spdlog::warn("实时合约不足 10 个，切换为兜底列表");
+        return ULTIMATE_FALLBACK;
+    }
+    spdlog::info("最终监控 {} 个合约, 前3: {}", result.size(),
                  result.size()>=3 ? result[0]+","+result[1]+","+result[2] : "");
     return result;
 }
@@ -84,7 +115,7 @@ struct SymbolContext {
 std::map<std::string, SymbolContext> contexts;
 std::shared_mutex contexts_mutex;
 
-// A层（数据不足60点不输出）
+// A层（数据不足60个微价格不输出）
 bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, double& out_vol_ratio) {
     if (ind.prices().size() < 60) return false;
 
@@ -111,6 +142,48 @@ bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, doub
     return true;
 }
 
+// 核心业务处理（带时效检查）
+void process_json_msg(const json& msg) {
+    if (!msg.contains("stream") || !msg.contains("data")) return;
+
+    std::string stream = msg["stream"];
+    auto& data = msg["data"];
+
+    int64_t ts = 0;
+    if (data.contains("T")) ts = safe_get_int64(data, "T");
+    else if (data.contains("E")) ts = safe_get_int64(data, "E");
+
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  std::chrono::system_clock::now().time_since_epoch()).count();
+
+    // 1.5秒门禁
+    if (ts > 0 && std::abs(now_ms - ts) > 1500) return;
+
+    size_t pos = stream.find('@');
+    if (pos == std::string::npos) return;
+    std::string sym = stream.substr(0, pos);
+    for (char& c : sym) c = std::toupper(c);
+
+    std::unique_lock lock(contexts_mutex);
+    auto it = contexts.find(sym);
+    if (it == contexts.end()) return;
+
+    try {
+        if (stream.find("@depth") != std::string::npos) {
+            it->second.orderbook.update_depth(data);
+            double mp = it->second.orderbook.micro_price();
+            if (mp > 0) it->second.indicators.update(mp);
+        } else if (stream.find("@aggTrade") != std::string::npos) {
+            double p = safe_get_double(data, "p");
+            double q = safe_get_double(data, "q");
+            bool isMaker = data["m"].get<bool>();
+            it->second.orderbook.add_agg_trade(!isMaker, q, ts);
+        }
+    } catch (const std::exception& e) {
+        spdlog::error("数据处理崩溃 [{}]: {}", sym, e.what());
+    }
+}
+
 void run_websocket(const std::vector<std::string>& symbols) {
     while (keep_running) {
         try {
@@ -118,69 +191,48 @@ void run_websocket(const std::vector<std::string>& symbols) {
             ssl::context ctx{ssl::context::tls_client};
             ctx.set_options(ssl::context::default_workarounds | ssl::context::no_sslv2 | ssl::context::no_sslv3);
             ctx.set_default_verify_paths(); ctx.set_verify_mode(ssl::verify_peer);
-            ws::stream<beast::ssl_stream<tcp::socket>> ws(ioc, ctx);
+            ws::stream<beast::ssl_stream<tcp::socket>> ws_stream(ioc, ctx);
             tcp::resolver resolver(ioc);
-            auto const results = resolver.resolve("fstream.binance.com","443");
-            net::connect(ws.next_layer().next_layer(), results.begin(), results.end());
-            ws.next_layer().handshake(ssl::stream_base::client);
-            ws.handshake("fstream.binance.com","/stream");
+            auto const results = resolver.resolve("fstream.binance.com", "443");
+            net::connect(ws_stream.next_layer().next_layer(), results.begin(), results.end());
+            ws_stream.next_layer().handshake(ssl::stream_base::client);
+            ws_stream.handshake("fstream.binance.com", "/stream");
+
             std::vector<std::string> streams;
-            for (auto& sym : symbols) {
+            for (const auto& sym : symbols) {
                 std::string s = sym;
                 for (char& c : s) c = std::tolower(c);
-                streams.push_back(s+"@depth@500ms");
-                streams.push_back(s+"@aggTrade");
+                streams.push_back(s + "@depth@500ms");
+                streams.push_back(s + "@aggTrade");
             }
             json sub_msg = {{"method","SUBSCRIBE"}, {"params",streams}, {"id",1}};
-            ws.write(net::buffer(sub_msg.dump()));
+            ws_stream.write(net::buffer(sub_msg.dump()));
+            spdlog::info("WebSocket 连接成功，已订阅 {} 个流", streams.size());
+
             beast::flat_buffer buffer;
             while (keep_running) {
-                ws.read(buffer);
+                ws_stream.read(buffer);
                 auto msg = json::parse(beast::buffers_to_string(buffer.data()));
                 buffer.clear();
-                // 只保留最新数据：连续读取直到缓冲区空
-                while (ws.next_layer().next_layer().available() > 0) {
+
+                // 积压清理，上限 5 次
+                int cleanup_limit = 5;
+                while (cleanup_limit-- > 0 && ws_stream.next_layer().next_layer().available() > 0) {
                     beast::error_code ec;
-                    ws.read(buffer, ec);
+                    ws_stream.read(buffer, ec);
                     if (ec) break;
-                    msg = json::parse(beast::buffers_to_string(buffer.data()));
+                    process_json_msg(json::parse(beast::buffers_to_string(buffer.data())));
                     buffer.clear();
                 }
 
-                if (msg.contains("stream") && msg.contains("data")) {
-                    std::string stream = msg["stream"]; auto& data = msg["data"];
-                    size_t pos = stream.find('@'); if (pos==std::string::npos) continue;
-                    std::string sym = stream.substr(0,pos);
-                    for (char& c : sym) c = std::toupper(c);
-
-                    // 温和的时效过滤：5秒以上视为过期，避免网络抖动误杀
-                    int64_t ts = 0;
-                    if (data.contains("T")) ts = std::stoll(data["T"].get<std::string>());
-                    else if (data.contains("E")) ts = std::stoll(data["E"].get<std::string>());
-                    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::now().time_since_epoch()).count();
-                    if (ts > 0 && (now_ms - ts) > 5000) {
-                        continue;
-                    }
-
-                    std::unique_lock lock(contexts_mutex);
-                    auto it = contexts.find(sym); if (it==contexts.end()) continue;
-                    if (stream.find("@depth")!=std::string::npos) {
-                        it->second.orderbook.update_depth(data);
-                        double mp = it->second.orderbook.micro_price();
-                        if (mp > 0) it->second.indicators.update(mp);
-                    } else if (stream.find("@aggTrade")!=std::string::npos) {
-                        double price = std::stod(data["p"].get<std::string>());
-                        double qty   = std::stod(data["q"].get<std::string>());
-                        bool isMaker = data["m"];
-                        it->second.orderbook.add_agg_trade(!isMaker, qty, 0);
-                    }
-                }
+                process_json_msg(msg);
             }
-        } catch (std::exception const& e) {
-            spdlog::error("WS异常: {}，3s后重连", e.what());
-            std::this_thread::sleep_for(std::chrono::seconds(3));
+        } catch (const std::exception& e) {
+            spdlog::error("WebSocket 线程严重故障: {}，3秒后重连", e.what());
+        } catch (...) {
+            spdlog::error("WebSocket 线程未知异常，3秒后重连");
         }
+        if (keep_running) std::this_thread::sleep_for(std::chrono::seconds(3));
     }
 }
 
@@ -283,18 +335,33 @@ void run_detection() {
 }
 
 int main() {
-    spdlog::set_level(spdlog::level::warn);
-    auto symbols = fetch_top_symbols(100, 30000000.0);
-    {
-        std::unique_lock lock(contexts_mutex);
-        for (auto& sym : symbols) contexts.emplace(std::piecewise_construct,
-                                                   std::forward_as_tuple(sym),
-                                                   std::forward_as_tuple());
+    spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
+    spdlog::info(">>> 极端反转引擎 [融合稳健版] 启动中...");
+
+    try {
+        auto symbols = fetch_top_symbols(100, 30000000.0);
+        if (symbols.empty()) {
+            spdlog::critical("无可用合约，引擎退出");
+            return 1;
+        }
+        {
+            std::unique_lock lock(contexts_mutex);
+            for (const auto& sym : symbols) {
+                contexts.emplace(std::piecewise_construct,
+                                 std::forward_as_tuple(sym),
+                                 std::forward_as_tuple());
+            }
+        }
+        spdlog::info("引擎启动，监控 {} 个合约", symbols.size());
+
+        std::thread ws_thread(run_websocket, symbols);
+        std::thread detect_thread(run_detection);
+
+        ws_thread.join();
+        detect_thread.join();
+    } catch (const std::exception& e) {
+        spdlog::error("主程序抛出未捕获异常: {}", e.what());
+        return 1;
     }
-    spdlog::info("引擎启动，监控 {} 个合约 (长期稳定版)", symbols.size());
-    std::thread ws_thread(run_websocket, symbols);
-    std::thread detect_thread(run_detection);
-    ws_thread.join();
-    detect_thread.join();
     return 0;
 }
