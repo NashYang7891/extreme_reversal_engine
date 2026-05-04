@@ -131,7 +131,8 @@ void run_websocket(const std::vector<std::string>& symbols) {
                 streams.push_back(s+"@depth@100ms");
                 streams.push_back(s+"@aggTrade");
             }
-            ws.write(net::buffer(json{{"method","SUBSCRIBE"},{"params",streams},{"id",1}}.dump()));
+            json sub_msg = {{"method","SUBSCRIBE"}, {"params",streams}, {"id",1}};
+            ws.write(net::buffer(sub_msg.dump()));
             beast::flat_buffer buffer;
             while (keep_running) {
                 ws.read(buffer);
@@ -165,7 +166,6 @@ void run_websocket(const std::vector<std::string>& symbols) {
 }
 
 void run_detection() {
-    // 心跳日志控制
     auto last_heartbeat = std::chrono::steady_clock::now();
     while (keep_running) {
         auto start = std::chrono::steady_clock::now();
@@ -174,7 +174,7 @@ void run_detection() {
             auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
 
-            // 每30分钟输出心跳JSON
+            // 每30分钟心跳
             auto now_steady = std::chrono::steady_clock::now();
             if (now_steady - last_heartbeat > std::chrono::minutes(30)) {
                 json hb;
@@ -186,7 +186,7 @@ void run_detection() {
             }
 
             for (auto& [sym, ctx] : contexts) {
-                // ★ 时效性放宽到60秒
+                // 时效性放宽到60秒
                 if (ctx.indicators.is_stale(60000)) continue;
 
                 try {
@@ -196,12 +196,16 @@ void run_detection() {
                         json a_msg;
                         a_msg["type"] = "A_ACTIVE";
                         a_msg["symbol"] = sym;
+                        a_msg["current_price"] = ctx.indicators.price();
                         a_msg["price"] = ctx.indicators.price();
                         a_msg["change_pct"] = change_pct * 100.0;
                         a_msg["vol_ratio"] = vol_ratio;
                         a_msg["timestamp"] = std::time(nullptr);
                         double atr = ctx.indicators.atr();
-                        if (atr > 0) a_msg["dev"] = (ctx.indicators.ema20() - ctx.indicators.price()) / atr;
+                        if (atr > 1e-9) {
+                            double dev = (ctx.indicators.ema20() - ctx.indicators.price()) / atr;
+                            if (std::abs(dev) < 50.0) a_msg["dev"] = dev;
+                        }
                         std::cout << a_msg.dump() << std::endl;
                     }
 
@@ -213,20 +217,40 @@ void run_detection() {
                             b_msg["type"] = "SIGNAL";
                             b_msg["symbol"] = sym;
                             b_msg["side"]   = sig.side;
-                            b_msg["price"]  = sig.price;
+                            b_msg["price"]  = sig.price;          // 推导入场价
                             b_msg["score"]  = sig.score;
                             b_msg["timestamp"] = std::time(nullptr);
+                            b_msg["current_price"] = ctx.indicators.price();
+
                             double atr = ctx.indicators.atr();
-                            if (atr > 0) {
-                                double raw_stop = atr * 2.0;
-                                double hard_limit = sig.price * 0.03;
-                                if (sig.side == "LONG") {
-                                    b_msg["stop_loss"] = std::min(raw_stop, hard_limit);
-                                    b_msg["take_profit"] = sig.price + atr * 3.0;
-                                } else {
-                                    b_msg["stop_loss"] = std::min(raw_stop, hard_limit);
-                                    b_msg["take_profit"] = sig.price - atr * 3.0;
-                                }
+                            double p   = sig.price;
+
+                            // 止损距离：max(2*ATR, 2%价格)，且不低于1%价格
+                            double raw_atr_stop = (atr > 1e-9) ? (atr * 2.0) : (p * 0.02);
+                            double pct_stop     = p * 0.02;
+                            double stop_dist    = std::max(raw_atr_stop, pct_stop);
+                            if (stop_dist < p * 0.01) stop_dist = p * 0.01;
+
+                            // 止盈：3*ATR 或 固定百分比
+                            double tp_atr = (atr > 1e-9) ? (p + atr * 3.0) : (p * 1.03);
+                            double tp_pct_up   = p * 1.03;   // 做多最低止盈
+                            double tp_pct_down = p * 0.98;   // 做空最高止盈
+
+                            if (sig.side == "LONG") {
+                                b_msg["stop_loss"]   = p - stop_dist;
+                                b_msg["take_profit"] = std::max(tp_atr, tp_pct_up);
+                            } else {
+                                b_msg["stop_loss"]   = p + stop_dist;
+                                b_msg["take_profit"] = std::min(tp_atr, tp_pct_down);
+                            }
+
+                            // 合法性校验：确保止损合理
+                            if (sig.side == "LONG") {
+                                if (b_msg["stop_loss"] >= p) b_msg["stop_loss"] = p * 0.97;
+                                if (b_msg["take_profit"] <= p) b_msg["take_profit"] = p * 1.02;
+                            } else {
+                                if (b_msg["stop_loss"] <= p) b_msg["stop_loss"] = p * 1.03;
+                                if (b_msg["take_profit"] >= p) b_msg["take_profit"] = p * 0.98;
                             }
                             std::cout << b_msg.dump() << std::endl;
                             ctx.last_active_time = 0;
@@ -253,7 +277,7 @@ int main() {
                                                    std::forward_as_tuple(sym),
                                                    std::forward_as_tuple());
     }
-    spdlog::info("引擎启动，监控 {} 个合约 (自锁修复版)", symbols.size());
+    spdlog::info("引擎启动，监控 {} 个合约 (最终修正版)", symbols.size());
     std::thread ws_thread(run_websocket, symbols);
     std::thread detect_thread(run_detection);
     ws_thread.join();
