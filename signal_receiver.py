@@ -45,8 +45,8 @@ def place_order(symbol, side, price):
     try:
         if not exchange.markets: exchange.load_markets()
         ticker = exchange.fetch_ticker(symbol)
-        bid = ticker['bid'] if ticker['bid'] else price
-        ask = ticker['ask'] if ticker['ask'] else price
+        bid = ticker['bid'] or price
+        ask = ticker['ask'] or price
         if side == 'buy':
             order_price = min(price, ask * 1.0005)
         else:
@@ -64,7 +64,7 @@ def place_order(symbol, side, price):
         return order_price, order
     except Exception as e:
         print(f"❌ 下单失败 {symbol}: {e}")
-        return None, None
+        return None, str(e)[:100]
 
 def cancel_order(order_id, symbol):
     try:
@@ -83,7 +83,7 @@ def main():
     except: pass
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True)
-    send_tg("🤖 极端反转引擎启动 (高门坎去重版)")
+    send_tg("🤖 极端反转引擎启动 (A层1.2%/1.5x)")
     last_b_signal = {}
     last_a_push = {}
     active_a_orders = {}
@@ -105,7 +105,6 @@ def main():
         sym = msg.get("symbol", "")
         if t == "A_ACTIVE":
             now = time.time()
-            # Python 端去重仍然保留，防止 C++ 端的 120 秒去重在多线程下偶有失效
             if sym in last_a_push and now - last_a_push[sym] < 120:
                 continue
             price = msg.get("price",0); change = msg.get("change_pct",0)
@@ -117,11 +116,9 @@ def main():
             if dev is not None and abs(dev) > 1.3:
                 side = "buy" if dev > 0 else "sell"
                 order_key = f"{sym}_{side}"
-                # 30 分钟内同一币种同方向不重复挂单
-                if order_key in active_a_orders:
-                    continue
+                if order_key in active_a_orders: continue
                 actual_price, order = place_order(sym, side, price)
-                if actual_price and order:
+                if actual_price:
                     active_a_orders[order_key] = {
                         'symbol': sym, 'side': side, 'order': order,
                         'time': now, 'entry_dev': dev
@@ -129,30 +126,36 @@ def main():
                     send_tg(f"⚡ A层埋单 {side.upper()} {sym} @ {actual_price:.6f} (偏离度:{dev:.1f})")
 
         elif t == "SIGNAL":
-            side = msg.get("side",""); price_derived = msg.get("price",0)
+            side = msg.get("side",""); derived_price = msg.get("price",0)
             score = msg.get("score",0)
-            stop_loss = msg.get("stop_loss",0); take_profit = msg.get("take_profit",0)
+            stop_loss = msg.get("stop_loss",0)
+            take_profit = msg.get("take_profit",0)
             now = time.time()
-            if sym in last_b_signal and now - last_b_signal[sym] < 600: continue
-            if is_quiet_period(): continue
 
-            actual_price, order = place_order(sym, side, price_derived)
-            tg_lines = [f"🎯 {side.upper()} {sym} 评分:{score:.1f}"]
+            if sym in last_b_signal and now - last_b_signal[sym] < 600:
+                print(f"⏰ {sym} B信号冷却中")
+                continue
+            if is_quiet_period():
+                print("🔇 静默期")
+                continue
+
+            actual_price, order_or_err = place_order(sym, side, derived_price)
+            tg_lines = [
+                f"🎯 {side.upper()} {sym} 评分:{score:.1f}",
+                f"💰 推导入场: {derived_price:.6f}"
+            ]
             if actual_price:
-                tg_lines.append(f"✅ 下单成功: {actual_price:.6f}")
+                tg_lines.append(f"✅ 实际下单: {actual_price:.6f}")
                 order_key = f"{sym}_{side.lower()}"
                 if order_key in active_a_orders:
                     cancel_order(active_a_orders[order_key]['order'].get('id',''), sym)
                     del active_a_orders[order_key]
+                last_b_signal[sym] = now
             else:
-                tg_lines.append(f"❌ 下单失败")
+                tg_lines.append(f"❌ 下单失败: {order_or_err[:80]}")
             tg_lines.append(f"🛑 止损: {stop_loss:.6f} | 🎯 止盈: {take_profit:.6f}")
             send_tg("\n".join(tg_lines))
 
-            if actual_price:
-                last_b_signal[sym] = now
-
-        # 定期检查 A 层订单过期
         now_ts = time.time()
         for key in list(active_a_orders.keys()):
             if now_ts - active_a_orders[key]['time'] > A_ORDER_TIMEOUT_SEC:

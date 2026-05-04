@@ -79,33 +79,30 @@ struct SymbolContext {
     MLOptimizer ml{3};
     SignalDetector detector{ml, indicators};
     std::atomic<int64_t> last_active_time{0};
-    std::atomic<int64_t> last_a_push_ms{0};   // A层去重时间戳（毫秒）
+    std::atomic<int64_t> last_a_push_ms{0};
 };
 
 std::map<std::string, SymbolContext> contexts;
 std::shared_mutex contexts_mutex;
 
-// ---------- A层（修复版）----------
+// ---------- A层（参数还原版）----------
 bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, double& out_vol_ratio) {
     double change_3m = ind.price_change_pct(3*60);
     // 过滤明显异常涨跌
     if (std::abs(change_3m) > 0.20) return false;
-    // 涨跌幅 ≥ 2.0%
-    if (std::abs(change_3m) < 0.02) return false;
+    // 涨跌幅 ≥ 1.2%
+    if (std::abs(change_3m) < 0.012) return false;
 
     double recent_vol = ob.recent_volume(3*60*1000);
     double avg_vol = ind.get_volume_ema();
-
-    // EMA 未初始化时直接放弃，不伪造量比
+    // EMA 未初始化时跳过
     if (avg_vol <= 1e-9) {
-        // 立即用当前量初始化，但不放行
         ind.update_volume(recent_vol);
         return false;
     }
-
     double vol_ratio = recent_vol / avg_vol;
-    // 量比必须 > 1.8
-    if (vol_ratio < 1.8) return false;
+    // 量比 ≥ 1.5
+    if (vol_ratio < 1.5) return false;
 
     ind.update_volume(recent_vol);
     out_change = change_3m;
@@ -175,30 +172,23 @@ void run_detection() {
             auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
 
-            // 每30分钟心跳
-            auto now_steady = std::chrono::steady_clock::now();
-            if (now_steady - last_heartbeat > std::chrono::minutes(30)) {
+            if (std::chrono::steady_clock::now() - last_heartbeat > std::chrono::minutes(30)) {
                 json hb;
                 hb["type"] = "HEARTBEAT";
                 hb["symbols"] = contexts.size();
                 hb["timestamp"] = std::time(nullptr);
                 std::cout << hb.dump() << std::endl;
-                last_heartbeat = now_steady;
+                last_heartbeat = std::chrono::steady_clock::now();
             }
 
             for (auto& [sym, ctx] : contexts) {
-                // 时效性放宽到 60 秒
                 if (ctx.indicators.is_stale(60000)) continue;
-
                 try {
                     double change_pct = 0.0, vol_ratio = 0.0;
-                    // ---- A层 ----
                     if (active_layer(ctx.orderbook, ctx.indicators, change_pct, vol_ratio)) {
-                        // A层去重：120 秒内同一币种不重复推送
                         if (now_ms - ctx.last_a_push_ms.load() < 120000) continue;
                         ctx.last_a_push_ms = now_ms;
                         ctx.last_active_time = now_ms;
-
                         json a_msg;
                         a_msg["type"] = "A_ACTIVE";
                         a_msg["symbol"] = sym;
@@ -207,16 +197,13 @@ void run_detection() {
                         a_msg["vol_ratio"] = vol_ratio;
                         a_msg["timestamp"] = std::time(nullptr);
                         double atr = ctx.indicators.atr();
-                        if (atr > 0) {
+                        if (atr > 1e-9) {
                             double dev = (ctx.indicators.ema20() - ctx.indicators.price()) / atr;
-                            // 过滤极端偏离度
-                            if (std::abs(dev) < 50.0)
-                                a_msg["dev"] = dev;
+                            if (std::abs(dev) < 50.0) a_msg["dev"] = dev;
                         }
                         std::cout << a_msg.dump() << std::endl;
                     }
 
-                    // ---- B层 ----
                     int64_t last_active = ctx.last_active_time.load();
                     if (last_active > 0 && (now_ms - last_active) < 15*60*1000) {
                         auto sig = ctx.detector.check(ctx.orderbook);
@@ -228,16 +215,27 @@ void run_detection() {
                             b_msg["price"]  = sig.price;
                             b_msg["score"]  = sig.score;
                             b_msg["timestamp"] = std::time(nullptr);
+
                             double atr = ctx.indicators.atr();
-                            if (atr > 0) {
-                                double raw_stop = atr * 2.0;
-                                double hard_limit = sig.price * 0.03;
+                            if (atr > 1e-9) {
+                                double raw_atr_stop = atr * 2.0;
+                                double pct_stop = sig.price * 0.02;
+                                double stop = std::max(raw_atr_stop, pct_stop);
+                                double tp = sig.price + atr * 3.0;
                                 if (sig.side == "LONG") {
-                                    b_msg["stop_loss"] = std::min(raw_stop, hard_limit);
-                                    b_msg["take_profit"] = sig.price + atr * 3.0;
+                                    b_msg["stop_loss"]   = sig.price - stop;
+                                    b_msg["take_profit"] = std::max(tp, sig.price * 1.015);
                                 } else {
-                                    b_msg["stop_loss"] = std::min(raw_stop, hard_limit);
-                                    b_msg["take_profit"] = sig.price - atr * 3.0;
+                                    b_msg["stop_loss"]   = sig.price + stop;
+                                    b_msg["take_profit"] = std::min(tp, sig.price * 0.985);
+                                }
+                            } else {
+                                if (sig.side == "LONG") {
+                                    b_msg["stop_loss"]   = sig.price * 0.98;
+                                    b_msg["take_profit"] = sig.price * 1.03;
+                                } else {
+                                    b_msg["stop_loss"]   = sig.price * 1.02;
+                                    b_msg["take_profit"] = sig.price * 0.97;
                                 }
                             }
                             std::cout << b_msg.dump() << std::endl;
@@ -265,7 +263,7 @@ int main() {
                                                    std::forward_as_tuple(sym),
                                                    std::forward_as_tuple());
     }
-    spdlog::info("引擎启动，监控 {} 个合约 (去重版)", symbols.size());
+    spdlog::info("引擎启动，监控 {} 个合约 (A层1.2%/1.5x)", symbols.size());
     std::thread ws_thread(run_websocket, symbols);
     std::thread detect_thread(run_detection);
     ws_thread.join();
