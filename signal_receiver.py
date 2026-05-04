@@ -3,6 +3,8 @@ import subprocess, json, time, os, sys
 from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 import ccxt
+basedir = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(basedir, '.env'))
 
 load_dotenv()
 API_KEY = os.getenv("BINANCE_API_KEY")
