@@ -84,16 +84,27 @@ struct SymbolContext {
 std::map<std::string, SymbolContext> contexts;
 std::shared_mutex contexts_mutex;
 
-// A层
+// A层（修复版：放宽时效性、解除EMA死锁）
 bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, double& out_vol_ratio) {
     double change_3m = ind.price_change_pct(3*60);
     if (std::abs(change_3m) > 0.20) return false;
     if (std::abs(change_3m) < 0.012) return false;
+
     double recent_vol = ob.recent_volume(3*60*1000);
     double avg_vol = ind.get_volume_ema();
-    if (avg_vol <= 0) { ind.update_volume(recent_vol); return false; }
+
+    // 解除冷启动死锁：EMA未初始化时直接使用recent_vol作为初值，量比设为1.0放行
+    if (avg_vol <= 1e-9) {
+        spdlog::debug("EMA冷启动，设置avg_vol = recent_vol = {}", recent_vol);
+        ind.update_volume(recent_vol);   // 更新EMA
+        out_change = change_3m;
+        out_vol_ratio = 1.0;             // 视为正常量比
+        return true;
+    }
+
     double vol_ratio = recent_vol / avg_vol;
     if (vol_ratio < 1.5) return false;
+
     ind.update_volume(recent_vol);
     out_change = change_3m;
     out_vol_ratio = vol_ratio;
@@ -154,6 +165,8 @@ void run_websocket(const std::vector<std::string>& symbols) {
 }
 
 void run_detection() {
+    // 心跳日志控制
+    auto last_heartbeat = std::chrono::steady_clock::now();
     while (keep_running) {
         auto start = std::chrono::steady_clock::now();
         {
@@ -161,8 +174,21 @@ void run_detection() {
             auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
 
+            // 每30分钟输出心跳JSON
+            auto now_steady = std::chrono::steady_clock::now();
+            if (now_steady - last_heartbeat > std::chrono::minutes(30)) {
+                json hb;
+                hb["type"] = "HEARTBEAT";
+                hb["symbols"] = contexts.size();
+                hb["timestamp"] = std::time(nullptr);
+                std::cout << hb.dump() << std::endl;
+                last_heartbeat = now_steady;
+            }
+
             for (auto& [sym, ctx] : contexts) {
-                if (ctx.indicators.is_stale(5000)) continue;
+                // ★ 时效性放宽到60秒
+                if (ctx.indicators.is_stale(60000)) continue;
+
                 try {
                     double change_pct = 0.0, vol_ratio = 0.0;
                     if (active_layer(ctx.orderbook, ctx.indicators, change_pct, vol_ratio)) {
@@ -175,15 +201,12 @@ void run_detection() {
                         a_msg["vol_ratio"] = vol_ratio;
                         a_msg["timestamp"] = std::time(nullptr);
                         double atr = ctx.indicators.atr();
-                        if (atr > 0) {
-                            double dev = (ctx.indicators.ema20() - ctx.indicators.price()) / atr;
-                            a_msg["dev"] = dev;
-                        }
+                        if (atr > 0) a_msg["dev"] = (ctx.indicators.ema20() - ctx.indicators.price()) / atr;
                         std::cout << a_msg.dump() << std::endl;
                     }
 
                     int64_t last_active = ctx.last_active_time.load();
-                    if (last_active > 0 && (now_ms - last_active) < 15 * 60 * 1000) {
+                    if (last_active > 0 && (now_ms - last_active) < 15*60*1000) {
                         auto sig = ctx.detector.check(ctx.orderbook);
                         if (sig.valid) {
                             json b_msg;
@@ -196,7 +219,7 @@ void run_detection() {
                             double atr = ctx.indicators.atr();
                             if (atr > 0) {
                                 double raw_stop = atr * 2.0;
-                                double hard_limit = sig.price * 0.03; // 3%
+                                double hard_limit = sig.price * 0.03;
                                 if (sig.side == "LONG") {
                                     b_msg["stop_loss"] = std::min(raw_stop, hard_limit);
                                     b_msg["take_profit"] = sig.price + atr * 3.0;
@@ -230,7 +253,7 @@ int main() {
                                                    std::forward_as_tuple(sym),
                                                    std::forward_as_tuple());
     }
-    spdlog::info("引擎启动，监控 {} 个合约 (最终版)", symbols.size());
+    spdlog::info("引擎启动，监控 {} 个合约 (自锁修复版)", symbols.size());
     std::thread ws_thread(run_websocket, symbols);
     std::thread detect_thread(run_detection);
     ws_thread.join();
