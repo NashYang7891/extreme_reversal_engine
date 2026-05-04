@@ -19,9 +19,9 @@ exchange = ccxt.binance({
 
 LEVERAGE = 3
 ORDER_USDT = 10.0
-MAX_ACTIVE_ORDERS = 3          # 最多同时挂 3 个限价单
+MAX_ACTIVE_ORDERS = 5          # 最多同时挂 5 个限价单
 
-# 跟踪止盈止损参数（激进优化）
+# 跟踪止盈止损参数
 TRAILING_ACTIVATION_PCT = 3.0  # 盈利超过 3% 激活移动止损
 TRAILING_CALLBACK_PCT = 1.2    # 从最高点回撤 1.2% 触发平仓（做多）
 TRAILING_CALLBACK_PCT_SHORT = 1.2  # 做空：从最低点反弹 1.2% 触发平仓
@@ -46,6 +46,7 @@ def is_quiet_period():
     return False
 
 def place_order(symbol, side, price):
+    """下单（仅在下单时获取一次实时价格用于盘口修正）"""
     side = side.lower()
     if side == "long": side = "buy"
     elif side == "short": side = "sell"
@@ -60,9 +61,10 @@ def place_order(symbol, side, price):
             return None, f"余额不足({free:.2f}U)"
 
         if not exchange.markets: exchange.load_markets()
+        # 只在真正准备下单时才获取一次 ticker
         ticker = exchange.fetch_ticker(symbol)
-        bid = ticker['bid'] if ticker['bid'] else price
-        ask = ticker['ask'] if ticker['ask'] else price
+        bid = ticker.get('bid', price)
+        ask = ticker.get('ask', price)
         if side == 'buy':
             order_price = min(price, ask * 1.0005)
         else:
@@ -107,6 +109,7 @@ def update_positions_after_fill(symbol, side, entry_price, order):
     print(f"📊 持仓记录: {symbol} {pos_side} @ {entry_price:.6f} 数量:{qty}")
 
 def check_and_trail_positions():
+    """使用 C++ 引擎传来的 {'type':'HEARTBEAT'} 里不会包含价格，所以这里还是得主动获取。但我们把频率降到 60 秒"""
     if not positions: return
     for sym in list(positions.keys()):
         pos = positions[sym]
@@ -154,12 +157,14 @@ def main():
     except: pass
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True, bufsize=1)
-    send_tg("🤖 引擎启动 (B层优先/回调1.2%)")
+    send_tg("🤖 引擎启动 (稳定版, 依赖C++实时价)")
     last_b_signal = {}
     last_a_push = {}
     active_a_orders = {}
     A_ORDER_TIMEOUT_SEC = 15 * 60
     last_trail_check = time.time()
+    # 跟踪检查频率改为 60 秒，减少交易所压力
+    TRAIL_CHECK_INTERVAL = 60
 
     for line in proc.stdout:
         line = line.strip()
@@ -168,19 +173,18 @@ def main():
         except json.JSONDecodeError: continue
 
         now = time.time()
-        if now - last_trail_check > 30:
-            check_and_trail_positions()
+        if now - last_trail_check > TRAIL_CHECK_INTERVAL:
+            try:
+                check_and_trail_positions()
+            except Exception as e:
+                print(f"⚠ 跟踪止损故障: {e}")
             last_trail_check = now
 
         t = msg.get("type", "")
         sym = msg.get("symbol", "")
 
-        current_market_price = None
-        try:
-            ticker = exchange.fetch_ticker(sym)
-            current_market_price = ticker['last'] if ticker else None
-        except:
-            pass
+        # 直接使用 C++ 引擎传来的 current_price（已是最新微价格）
+        current_price = msg.get("current_price", None)
 
         if t == "HEARTBEAT":
             syms = msg.get("symbols", 0)
@@ -223,16 +227,17 @@ def main():
             if sym in last_b_signal and now - last_b_signal[sym] < 600: continue
             if is_quiet_period(): continue
 
-            if current_market_price and derived_price > 0:
-                diff_pct = abs(current_market_price - derived_price) / derived_price
+            # 过期检查使用 C++ 传来的实时价，无需额外 fetch
+            if current_price and derived_price > 0:
+                diff_pct = abs(current_price - derived_price) / derived_price
                 if diff_pct > 0.01:
-                    send_tg(f"⚠ {sym} 信号过期 (市场{current_market_price:.6f} 推导{derived_price:.6f})，放弃下单")
+                    send_tg(f"⚠ {sym} 信号过期 (实时{current_price:.6f} 推导{derived_price:.6f})，放弃下单")
                     continue
 
             actual_price, order = place_order(sym, side, derived_price)
             tg_lines = [f"🎯 {side.upper()} {sym} 评分:{score:.1f}"]
-            if current_market_price:
-                tg_lines.append(f"💰 实时价: {current_market_price:.6f}")
+            if current_price:
+                tg_lines.append(f"💰 实时价: {current_price:.6f}")
             tg_lines.append(f"📍 推导入场: {derived_price:.6f}")
             if actual_price:
                 tg_lines.append(f"✅ 实际下单: {actual_price:.6f}")
@@ -247,6 +252,7 @@ def main():
             tg_lines.append(f"🛑 止损: {stop_loss:.6f} | 🎯 止盈: {take_profit:.6f}")
             send_tg("\n".join(tg_lines))
 
+        # 清理过期A层订单
         for key in list(active_a_orders.keys()):
             if time.time() - active_a_orders[key]['time'] > A_ORDER_TIMEOUT_SEC:
                 cancel_order(active_a_orders[key]['order'].get('id',''), active_a_orders[key]['symbol'])
