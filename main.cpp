@@ -84,9 +84,8 @@ struct SymbolContext {
 std::map<std::string, SymbolContext> contexts;
 std::shared_mutex contexts_mutex;
 
-// A层（增加初始化保护：数据点不足60个不输出）
+// A层（数据点不足60个不输出）
 bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, double& out_vol_ratio) {
-    // 价格序列不足，直接丢弃
     if (ind.prices().size() < 60) return false;
 
     double change_3m = ind.price_change_pct(3*60);
@@ -110,13 +109,6 @@ bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, doub
     out_change = change_3m;
     out_vol_ratio = vol_ratio;
     return true;
-}
-
-// 提取数据时间戳（毫秒），支持 aggTrade (T) 和 depth (E)
-int64_t extract_event_time(const json& data) {
-    if (data.contains("T")) return std::stoll(data["T"].get<std::string>());
-    if (data.contains("E")) return std::stoll(data["E"].get<std::string>());
-    return 0;
 }
 
 void run_websocket(const std::vector<std::string>& symbols) {
@@ -143,10 +135,10 @@ void run_websocket(const std::vector<std::string>& symbols) {
             ws.write(net::buffer(sub_msg.dump()));
             beast::flat_buffer buffer;
             while (keep_running) {
-                // 清空积压
                 ws.read(buffer);
                 auto msg = json::parse(beast::buffers_to_string(buffer.data()));
                 buffer.clear();
+                // 清空积压
                 while (ws.next_layer().next_layer().available() > 0) {
                     beast::error_code ec;
                     ws.read(buffer, ec);
@@ -161,12 +153,14 @@ void run_websocket(const std::vector<std::string>& symbols) {
                     std::string sym = stream.substr(0,pos);
                     for (char& c : sym) c = std::toupper(c);
 
-                    // ---------- 严格时效过滤 ----------
-                    int64_t event_time = extract_event_time(data);
+                    // ---------- 强制1秒时效过滤 ----------
+                    int64_t ts = 0;
+                    if (data.contains("T")) ts = std::stoll(data["T"].get<std::string>());
+                    else if (data.contains("E")) ts = std::stoll(data["E"].get<std::string>());
                     auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::system_clock::now().time_since_epoch()).count();
-                    if (event_time > 0 && std::abs(now_ms - event_time) > 3000) {
-                        // 超过3秒的数据直接丢弃，不进入 contexts
+                    if (ts > 0 && (now_ms - ts) > 1000) {
+                        // 超过1秒的历史数据直接丢弃
                         continue;
                     }
 
@@ -180,8 +174,7 @@ void run_websocket(const std::vector<std::string>& symbols) {
                         double price = std::stod(data["p"].get<std::string>());
                         double qty   = std::stod(data["q"].get<std::string>());
                         bool isMaker = data["m"];
-                        // T 用于时效判断，此处不再单独存储
-                        it->second.orderbook.add_agg_trade(!isMaker, qty, event_time);
+                        it->second.orderbook.add_agg_trade(!isMaker, qty, 0);
                     }
                 }
             }
@@ -266,7 +259,6 @@ void run_detection() {
                                 b_msg["take_profit"] = std::min(tp_atr, tp_pct_down);
                             }
 
-                            // 强制防御：止损不低于开仓价的95%（做多）或不高于开仓价的105%（做空）
                             if (sig.side == "LONG") {
                                 if (b_msg["stop_loss"] < p * 0.95) b_msg["stop_loss"] = p * 0.95;
                                 if (b_msg["take_profit"] <= p) b_msg["take_profit"] = p * 1.02;
@@ -300,7 +292,7 @@ int main() {
                                                    std::forward_as_tuple(sym),
                                                    std::forward_as_tuple());
     }
-    spdlog::info("引擎启动，监控 {} 个合约 (防过期/止损防御)", symbols.size());
+    spdlog::info("引擎启动，监控 {} 个合约 (1s时效/防积压)", symbols.size());
     std::thread ws_thread(run_websocket, symbols);
     std::thread detect_thread(run_detection);
     ws_thread.join();

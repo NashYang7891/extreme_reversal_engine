@@ -19,6 +19,7 @@ exchange = ccxt.binance({
 
 LEVERAGE = 3
 ORDER_USDT = 10.0
+MAX_ACTIVE_ORDERS = 3                # 最多同时挂3个限价单
 
 TRAILING_ACTIVATION_PCT = 3.0
 TRAILING_CALLBACK_PCT = 2.0
@@ -51,6 +52,12 @@ def place_order(symbol, side, price):
         print(f"❌ 无效方向: {side}")
         return None, None
     try:
+        balance = exchange.fetch_balance()
+        free = balance.get('USDT', {}).get('free', 0)
+        if free < ORDER_USDT:
+            print(f"❌ 余额不足 ({free:.2f}U)，无法下单")
+            return None, f"余额不足({free:.2f}U)"
+
         if not exchange.markets: exchange.load_markets()
         ticker = exchange.fetch_ticker(symbol)
         bid = ticker['bid'] if ticker['bid'] else price
@@ -145,8 +152,8 @@ def main():
         print("✅ 市场数据已加载")
     except: pass
 
-    proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True)
-    send_tg("🤖 引擎启动 (防过期终极版)")
+    proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True, bufsize=1)
+    send_tg("🤖 引擎启动 (熔断保护/1s时效)")
     last_b_signal = {}
     last_a_push = {}
     active_a_orders = {}
@@ -179,6 +186,18 @@ def main():
             send_tg(f"💓 心跳 | 合约: {syms}")
             continue
 
+        # 检查当前挂单数量是否已达上限
+        active_count = len(active_a_orders)
+        if active_count >= MAX_ACTIVE_ORDERS:
+            print(f"🛑 挂单已满 ({active_count}/{MAX_ACTIVE_ORDERS})，跳过新信号")
+            # 仍然可以推送A层异动，但不下单
+            if t == "A_ACTIVE":
+                derived_price = msg.get("price",0); change = msg.get("change_pct",0)
+                vol_r = msg.get("vol_ratio",0); dev = msg.get("dev", None)
+                d_str = f" | 偏离度:{dev:.1f}" if dev else ""
+                send_tg(f"🔥 {sym} 异动 | 价:{derived_price:.4f} | 涨跌:{change:+.2f}% | 量比:{vol_r:.1f}x{d_str}")
+            continue
+
         if t == "A_ACTIVE":
             now = time.time()
             if sym in last_a_push and now - last_a_push[sym] < 300: continue
@@ -186,12 +205,6 @@ def main():
             change = msg.get("change_pct", 0)
             vol_r = msg.get("vol_ratio", 0)
             dev = msg.get("dev", None)
-
-            if current_market_price and derived_price > 0:
-                diff_pct = abs(current_market_price - derived_price) / derived_price
-                if diff_pct > 0.01:
-                    print(f"⚠ A层过期({sym}): 市场价{current_market_price:.6f} 信号{derived_price:.6f} 偏差{diff_pct*100:.1f}%")
-                    # 不再丢弃，只提示，让用户知晓
 
             d_str = f" | 偏离度:{dev:.1f}" if dev else ""
             send_tg(f"🔥 {sym} 异动 | 价:{derived_price:.4f} | 涨跌:{change:+.2f}% | 量比:{vol_r:.1f}x{d_str}")
@@ -218,11 +231,10 @@ def main():
             if sym in last_b_signal and now - last_b_signal[sym] < 600: continue
             if is_quiet_period(): continue
 
-            # Python端最终兜底：现价偏离推导价超过1%则放弃下单
             if current_market_price and derived_price > 0:
                 diff_pct = abs(current_market_price - derived_price) / derived_price
                 if diff_pct > 0.01:
-                    send_tg(f"⚠ {sym} 信号过期 (市场价{current_market_price:.6f} 推导{derived_price:.6f})，放弃下单")
+                    send_tg(f"⚠ {sym} 信号过期 (市场{current_market_price:.6f} 推导{derived_price:.6f})，放弃下单")
                     continue
 
             actual_price, order = place_order(sym, side, derived_price)
@@ -243,7 +255,6 @@ def main():
             tg_lines.append(f"🛑 止损: {stop_loss:.6f} | 🎯 止盈: {take_profit:.6f}")
             send_tg("\n".join(tg_lines))
 
-        # 清理过期A层订单
         for key in list(active_a_orders.keys()):
             if time.time() - active_a_orders[key]['time'] > A_ORDER_TIMEOUT_SEC:
                 cancel_order(active_a_orders[key]['order'].get('id',''), active_a_orders[key]['symbol'])
