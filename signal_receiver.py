@@ -19,11 +19,12 @@ exchange = ccxt.binance({
 
 LEVERAGE = 3
 ORDER_USDT = 10.0
-MAX_ACTIVE_ORDERS = 3                # 最多同时挂3个限价单
+MAX_ACTIVE_ORDERS = 3          # 最多同时挂 3 个限价单
 
-TRAILING_ACTIVATION_PCT = 3.0
-TRAILING_CALLBACK_PCT = 2.0
-TRAILING_CALLBACK_PCT_SHORT = 2.0
+# 跟踪止盈止损参数（激进优化）
+TRAILING_ACTIVATION_PCT = 3.0  # 盈利超过 3% 激活移动止损
+TRAILING_CALLBACK_PCT = 1.2    # 从最高点回撤 1.2% 触发平仓（做多）
+TRAILING_CALLBACK_PCT_SHORT = 1.2  # 做空：从最低点反弹 1.2% 触发平仓
 
 positions = {}
 
@@ -55,7 +56,7 @@ def place_order(symbol, side, price):
         balance = exchange.fetch_balance()
         free = balance.get('USDT', {}).get('free', 0)
         if free < ORDER_USDT:
-            print(f"❌ 余额不足 ({free:.2f}U)，无法下单")
+            print(f"❌ 余额不足 ({free:.2f}U)")
             return None, f"余额不足({free:.2f}U)"
 
         if not exchange.markets: exchange.load_markets()
@@ -153,7 +154,7 @@ def main():
     except: pass
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True, bufsize=1)
-    send_tg("🤖 引擎启动 (熔断保护/1s时效)")
+    send_tg("🤖 引擎启动 (B层优先/回调1.2%)")
     last_b_signal = {}
     last_a_push = {}
     active_a_orders = {}
@@ -186,17 +187,8 @@ def main():
             send_tg(f"💓 心跳 | 合约: {syms}")
             continue
 
-        # 检查当前挂单数量是否已达上限
-        active_count = len(active_a_orders)
-        if active_count >= MAX_ACTIVE_ORDERS:
-            print(f"🛑 挂单已满 ({active_count}/{MAX_ACTIVE_ORDERS})，跳过新信号")
-            # 仍然可以推送A层异动，但不下单
-            if t == "A_ACTIVE":
-                derived_price = msg.get("price",0); change = msg.get("change_pct",0)
-                vol_r = msg.get("vol_ratio",0); dev = msg.get("dev", None)
-                d_str = f" | 偏离度:{dev:.1f}" if dev else ""
-                send_tg(f"🔥 {sym} 异动 | 价:{derived_price:.4f} | 涨跌:{change:+.2f}% | 量比:{vol_r:.1f}x{d_str}")
-            continue
+        # 挂单满时，只限制新开 A 层埋单，不限制 B 层信号
+        skip_a_order = (len(active_a_orders) >= MAX_ACTIVE_ORDERS)
 
         if t == "A_ACTIVE":
             now = time.time()
@@ -210,7 +202,7 @@ def main():
             send_tg(f"🔥 {sym} 异动 | 价:{derived_price:.4f} | 涨跌:{change:+.2f}% | 量比:{vol_r:.1f}x{d_str}")
             last_a_push[sym] = now
 
-            if dev is not None and abs(dev) > 1.3:
+            if not skip_a_order and dev is not None and abs(dev) > 1.3:
                 side = "buy" if dev > 0 else "sell"
                 order_key = f"{sym}_{side}"
                 if order_key in active_a_orders: continue
@@ -223,7 +215,7 @@ def main():
                     send_tg(f"⚡ A层埋单 {side.upper()} {sym} @ {actual_price:.6f}")
                     update_positions_after_fill(sym, side, actual_price, order)
 
-        elif t == "SIGNAL":
+        elif t == "SIGNAL":   # B层信号，不受挂单数量限制，可撤旧换新
             side = msg.get("side",""); derived_price = msg.get("price",0)
             score = msg.get("score",0)
             stop_loss = msg.get("stop_loss",0); take_profit = msg.get("take_profit",0)
