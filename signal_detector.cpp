@@ -1,167 +1,128 @@
-#!/usr/bin/env python3
-import subprocess, json, time, os, sys
-from datetime import datetime, timezone, timedelta
-from dotenv import load_dotenv
-import ccxt
+#include "signal_detector.h"
+#include <spdlog/spdlog.h>
+#include <cmath>
+#include <algorithm>
+#include <vector>
 
-load_dotenv()
-API_KEY = os.getenv("BINANCE_API_KEY")
-SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
-TG_TOKEN = os.getenv("TG_BOT_TOKEN")
-TG_CHAT = "5372217316"
+SignalDetector::SignalDetector(MLOptimizer& ml, Indicators& ind) : ml_(ml), ind_(ind) {}
 
-exchange = ccxt.binance({
-    'apiKey': API_KEY,
-    'secret': SECRET_KEY,
-    'enableRateLimit': True,
-    'options': {'defaultType': 'future'},
-})
+// 局部计算 KDJ 的 J 值，不修改共享 Indicators
+static double calc_kdj_j(const std::deque<double>& prices, int period = 9) {
+    if (prices.size() < static_cast<size_t>(period)) return 50.0;
+    // 使用局部静态状态，由于检测线程只有一个，这是安全的
+    static double k = 50.0, d = 50.0;
+    double low = *std::min_element(prices.end() - period, prices.end());
+    double high = *std::max_element(prices.end() - period, prices.end());
+    if (high == low) return 50.0;
+    double rsv = (prices.back() - low) / (high - low) * 100.0;
+    k = 0.6667 * k + 0.3333 * rsv;
+    d = 0.6667 * d + 0.3333 * k;
+    return 3.0 * k - 2.0 * d;
+}
 
-LEVERAGE = 3
-ORDER_USDT = 10.0
+double SignalDetector::objective(const OrderBook& ob, double price, const std::string& side) {
+    double atr = ind_.atr();
+    if (atr <= 0) return 0.0;
+    double dev = (ind_.ema20() - price) / atr;
 
-def send_tg(msg):
-    if not TG_TOKEN: return
-    try:
-        import requests
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                      json={"chat_id": TG_CHAT, "text": msg, "parse_mode": "Markdown"}, timeout=8)
-    except: pass
+    // 综合振荡器：RSI + KDJ + CCI（所有计算只读或使用局部状态）
+    double rsi = ind_.rsi() / 100.0;
+    double kdj = calc_kdj_j(ind_.prices(), 9) / 100.0;
+    double cci = (ind_.cci() + 200.0) / 400.0;
+    double osc = (rsi + kdj + cci) / 3.0;      // 原 16:02 的三因子等权
 
-def is_quiet_period():
-    now = datetime.now(timezone.utc)
-    if now.hour == 0 and now.minute < 5: return True
-    for h in [0, 8, 16]:
-        start = now.replace(hour=h, minute=0, second=0) - timedelta(minutes=5)
-        end = now.replace(hour=h, minute=0, second=0) + timedelta(minutes=5)
-        if start <= now <= end: return True
-    return False
+    double wall = ob.imbalance();
+    if (side == "LONG")
+        return dev * 0.4 + (1.0 - osc) * 0.4 + wall * 0.2;
+    else
+        return (-dev) * 0.4 + osc * 0.4 + (1.0 - wall) * 0.2;
+}
 
-def place_order(symbol, side, price):
-    side = side.lower()
-    if side not in ('buy', 'sell'):
-        print(f"❌ 无效方向: {side}")
-        return None, None
-    try:
-        if not exchange.markets: exchange.load_markets()
-        ticker = exchange.fetch_ticker(symbol)
-        bid = ticker['bid'] or price
-        ask = ticker['ask'] or price
-        if side == 'buy':
-            order_price = min(price, ask * 1.0005)
-        else:
-            order_price = max(price, bid * 0.9995)
-        order_price = exchange.price_to_precision(symbol, order_price)
-        amount = ORDER_USDT / float(order_price)
-        amount = exchange.amount_to_precision(symbol, amount)
-        exchange.set_leverage(LEVERAGE, symbol)
-        exchange.set_margin_mode('isolated', symbol)
-        order = exchange.create_order(
-            symbol=symbol, type='limit', side=side, amount=amount, price=order_price,
-            params={'timeInForce': 'GTX', 'postOnly': True}
-        )
-        print(f"✅ 下单成功: {symbol} {side} @ {order_price} (推导:{price}) Qty:{amount}")
-        return order_price, order
-    except Exception as e:
-        print(f"❌ 下单失败 {symbol}: {e}")
-        return None, str(e)[:100]
+double SignalDetector::solve_critical_price(const OrderBook& ob, const std::string& side) {
+    double lo = std::min(ind_.price() * 0.98, ob.best_bid());
+    double hi = std::max(ind_.price() * 1.02, ob.best_ask());
+    const double phi = 0.618;
+    for (int i = 0; i < 30; ++i) {
+        double c = hi - (hi - lo) * phi;
+        double d = lo + (hi - lo) * phi;
+        if (objective(ob, c, side) > objective(ob, d, side))
+            hi = d;
+        else
+            lo = c;
+    }
+    return (lo + hi) / 2.0;
+}
 
-def cancel_order(order_id, symbol):
-    try:
-        exchange.cancel_order(order_id, symbol)
-        print(f"🗑️ 已撤单 {symbol} {order_id}")
-    except Exception as e:
-        print(f"⚠️ 撤单失败 {symbol} {order_id}: {e}")
+bool SignalDetector::check_momentum_decay(const std::string& side) {
+    const auto& prices = ind_.prices();
+    if (prices.size() < 7) return false;
 
-def main():
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    engine_path = os.path.join(script_dir, "build", "engine")
-    if not os.path.exists(engine_path): sys.exit("engine 未编译")
-    try:
-        exchange.load_markets()
-        print("✅ 市场数据已加载")
-    except: pass
+    double v0 = prices.back() - prices[prices.size()-2];
+    double v1 = prices[prices.size()-2] - prices[prices.size()-3];
+    double v2 = prices[prices.size()-3] - prices[prices.size()-4];
+    double accel0 = v0 - v1;
+    double accel1 = v1 - v2;
 
-    proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True)
-    send_tg("🤖 最终自锁修复版启动 (心跳监控)")
-    last_b_signal = {}
-    last_a_push = {}
-    active_a_orders = {}
-    A_ORDER_TIMEOUT_SEC = 15 * 60
+    bool price_rising = prices.back() > prices[prices.size()-5];
+    bool price_falling = prices.back() < prices[prices.size()-5];
 
-    for line in proc.stdout:
-        line = line.strip()
-        if not line: continue
-        try: msg = json.loads(line)
-        except: print("C++:", line); continue
+    if (side == "LONG") {
+        bool is_low = true;
+        double cur = prices.back();
+        for (size_t i = prices.size()-5; i < prices.size()-1; ++i)
+            if (prices[i] < cur) { is_low = false; break; }
+        return (accel0 > 0 && accel1 > 0) || (price_rising && is_low);
+    } else {
+        bool is_high = true;
+        double cur = prices.back();
+        for (size_t i = prices.size()-5; i < prices.size()-1; ++i)
+            if (prices[i] > cur) { is_high = false; break; }
+        return (accel0 < 0 && accel1 < 0) || (price_falling && is_high);
+    }
+}
 
-        t = msg.get("type", "")
+Signal SignalDetector::check(const OrderBook& ob) {
+    Signal sig;
+    if (ind_.prices().size() < 60) return sig;
+    double atr = ind_.atr(); if (atr <= 0) return sig;
+    double ema20 = ind_.ema20(); double price = ind_.price();
+    if (price <= 0) return sig;
 
-        if t == "HEARTBEAT":
-            syms = msg.get("symbols", 0)
-            send_tg(f"💓 系统心跳 | 监控合约: {syms} | 时间: {datetime.now().strftime('%H:%M:%S')}")
-            continue
+    double dev = (ema20 - price) / atr;
 
-        sym = msg.get("symbol", "")
-        if t == "A_ACTIVE":
-            now = time.time()
-            if sym in last_a_push and now - last_a_push[sym] < 120:
-                continue
-            price = msg.get("price",0); change = msg.get("change_pct",0)
-            vol_r = msg.get("vol_ratio",0); dev = msg.get("dev", None)
-            d_str = f" | 偏离度:{dev:.1f}" if dev is not None else ""
-            send_tg(f"🔥 {sym} 异动 | 价:{price:.4f} | 涨跌:{change:+.2f}% | 量比:{vol_r:.1f}x{d_str}")
-            last_a_push[sym] = now
+    // 使用局部 KDJ 计算振荡器
+    double rsi = ind_.rsi() / 100.0;
+    double kdj = calc_kdj_j(ind_.prices(), 9) / 100.0;
+    double cci = (ind_.cci() + 200.0) / 400.0;
+    double osc = (rsi + kdj + cci) / 3.0;
 
-            if dev is not None and abs(dev) > 1.3:
-                side = "buy" if dev > 0 else "sell"
-                order_key = f"{sym}_{side}"
-                if order_key in active_a_orders: continue
-                actual_price, order = place_order(sym, side, price)
-                if actual_price:
-                    active_a_orders[order_key] = {
-                        'symbol': sym, 'side': side, 'order': order,
-                        'time': now, 'entry_dev': dev
-                    }
-                    send_tg(f"⚡ A层埋单 {side.upper()} {sym} @ {actual_price:.6f} (偏离度:{dev:.1f})")
+    double wall_raw = ob.imbalance();
+    double wall = wall_raw;
+    if (wall_raw <= 0.001 || wall_raw >= 0.999) wall = 0.5;
 
-        elif t == "SIGNAL":
-            side = msg.get("side",""); price_derived = msg.get("price",0)
-            score = msg.get("score",0)
-            stop_loss = msg.get("stop_loss",0)
-            take_profit = msg.get("take_profit",0)
-            now = time.time()
+    constexpr double LONG_DEV_THRESH  = 1.9;
+    constexpr double LONG_OSC_MAX     = 0.35;
+    constexpr double LONG_WALL_MIN    = 0.6;
+    constexpr double SHORT_DEV_THRESH = 1.9;
+    constexpr double SHORT_OSC_MIN    = 0.65;
+    constexpr double SHORT_WALL_MAX   = 0.4;
 
-            if sym in last_b_signal and now - last_b_signal[sym] < 600:
-                print(f"⏰ {sym} B信号冷却中")
-                continue
-            if is_quiet_period():
-                print("🔇 静默期")
-                continue
+    bool decay_long = check_momentum_decay("LONG");
+    bool decay_short = check_momentum_decay("SHORT");
 
-            actual_price, order_or_err = place_order(sym, side, price_derived)
-            tg_lines = [
-                f"🎯 {side.upper()} {sym} 评分:{score:.1f}",
-                f"💰 推导入场: {price_derived:.6f}"
-            ]
-            if actual_price:
-                tg_lines.append(f"✅ 实际下单: {actual_price:.6f}")
-                order_key = f"{sym}_{side.lower()}"
-                if order_key in active_a_orders:
-                    cancel_order(active_a_orders[order_key]['order'].get('id',''), sym)
-                    del active_a_orders[order_key]
-                last_b_signal[sym] = now
-            else:
-                tg_lines.append(f"❌ 下单失败: {order_or_err[:80]}")
-            tg_lines.append(f"🛑 止损: {stop_loss:.6f} | 🎯 止盈: {take_profit:.6f}")
-            send_tg("\n".join(tg_lines))
+    static int log_cnt = 0;
+    if (++log_cnt % 100 == 0)
+        spdlog::info("B层(KDJ): dev={:.2f} osc={:.2f} wall={:.2f} decay_long={} decay_short={}",
+                     dev, osc, wall, decay_long, decay_short);
 
-        # 定期清理过期 A 层订单
-        now_ts = time.time()
-        for key in list(active_a_orders.keys()):
-            if now_ts - active_a_orders[key]['time'] > A_ORDER_TIMEOUT_SEC:
-                cancel_order(active_a_orders[key]['order'].get('id',''), active_a_orders[key]['symbol'])
-                del active_a_orders[key]
-
-if __name__ == "__main__":
-    main()
+    if (dev > LONG_DEV_THRESH && osc < LONG_OSC_MAX && wall > LONG_WALL_MIN && decay_long) {
+        sig.valid = true; sig.side = "LONG";
+        sig.price = solve_critical_price(ob, "LONG");
+        sig.score = std::min(100.0, dev * 30.0 + (1.0 - osc) * 30.0 + wall * 40.0);
+    } else if (dev < -SHORT_DEV_THRESH && osc > SHORT_OSC_MIN && wall < SHORT_WALL_MAX && decay_short) {
+        sig.valid = true; sig.side = "SHORT";
+        sig.price = solve_critical_price(ob, "SHORT");
+        sig.score = std::min(100.0, (-dev) * 30.0 + osc * 30.0 + (1.0 - wall) * 40.0);
+    }
+    return sig;
+}

@@ -83,7 +83,7 @@ def main():
     except: pass
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True)
-    send_tg("🤖 极端反转引擎启动 (信号恢复版)")
+    send_tg("🤖 最终自锁修复版启动 (心跳监控)")
     last_b_signal = {}
     last_a_push = {}
     active_a_orders = {}
@@ -126,7 +126,7 @@ def main():
                     send_tg(f"⚡ A层埋单 {side.upper()} {sym} @ {actual_price:.6f} (偏离度:{dev:.1f})")
 
         elif t == "SIGNAL":
-            side = msg.get("side",""); derived_price = msg.get("price",0)
+            side = msg.get("side",""); price_derived = msg.get("price",0)
             score = msg.get("score",0)
             stop_loss = msg.get("stop_loss",0)
             take_profit = msg.get("take_profit",0)
@@ -139,10 +139,10 @@ def main():
                 print("🔇 静默期")
                 continue
 
-            actual_price, order_or_err = place_order(sym, side, derived_price)
+            actual_price, order_or_err = place_order(sym, side, price_derived)
             tg_lines = [
                 f"🎯 {side.upper()} {sym} 评分:{score:.1f}",
-                f"💰 推导入场: {derived_price:.6f}"
+                f"💰 推导入场: {price_derived:.6f}"
             ]
             if actual_price:
                 tg_lines.append(f"✅ 实际下单: {actual_price:.6f}")
