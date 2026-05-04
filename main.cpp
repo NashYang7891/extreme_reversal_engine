@@ -35,7 +35,6 @@ static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *use
     return size * nmemb;
 }
 
-// 兜底列表（20个主流币）
 const std::vector<std::string> ULTIMATE_FALLBACK = {
     "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","TRXUSDT",
     "BNBUSDT","ZECUSDT","BIOUSDT","ORDIUSDT","TSTUSDT","BABYUSDT",
@@ -43,7 +42,7 @@ const std::vector<std::string> ULTIMATE_FALLBACK = {
     "TAGUSDT","BSBUSDT","GENIUSUSDT"
 };
 
-// 获取成交量前100的USDT永续合约，失败时回退到兜底列表
+// 获取成交量前100的USDT永续合约，失败回退兜底列表
 std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 30000000.0) {
     std::vector<std::pair<std::string, double>> tickers;
     CURL *curl = curl_easy_init();
@@ -236,15 +235,22 @@ void run_detection() {
 
                             double atr = ctx.indicators.atr();
                             double p   = sig.price;
-                            double stop_dist = std::max(atr * 2.0, p * 0.02);
-                            if (stop_dist < p * 0.01) stop_dist = p * 0.01;
+
+                            // 新止损距离：3倍ATR，不低于1.5%价格，不高于5%价格
+                            double stop_dist = std::max(atr * 3.0, p * 0.015);
+                            if (stop_dist > p * 0.05) stop_dist = p * 0.05;
 
                             if (sig.side == "LONG") {
                                 b_msg["stop_loss"]   = p - stop_dist;
-                                b_msg["take_profit"] = p + atr * 3.0;
+                                b_msg["take_profit"] = std::max(p + atr * 5.0, p * 1.015);
+                                // 硬限制
+                                if (b_msg["stop_loss"] < p * 0.95) b_msg["stop_loss"] = p * 0.95;
+                                if (b_msg["take_profit"] <= p) b_msg["take_profit"] = p * 1.02;
                             } else {
                                 b_msg["stop_loss"]   = p + stop_dist;
-                                b_msg["take_profit"] = p - atr * 3.0;
+                                b_msg["take_profit"] = std::min(p - atr * 5.0, p * 0.985);
+                                if (b_msg["stop_loss"] > p * 1.05) b_msg["stop_loss"] = p * 1.05;
+                                if (b_msg["take_profit"] >= p) b_msg["take_profit"] = p * 0.98;
                             }
                             std::cout << b_msg.dump() << std::endl;
                             ctx.last_active_time = 0;
@@ -266,9 +272,8 @@ int main() {
     std::cout.setf(std::ios::unitbuf);
 
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
-    spdlog::info(">>> 极端反转引擎 [100合约版] 启动...");
+    spdlog::info(">>> 极端反转引擎 [优化盈亏比版] 启动...");
 
-    // 尝试在线获取100个合约，失败则使用兜底列表
     auto symbols = fetch_top_symbols(100, 30000000.0);
     {
         std::unique_lock lock(contexts_mutex);
