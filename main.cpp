@@ -100,28 +100,21 @@ struct SymbolContext {
 std::map<std::string, SymbolContext> contexts;
 std::shared_mutex contexts_mutex;
 
-// ---------- A层（修复冷启动死锁，涨跌幅≥1.2%、量比≥1.5）----------
-bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, double& out_vol_ratio) {
+// ---------- A层（纯只读，不再修改 Indicators）----------
+bool active_layer(const OrderBook& ob, const Indicators& ind, double& out_change, double& out_vol_ratio) {
     double change_3m = ind.price_change_pct(3*60);
     if (std::abs(change_3m) > 0.20) return false;
     if (std::abs(change_3m) < 0.012) return false;
 
     double recent_vol = ob.recent_volume(3*60*1000);
     double avg_vol = ind.get_volume_ema();
-
     if (avg_vol <= 1e-9) {
-        // EMA 未初始化：用当前量作为初值，并将量比设为门槛 1.5 直接放行（避免冷启动无信号）
-        ind.update_volume(recent_vol);
-        out_change = change_3m;
-        out_vol_ratio = 1.5;   // 刚好越过门槛，赋予中性的量比显示
-        spdlog::debug("A层冷启动放行: 量比置为1.5");
-        return true;
+        // EMA 尚未初始化，无法判断量比，暂不通过
+        return false;
     }
-
     double vol_ratio = recent_vol / avg_vol;
     if (vol_ratio < 1.5) return false;
 
-    ind.update_volume(recent_vol);
     out_change = change_3m;
     out_vol_ratio = vol_ratio;
     return true;
@@ -164,7 +157,12 @@ void run_websocket(const std::vector<std::string>& symbols) {
                     if (stream.find("@depth")!=std::string::npos) {
                         it->second.orderbook.update_depth(data);
                         double mp = it->second.orderbook.micro_price();
-                        if (mp > 0) it->second.indicators.update(mp);
+                        if (mp > 0) {
+                            it->second.indicators.update(mp);
+                            // 同时更新成交量 EMA（在写锁内，线程安全）
+                            double recent_vol = it->second.orderbook.recent_volume(3*60*1000);
+                            it->second.indicators.update_volume(recent_vol);
+                        }
                     } else if (stream.find("@aggTrade")!=std::string::npos) {
                         double price = std::stod(data["p"].get<std::string>());
                         double qty   = std::stod(data["q"].get<std::string>());
@@ -205,7 +203,7 @@ void run_detection() {
                 try {
                     double change_pct = 0.0, vol_ratio = 0.0;
                     if (active_layer(ctx.orderbook, ctx.indicators, change_pct, vol_ratio)) {
-                        // A层去重：180秒内同一币种不重复推送（平衡信号数量）
+                        // A层去重：180秒内同一币种不重复推送
                         if (now_ms - ctx.last_a_push_ms.load() < 180000) continue;
                         ctx.last_a_push_ms = now_ms;
                         ctx.last_active_time = now_ms;
@@ -287,7 +285,7 @@ int main() {
                                                    std::forward_as_tuple(sym),
                                                    std::forward_as_tuple());
     }
-    spdlog::info("引擎启动，监控 {} 个合约 (冷启动修复版)", symbols.size());
+    spdlog::info("引擎启动，监控 {} 个合约 (线程安全版)", symbols.size());
     std::thread ws_thread(run_websocket, symbols);
     std::thread detect_thread(run_detection);
     ws_thread.join();
