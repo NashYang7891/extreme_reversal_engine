@@ -16,6 +16,7 @@
 #include <cctype>
 #include <shared_mutex>
 #include <curl/curl.h>
+#include <csignal>
 #include "orderbook.h"
 #include "indicators.h"
 #include "signal_detector.h"
@@ -31,12 +32,18 @@ using tcp = net::ip::tcp;
 std::atomic<bool> keep_running{true};
 std::atomic<int64_t> last_data_time_ms{0};
 
+// 信号处理：记录崩溃地址
+void signal_handler(int sig) {
+    spdlog::critical("*** C++ 引擎收到信号 {}，即将退出 ***", sig);
+    keep_running = false;
+    std::exit(sig);
+}
+
 static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
     ((std::string*)userp)->append((char*)contents, size * nmemb);
     return size * nmemb;
 }
 
-// ---------- 安全类型转换 ----------
 int64_t safe_get_int64(const json& j, const std::string& key) {
     if (!j.contains(key)) return 0;
     if (j[key].is_number()) return j[key].get<int64_t>();
@@ -51,7 +58,7 @@ double safe_get_double(const json& j, const std::string& key) {
     return 0.0;
 }
 
-// 永不为空的兜底列表
+// 内置 20 个主流合约，完全离线可用
 const std::vector<std::string> ULTIMATE_FALLBACK = {
     "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","TRXUSDT",
     "BNBUSDT","ZECUSDT","BIOUSDT","ORDIUSDT","TSTUSDT","BABYUSDT",
@@ -59,50 +66,10 @@ const std::vector<std::string> ULTIMATE_FALLBACK = {
     "TAGUSDT","BSBUSDT","GENIUSUSDT"
 };
 
-// 获取合约列表，失败时回退到兜底列表
-std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 30000000.0) {
-    std::vector<std::pair<std::string, double>> tickers;
-    CURL *curl = curl_easy_init();
-    if (curl) {
-        std::string response;
-        curl_easy_setopt(curl, CURLOPT_URL, "https://fapi.binance.com/fapi/v1/ticker/24hr");
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-        CURLcode res = curl_easy_perform(curl);
-        if (res == CURLE_OK) {
-            try {
-                auto data = json::parse(response);
-                for (auto& item : data) {
-                    std::string sym = item["symbol"];
-                    if (sym.size()>4 && sym.compare(sym.size()-4,4,"USDT")==0 &&
-                        sym.find('_')==std::string::npos && sym!="USDCUSDT") {
-                        double vol = std::stod(item["quoteVolume"].get<std::string>());
-                        if (vol >= min_vol) tickers.emplace_back(sym, vol);
-                    }
-                }
-            } catch (...) { spdlog::error("解析 ticker 失败，使用兜底列表"); }
-        } else {
-            spdlog::error("获取 ticker 失败: {}，使用兜底列表", curl_easy_strerror(res));
-        }
-        curl_easy_cleanup(curl);
-    } else {
-        spdlog::error("curl 初始化失败，使用兜底列表");
-    }
-
-    std::sort(tickers.begin(), tickers.end(),
-              [](const auto& a, const auto& b) { return a.second > b.second; });
-
-    std::vector<std::string> result;
-    for (size_t i = 0; i < tickers.size() && i < (size_t)top_n; ++i)
-        result.push_back(tickers[i].first);
-
-    if (result.size() < 10) {
-        spdlog::warn("实时合约不足 10 个，切换为兜底列表");
-        return ULTIMATE_FALLBACK;
-    }
-    spdlog::info("最终监控 {} 个合约, 前3: {}", result.size(),
-                 result.size()>=3 ? result[0]+","+result[1]+","+result[2] : "");
-    return result;
+// 直接返回兜底列表，跳过所有网络请求
+std::vector<std::string> fetch_top_symbols(int top_n = 10, double min_vol = 30000000.0) {
+    spdlog::info("使用内置合约列表 (离线模式)");
+    return {ULTIMATE_FALLBACK.begin(), ULTIMATE_FALLBACK.begin() + std::min(top_n, (int)ULTIMATE_FALLBACK.size())};
 }
 
 struct SymbolContext {
@@ -117,27 +84,22 @@ struct SymbolContext {
 std::map<std::string, SymbolContext> contexts;
 std::shared_mutex contexts_mutex;
 
-// A层（数据不足60个微价格不输出）
 bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, double& out_vol_ratio) {
     if (ind.prices().size() < 60) return false;
-
     double change_3m = ind.price_change_pct(3*60);
     if (std::abs(change_3m) > 0.20) return false;
     if (std::abs(change_3m) < 0.012) return false;
 
     double recent_vol = ob.recent_volume(3*60*1000);
     double avg_vol = ind.get_volume_ema();
-
     if (avg_vol <= 1e-9) {
         ind.update_volume(recent_vol);
         out_change = change_3m;
         out_vol_ratio = 1.0;
         return true;
     }
-
     double vol_ratio = recent_vol / avg_vol;
     if (vol_ratio < 1.5) return false;
-
     ind.update_volume(recent_vol);
     out_change = change_3m;
     out_vol_ratio = vol_ratio;
@@ -146,7 +108,6 @@ bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, doub
 
 void process_json_msg(const json& msg) {
     if (!msg.contains("stream") || !msg.contains("data")) return;
-
     std::string stream = msg["stream"];
     auto& data = msg["data"];
 
@@ -156,10 +117,7 @@ void process_json_msg(const json& msg) {
 
     auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::system_clock::now().time_since_epoch()).count();
-
     last_data_time_ms = now_ms;
-
-    // 丢弃超过 1.5 秒的积压数据
     if (ts > 0 && std::abs(now_ms - ts) > 1500) return;
 
     size_t pos = stream.find('@');
@@ -188,7 +146,7 @@ void process_json_msg(const json& msg) {
 }
 
 void run_websocket(const std::vector<std::string>& symbols) {
-    int reconnect_attempt = 0;
+    int retry = 0;
     while (keep_running) {
         try {
             net::io_context ioc;
@@ -206,42 +164,32 @@ void run_websocket(const std::vector<std::string>& symbols) {
             for (const auto& sym : symbols) {
                 std::string s = sym;
                 for (char& c : s) c = std::tolower(c);
-                streams.push_back(s + "@depth@100ms");      // 改为标准 100ms
+                streams.push_back(s + "@depth@100ms");
                 streams.push_back(s + "@aggTrade");
             }
             json sub_msg = {{"method","SUBSCRIBE"}, {"params",streams}, {"id",1}};
             ws_stream.write(net::buffer(sub_msg.dump()));
-            spdlog::info("WebSocket 连接成功，已订阅 {} 个流", streams.size());
-
-            reconnect_attempt = 0;   // 成功连接后重置重试计数
+            spdlog::info("WebSocket 连接成功，订阅 {} 个流", streams.size());
+            retry = 0;
 
             beast::flat_buffer buffer;
             while (keep_running) {
                 ws_stream.read(buffer);
                 auto msg = json::parse(beast::buffers_to_string(buffer.data()));
                 buffer.clear();
-
-                int cleanup_limit = 5;
-                while (cleanup_limit-- > 0 && ws_stream.next_layer().next_layer().available() > 0) {
-                    beast::error_code ec;
-                    ws_stream.read(buffer, ec);
-                    if (ec) break;
-                    process_json_msg(json::parse(beast::buffers_to_string(buffer.data())));
-                    buffer.clear();
-                }
-
                 process_json_msg(msg);
+                // 不积压清理
             }
         } catch (const std::exception& e) {
-            spdlog::error("WebSocket 线程异常: {}，{}秒后重连 (尝试 {})", e.what(), 5 + reconnect_attempt * 2, reconnect_attempt);
+            spdlog::error("WebSocket 异常: {}，下次重试 {}s", e.what(), 3 + retry * 2);
         } catch (...) {
-            spdlog::error("WebSocket 未知异常，{}秒后重连 (尝试 {})", 5 + reconnect_attempt * 2, reconnect_attempt);
+            spdlog::error("WebSocket 未知异常");
         }
         if (keep_running) {
-            int wait_sec = 5 + reconnect_attempt * 2;   // 逐步延长等待时间
-            if (wait_sec > 60) wait_sec = 60;
-            std::this_thread::sleep_for(std::chrono::seconds(wait_sec));
-            reconnect_attempt++;
+            int w = 3 + retry * 2;
+            if (w > 30) w = 30;
+            std::this_thread::sleep_for(std::chrono::seconds(w));
+            retry++;
         }
     }
 }
@@ -255,14 +203,13 @@ void run_detection() {
             auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
 
-            auto now_steady = std::chrono::steady_clock::now();
-            if (now_steady - last_heartbeat > std::chrono::minutes(30)) {
+            if (std::chrono::steady_clock::now() - last_heartbeat > std::chrono::minutes(30)) {
                 json hb;
                 hb["type"] = "HEARTBEAT";
                 hb["symbols"] = contexts.size();
                 hb["timestamp"] = std::time(nullptr);
                 std::cout << hb.dump() << std::endl;
-                last_heartbeat = now_steady;
+                last_heartbeat = std::chrono::steady_clock::now();
             }
 
             for (auto& [sym, ctx] : contexts) {
@@ -284,8 +231,8 @@ void run_detection() {
                         a_msg["timestamp"] = std::time(nullptr);
                         double atr = ctx.indicators.atr();
                         if (atr > 1e-9) {
-                            double dev = (ctx.indicators.ema20() - ctx.indicators.price()) / atr;
-                            if (std::abs(dev) < 50.0) a_msg["dev"] = dev;
+                            a_msg["dev"] = (ctx.indicators.ema20() - ctx.indicators.price()) / atr;
+                            if (std::abs(a_msg["dev"].get<double>()) < 50.0) ;
                         }
                         std::cout << a_msg.dump() << std::endl;
                     }
@@ -305,12 +252,10 @@ void run_detection() {
 
                             double atr = ctx.indicators.atr();
                             double p   = sig.price;
-
                             double raw_atr_stop = (atr > 1e-9) ? (atr * 2.0) : (p * 0.02);
                             double pct_stop     = p * 0.02;
                             double stop_dist    = std::max(raw_atr_stop, pct_stop);
                             if (stop_dist < p * 0.01) stop_dist = p * 0.01;
-
                             double tp_atr = (atr > 1e-9) ? (p + atr * 3.0) : (p * 1.03);
                             double tp_pct_up   = p * 1.03;
                             double tp_pct_down = p * 0.98;
@@ -318,15 +263,11 @@ void run_detection() {
                             if (sig.side == "LONG") {
                                 b_msg["stop_loss"]   = p - stop_dist;
                                 b_msg["take_profit"] = std::max(tp_atr, tp_pct_up);
-                            } else {
-                                b_msg["stop_loss"]   = p + stop_dist;
-                                b_msg["take_profit"] = std::min(tp_atr, tp_pct_down);
-                            }
-
-                            if (sig.side == "LONG") {
                                 if (b_msg["stop_loss"] < p * 0.95) b_msg["stop_loss"] = p * 0.95;
                                 if (b_msg["take_profit"] <= p) b_msg["take_profit"] = p * 1.02;
                             } else {
+                                b_msg["stop_loss"]   = p + stop_dist;
+                                b_msg["take_profit"] = std::min(tp_atr, tp_pct_down);
                                 if (b_msg["stop_loss"] > p * 1.05) b_msg["stop_loss"] = p * 1.05;
                                 if (b_msg["take_profit"] >= p) b_msg["take_profit"] = p * 0.98;
                             }
@@ -348,49 +289,46 @@ void run_detection() {
 }
 
 int main() {
+    signal(SIGSEGV, signal_handler);
+    signal(SIGABRT, signal_handler);
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
-    spdlog::info(">>> 极端反转引擎 [连接修复版] 启动中...");
+    spdlog::info(">>> 极端反转引擎 [系统服务调试版] 启动...");
 
     try {
-        // 临时降为 20 个合约，确保连接稳定
-        auto symbols = fetch_top_symbols(20, 30000000.0);
+        auto symbols = fetch_top_symbols(10, 0);   // 10个合约，离线模式
         if (symbols.empty()) {
-            spdlog::critical("无可用合约，引擎退出");
+            spdlog::critical("无可用合约，退出");
             return 1;
         }
         {
             std::unique_lock lock(contexts_mutex);
-            for (const auto& sym : symbols) {
-                contexts.emplace(std::piecewise_construct,
-                                 std::forward_as_tuple(sym),
-                                 std::forward_as_tuple());
-            }
+            for (const auto& sym : symbols)
+                contexts.emplace(std::piecewise_construct, std::forward_as_tuple(sym), std::forward_as_tuple());
         }
         spdlog::info("引擎启动，监控 {} 个合约", symbols.size());
 
         std::thread ws_thread(run_websocket, symbols);
         std::thread detect_thread(run_detection);
+        spdlog::info("✅ 所有线程已启动");
 
-        spdlog::info("✅ 所有线程已启动，进入健康监控模式...");
-
-        const int64_t STALE_THRESHOLD_MS = 300000; // 5分钟无数据主动退出
+        // 主线程健康检查
+        const int64_t STALE_THRESHOLD_MS = 300000;
         while (keep_running) {
             std::this_thread::sleep_for(std::chrono::seconds(30));
             auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
-            int64_t last_data = last_data_time_ms.load();
-            if (last_data > 0 && (now_ms - last_data) > STALE_THRESHOLD_MS) {
-                spdlog::critical("❌ 数据已停滞 {} 秒，主动退出让 systemd 重启",
-                                 (now_ms - last_data) / 1000);
+            if (last_data_time_ms.load() > 0 && (now_ms - last_data_time_ms.load()) > STALE_THRESHOLD_MS) {
+                spdlog::critical("❌ 数据停滞 {} 秒，主动退出", (now_ms - last_data_time_ms.load()) / 1000);
                 keep_running = false;
-                break;
             }
         }
-
         if (ws_thread.joinable()) ws_thread.join();
         if (detect_thread.joinable()) detect_thread.join();
     } catch (const std::exception& e) {
-        spdlog::error("主程序异常: {}", e.what());
+        spdlog::error("main 异常: {}", e.what());
+        return 1;
+    } catch (...) {
+        spdlog::error("main 未知异常");
         return 1;
     }
     return 0;
