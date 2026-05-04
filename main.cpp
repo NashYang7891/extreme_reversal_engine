@@ -29,13 +29,15 @@ namespace ssl  = boost::asio::ssl;
 using tcp = net::ip::tcp;
 
 std::atomic<bool> keep_running{true};
+// 用于主线程健康检查：记录最后一次数据到达的时间戳
+std::atomic<int64_t> last_data_time_ms{0};
 
 static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
     ((std::string*)userp)->append((char*)contents, size * nmemb);
     return size * nmemb;
 }
 
-// ---------- 安全类型转换 (你的贡献) ----------
+// ---------- 安全类型转换 ----------
 int64_t safe_get_int64(const json& j, const std::string& key) {
     if (!j.contains(key)) return 0;
     if (j[key].is_number()) return j[key].get<int64_t>();
@@ -50,7 +52,7 @@ double safe_get_double(const json& j, const std::string& key) {
     return 0.0;
 }
 
-// 兜底合约列表
+// 永不为空的兜底列表
 const std::vector<std::string> ULTIMATE_FALLBACK = {
     "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","TRXUSDT",
     "BNBUSDT","ZECUSDT","BIOUSDT","ORDIUSDT","TSTUSDT","BABYUSDT",
@@ -58,7 +60,7 @@ const std::vector<std::string> ULTIMATE_FALLBACK = {
     "TAGUSDT","BSBUSDT","GENIUSUSDT"
 };
 
-// 获取 top_n 个合约，失败或不足时回退到兜底列表
+// 获取合约列表，失败时回退到兜底列表，保证永不返回空
 std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 30000000.0) {
     std::vector<std::pair<std::string, double>> tickers;
     CURL *curl = curl_easy_init();
@@ -79,13 +81,13 @@ std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 300
                         if (vol >= min_vol) tickers.emplace_back(sym, vol);
                     }
                 }
-            } catch (...) { spdlog::error("解析 ticker 失败，将使用兜底列表"); }
+            } catch (...) { spdlog::error("解析 ticker 失败，使用兜底列表"); }
         } else {
-            spdlog::error("获取 ticker 失败: {}，将使用兜底列表", curl_easy_strerror(res));
+            spdlog::error("获取 ticker 失败: {}，使用兜底列表", curl_easy_strerror(res));
         }
         curl_easy_cleanup(curl);
     } else {
-        spdlog::error("curl 初始化失败，将使用兜底列表");
+        spdlog::error("curl 初始化失败，使用兜底列表");
     }
 
     std::sort(tickers.begin(), tickers.end(),
@@ -142,7 +144,6 @@ bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, doub
     return true;
 }
 
-// 核心业务处理（带时效检查）
 void process_json_msg(const json& msg) {
     if (!msg.contains("stream") || !msg.contains("data")) return;
 
@@ -156,7 +157,10 @@ void process_json_msg(const json& msg) {
     auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                   std::chrono::system_clock::now().time_since_epoch()).count();
 
-    // 1.5秒门禁
+    // 更新最后数据时间（用于健康检查）
+    last_data_time_ms = now_ms;
+
+    // 丢弃超过 1.5 秒的积压数据
     if (ts > 0 && std::abs(now_ms - ts) > 1500) return;
 
     size_t pos = stream.find('@');
@@ -180,7 +184,7 @@ void process_json_msg(const json& msg) {
             it->second.orderbook.add_agg_trade(!isMaker, q, ts);
         }
     } catch (const std::exception& e) {
-        spdlog::error("数据处理崩溃 [{}]: {}", sym, e.what());
+        spdlog::error("数据处理异常 [{}]: {}", sym, e.what());
     }
 }
 
@@ -228,11 +232,12 @@ void run_websocket(const std::vector<std::string>& symbols) {
                 process_json_msg(msg);
             }
         } catch (const std::exception& e) {
-            spdlog::error("WebSocket 线程严重故障: {}，3秒后重连", e.what());
+            spdlog::error("WebSocket 线程异常: {}，5秒后重连", e.what());
+            std::this_thread::sleep_for(std::chrono::seconds(5));
         } catch (...) {
-            spdlog::error("WebSocket 线程未知异常，3秒后重连");
+            spdlog::error("WebSocket 未知异常，5秒后重连");
+            std::this_thread::sleep_for(std::chrono::seconds(5));
         }
-        if (keep_running) std::this_thread::sleep_for(std::chrono::seconds(3));
     }
 }
 
@@ -336,7 +341,7 @@ void run_detection() {
 
 int main() {
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
-    spdlog::info(">>> 极端反转引擎 [融合稳健版] 启动中...");
+    spdlog::info(">>> 极端反转引擎 [健康检查版] 启动中...");
 
     try {
         auto symbols = fetch_top_symbols(100, 30000000.0);
@@ -357,10 +362,27 @@ int main() {
         std::thread ws_thread(run_websocket, symbols);
         std::thread detect_thread(run_detection);
 
-        ws_thread.join();
-        detect_thread.join();
+        spdlog::info("✅ 所有线程已启动，进入健康监控模式...");
+
+        // 主线程健康检查：每30秒检查一次数据更新情况
+        const int64_t STALE_THRESHOLD_MS = 300000; // 5分钟无数据则认为网络已彻底中断
+        while (keep_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(30));
+            auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+            int64_t last_data = last_data_time_ms.load();
+            if (last_data > 0 && (now_ms - last_data) > STALE_THRESHOLD_MS) {
+                spdlog::critical("❌ 数据已停滞 {} 秒，主动退出让 systemd 重启",
+                                 (now_ms - last_data) / 1000);
+                keep_running = false;
+                break;
+            }
+        }
+
+        if (ws_thread.joinable()) ws_thread.join();
+        if (detect_thread.joinable()) detect_thread.join();
     } catch (const std::exception& e) {
-        spdlog::error("主程序抛出未捕获异常: {}", e.what());
+        spdlog::error("主程序异常: {}", e.what());
         return 1;
     }
     return 0;
