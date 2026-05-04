@@ -2,40 +2,17 @@
 #include <spdlog/spdlog.h>
 #include <cmath>
 #include <algorithm>
-#include <vector>
 
 SignalDetector::SignalDetector(MLOptimizer& ml, Indicators& ind) : ml_(ml), ind_(ind) {}
-
-// 局部计算 KDJ 的 J 值，不修改共享 Indicators
-static double calc_kdj_j(const std::deque<double>& prices, int period = 9) {
-    if (prices.size() < static_cast<size_t>(period)) return 50.0;
-    // 使用局部静态状态，由于检测线程只有一个，这是安全的
-    static double k = 50.0, d = 50.0;
-    double low = *std::min_element(prices.end() - period, prices.end());
-    double high = *std::max_element(prices.end() - period, prices.end());
-    if (high == low) return 50.0;
-    double rsv = (prices.back() - low) / (high - low) * 100.0;
-    k = 0.6667 * k + 0.3333 * rsv;
-    d = 0.6667 * d + 0.3333 * k;
-    return 3.0 * k - 2.0 * d;
-}
 
 double SignalDetector::objective(const OrderBook& ob, double price, const std::string& side) {
     double atr = ind_.atr();
     if (atr <= 0) return 0.0;
     double dev = (ind_.ema20() - price) / atr;
-
-    // 综合振荡器：RSI + KDJ + CCI（所有计算只读或使用局部状态）
-    double rsi = ind_.rsi() / 100.0;
-    double kdj = calc_kdj_j(ind_.prices(), 9) / 100.0;
-    double cci = (ind_.cci() + 200.0) / 400.0;
-    double osc = (rsi + kdj + cci) / 3.0;      // 原 16:02 的三因子等权
-
+    double osc = ind_.composite_oscillator(ml_.get_w_rsi(), ml_.get_w_kdj(), ml_.get_w_cci());
     double wall = ob.imbalance();
-    if (side == "LONG")
-        return dev * 0.4 + (1.0 - osc) * 0.4 + wall * 0.2;
-    else
-        return (-dev) * 0.4 + osc * 0.4 + (1.0 - wall) * 0.2;
+    if (side == "LONG") return dev * 0.4 + (1.0 - osc) * 0.4 + wall * 0.2;
+    else return (-dev) * 0.4 + osc * 0.4 + (1.0 - wall) * 0.2;
 }
 
 double SignalDetector::solve_critical_price(const OrderBook& ob, const std::string& side) {
@@ -45,18 +22,16 @@ double SignalDetector::solve_critical_price(const OrderBook& ob, const std::stri
     for (int i = 0; i < 30; ++i) {
         double c = hi - (hi - lo) * phi;
         double d = lo + (hi - lo) * phi;
-        if (objective(ob, c, side) > objective(ob, d, side))
-            hi = d;
-        else
-            lo = c;
+        if (objective(ob, c, side) > objective(ob, d, side)) hi = d; else lo = c;
     }
     return (lo + hi) / 2.0;
 }
 
 bool SignalDetector::check_momentum_decay(const std::string& side) {
     const auto& prices = ind_.prices();
-    if (prices.size() < 7) return false;
+    if (prices.size() < 7) return false;  // 需要更多数据计算两个加速度
 
+    // 计算两个连续加速度
     double v0 = prices.back() - prices[prices.size()-2];
     double v1 = prices[prices.size()-2] - prices[prices.size()-3];
     double v2 = prices[prices.size()-3] - prices[prices.size()-4];
@@ -71,13 +46,15 @@ bool SignalDetector::check_momentum_decay(const std::string& side) {
         double cur = prices.back();
         for (size_t i = prices.size()-5; i < prices.size()-1; ++i)
             if (prices[i] < cur) { is_low = false; break; }
-        return (accel0 > 0 && accel1 > 0) || (price_rising && is_low);
+        // 连续两个加速度均为正，或价格回升
+        return (accel0 > 0 && accel1 > 0) || price_rising && is_low;
     } else {
         bool is_high = true;
         double cur = prices.back();
         for (size_t i = prices.size()-5; i < prices.size()-1; ++i)
             if (prices[i] > cur) { is_high = false; break; }
-        return (accel0 < 0 && accel1 < 0) || (price_falling && is_high);
+        // 连续两个加速度均为负，或价格回落
+        return (accel0 < 0 && accel1 < 0) || price_falling && is_high;
     }
 }
 
@@ -89,13 +66,7 @@ Signal SignalDetector::check(const OrderBook& ob) {
     if (price <= 0) return sig;
 
     double dev = (ema20 - price) / atr;
-
-    // 使用局部 KDJ 计算振荡器
-    double rsi = ind_.rsi() / 100.0;
-    double kdj = calc_kdj_j(ind_.prices(), 9) / 100.0;
-    double cci = (ind_.cci() + 200.0) / 400.0;
-    double osc = (rsi + kdj + cci) / 3.0;
-
+    double osc = ind_.composite_oscillator(ml_.get_w_rsi(), ml_.get_w_kdj(), ml_.get_w_cci());
     double wall_raw = ob.imbalance();
     double wall = wall_raw;
     if (wall_raw <= 0.001 || wall_raw >= 0.999) wall = 0.5;
@@ -112,7 +83,7 @@ Signal SignalDetector::check(const OrderBook& ob) {
 
     static int log_cnt = 0;
     if (++log_cnt % 100 == 0)
-        spdlog::info("B层(KDJ): dev={:.2f} osc={:.2f} wall={:.2f} decay_long={} decay_short={}",
+        spdlog::info("B层: dev={:.2f} osc={:.2f} wall={:.2f} decay_long={} decay_short={}",
                      dev, osc, wall, decay_long, decay_short);
 
     if (dev > LONG_DEV_THRESH && osc < LONG_OSC_MAX && wall > LONG_WALL_MIN && decay_long) {

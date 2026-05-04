@@ -79,29 +79,33 @@ struct SymbolContext {
     MLOptimizer ml{3};
     SignalDetector detector{ml, indicators};
     std::atomic<int64_t> last_active_time{0};
-    std::atomic<int64_t> last_a_push_ms{0};
 };
 
 std::map<std::string, SymbolContext> contexts;
 std::shared_mutex contexts_mutex;
 
-// A层（冷启动放行，涨跌幅≥1.2%、量比≥1.5）
-bool active_layer(const OrderBook& ob, const Indicators& ind, double& out_change, double& out_vol_ratio) {
+// A层（修复版：放宽时效性、解除EMA死锁）
+bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, double& out_vol_ratio) {
     double change_3m = ind.price_change_pct(3*60);
     if (std::abs(change_3m) > 0.20) return false;
     if (std::abs(change_3m) < 0.012) return false;
 
     double recent_vol = ob.recent_volume(3*60*1000);
     double avg_vol = ind.get_volume_ema();
+
+    // 解除冷启动死锁：EMA未初始化时直接使用recent_vol作为初值，量比设为1.0放行
     if (avg_vol <= 1e-9) {
-        // EMA未初始化：直接放行，量比记为1.5
+        spdlog::debug("EMA冷启动，设置avg_vol = recent_vol = {}", recent_vol);
+        ind.update_volume(recent_vol);   // 更新EMA
         out_change = change_3m;
-        out_vol_ratio = 1.5;
+        out_vol_ratio = 1.0;             // 视为正常量比
         return true;
     }
+
     double vol_ratio = recent_vol / avg_vol;
     if (vol_ratio < 1.5) return false;
 
+    ind.update_volume(recent_vol);
     out_change = change_3m;
     out_vol_ratio = vol_ratio;
     return true;
@@ -127,8 +131,7 @@ void run_websocket(const std::vector<std::string>& symbols) {
                 streams.push_back(s+"@depth@100ms");
                 streams.push_back(s+"@aggTrade");
             }
-            json sub_msg = {{"method","SUBSCRIBE"}, {"params",streams}, {"id",1}};
-            ws.write(net::buffer(sub_msg.dump()));
+            ws.write(net::buffer(json{{"method","SUBSCRIBE"},{"params",streams},{"id",1}}.dump()));
             beast::flat_buffer buffer;
             while (keep_running) {
                 ws.read(buffer);
@@ -151,9 +154,6 @@ void run_websocket(const std::vector<std::string>& symbols) {
                         bool isMaker = data["m"];
                         int64_t trade_time = std::stoll(data["T"].get<std::string>());
                         it->second.orderbook.add_agg_trade(!isMaker, qty, trade_time);
-                        // 每次成交更新成交量 EMA
-                        double recent_vol = it->second.orderbook.recent_volume(3*60*1000);
-                        it->second.indicators.update_volume(recent_vol);
                     }
                 }
             }
@@ -165,6 +165,7 @@ void run_websocket(const std::vector<std::string>& symbols) {
 }
 
 void run_detection() {
+    // 心跳日志控制
     auto last_heartbeat = std::chrono::steady_clock::now();
     while (keep_running) {
         auto start = std::chrono::steady_clock::now();
@@ -173,23 +174,24 @@ void run_detection() {
             auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
 
-            // 每30分钟心跳
-            if (std::chrono::steady_clock::now() - last_heartbeat > std::chrono::minutes(30)) {
+            // 每30分钟输出心跳JSON
+            auto now_steady = std::chrono::steady_clock::now();
+            if (now_steady - last_heartbeat > std::chrono::minutes(30)) {
                 json hb;
                 hb["type"] = "HEARTBEAT";
                 hb["symbols"] = contexts.size();
                 hb["timestamp"] = std::time(nullptr);
                 std::cout << hb.dump() << std::endl;
-                last_heartbeat = std::chrono::steady_clock::now();
+                last_heartbeat = now_steady;
             }
 
             for (auto& [sym, ctx] : contexts) {
+                // ★ 时效性放宽到60秒
                 if (ctx.indicators.is_stale(60000)) continue;
+
                 try {
                     double change_pct = 0.0, vol_ratio = 0.0;
                     if (active_layer(ctx.orderbook, ctx.indicators, change_pct, vol_ratio)) {
-                        if (now_ms - ctx.last_a_push_ms.load() < 120000) continue;
-                        ctx.last_a_push_ms = now_ms;
                         ctx.last_active_time = now_ms;
                         json a_msg;
                         a_msg["type"] = "A_ACTIVE";
@@ -199,10 +201,7 @@ void run_detection() {
                         a_msg["vol_ratio"] = vol_ratio;
                         a_msg["timestamp"] = std::time(nullptr);
                         double atr = ctx.indicators.atr();
-                        if (atr > 1e-9) {
-                            double dev = (ctx.indicators.ema20() - ctx.indicators.price()) / atr;
-                            if (std::abs(dev) < 50.0) a_msg["dev"] = dev;
-                        }
+                        if (atr > 0) a_msg["dev"] = (ctx.indicators.ema20() - ctx.indicators.price()) / atr;
                         std::cout << a_msg.dump() << std::endl;
                     }
 
@@ -217,27 +216,16 @@ void run_detection() {
                             b_msg["price"]  = sig.price;
                             b_msg["score"]  = sig.score;
                             b_msg["timestamp"] = std::time(nullptr);
-
                             double atr = ctx.indicators.atr();
-                            if (atr > 1e-9) {
-                                double raw_atr_stop = atr * 2.0;
-                                double pct_stop = sig.price * 0.02;          // 2%硬止损
-                                double stop = std::max(raw_atr_stop, pct_stop);
-                                double tp = sig.price + atr * 3.0;
+                            if (atr > 0) {
+                                double raw_stop = atr * 2.0;
+                                double hard_limit = sig.price * 0.03;
                                 if (sig.side == "LONG") {
-                                    b_msg["stop_loss"]   = sig.price - stop;
-                                    b_msg["take_profit"] = std::max(tp, sig.price * 1.015);
+                                    b_msg["stop_loss"] = std::min(raw_stop, hard_limit);
+                                    b_msg["take_profit"] = sig.price + atr * 3.0;
                                 } else {
-                                    b_msg["stop_loss"]   = sig.price + stop;
-                                    b_msg["take_profit"] = std::min(tp, sig.price * 0.985);
-                                }
-                            } else {
-                                if (sig.side == "LONG") {
-                                    b_msg["stop_loss"]   = sig.price * 0.98;
-                                    b_msg["take_profit"] = sig.price * 1.03;
-                                } else {
-                                    b_msg["stop_loss"]   = sig.price * 1.02;
-                                    b_msg["take_profit"] = sig.price * 0.97;
+                                    b_msg["stop_loss"] = std::min(raw_stop, hard_limit);
+                                    b_msg["take_profit"] = sig.price - atr * 3.0;
                                 }
                             }
                             std::cout << b_msg.dump() << std::endl;
@@ -265,7 +253,7 @@ int main() {
                                                    std::forward_as_tuple(sym),
                                                    std::forward_as_tuple());
     }
-    spdlog::info("引擎启动，监控 {} 个合约 (最终自锁修复版)", symbols.size());
+    spdlog::info("引擎启动，监控 {} 个合约 (自锁修复版)", symbols.size());
     std::thread ws_thread(run_websocket, symbols);
     std::thread detect_thread(run_detection);
     ws_thread.join();
