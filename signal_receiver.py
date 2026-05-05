@@ -24,16 +24,19 @@ LEVERAGE = 3
 ORDER_USDT = 10.0
 SLIPPAGE_TOLERANCE = 0.002          # 0.2% 滑点
 
-# 跟踪止损参数
-TRAILING_ACTIVATION_PCT = 3.0       # 盈利 3% 激活
+TRAILING_ACTIVATION_PCT = 3.0       # 盈利 3% 激活跟踪止损
 TRAILING_CALLBACK_PCT = 1.2         # 回撤 1.2% 平仓 (做多)
 TRAILING_CALLBACK_PCT_SHORT = 1.2   # 做空反弹 1.2% 平仓
 
 positions = {}                       # 持仓记录
-
-# TG 消息频率控制
 LAST_TG_SEND = 0
 TG_RATE_LIMIT_SEC = 0.5
+
+# ----------------------- API 异常熔断 -----------------------
+api_fail_count = 0
+API_FAIL_THRESHOLD = 5              # 连续失败 5 次触发熔断
+api_pause_until = 0
+PAUSE_MINUTES = 10                  # 暂停 10 分钟
 
 def send_tg(msg):
     global LAST_TG_SEND
@@ -57,68 +60,71 @@ def is_quiet_period():
         if start <= now <= end: return True
     return False
 
+def get_market_price(symbol, fallback):
+    """获取盘口价，严重故障时返回 fallback"""
+    global api_fail_count, api_pause_until
+    if time.time() < api_pause_until:
+        return fallback, fallback, True   # 熔断中
+
+    try:
+        ticker = exchange.fetch_ticker(symbol)
+        api_fail_count = 0   # 成功则重置计数
+        ask = ticker.get('ask') or ticker.get('last') or fallback
+        bid = ticker.get('bid') or ticker.get('last') or fallback
+        return bid, ask, False
+    except Exception as e:
+        api_fail_count += 1
+        print(f"⚠ fetch_ticker 失败 ({api_fail_count}/{API_FAIL_THRESHOLD}): {e}")
+        if api_fail_count >= API_FAIL_THRESHOLD:
+            api_pause_until = time.time() + PAUSE_MINUTES * 60
+            send_tg(f"🚨 API 异常，暂停下单 {PAUSE_MINUTES} 分钟")
+        return fallback, fallback, True
+
 def place_order(symbol, side, price):
-    """
-    IOC 限价单 + 0.2% 滑点。
-    返回 (实际成交均价, 订单对象) 或 (None, 详细错误描述)。
-    """
     side = side.lower()
     if side == "long": side = "buy"
     elif side == "short": side = "sell"
     if side not in ('buy', 'sell'):
         return None, "无效方向"
 
+    # 若处于熔断期，直接放弃
+    if time.time() < api_pause_until:
+        return None, "API熔断暂停"
+
     try:
         if not exchange.markets:
             exchange.load_markets()
 
-        # 获取最新盘口
-        ticker = exchange.fetch_ticker(symbol)
-        ask = ticker.get('ask')
-        bid = ticker.get('bid')
-        if not ask or not bid:
-            return None, "盘口数据缺失"
+        # 使用稳健的盘口获取，失败时用 C++ 传来的 price 兜底
+        bid, ask, troubled = get_market_price(symbol, price)
+        if troubled and api_fail_count >= API_FAIL_THRESHOLD:
+            return None, "API严重异常"
 
-        # 计算下单价格 (含 0.2% 滑点)
         if side == 'buy':
             base_price = max(price, ask)
-            order_price = base_price * 1.002
+            order_price = base_price * (1.0 + SLIPPAGE_TOLERANCE)
         else:
             base_price = min(price, bid)
-            order_price = base_price * 0.998
+            order_price = base_price * (1.0 - SLIPPAGE_TOLERANCE)
 
         order_price_str = exchange.price_to_precision(symbol, order_price)
         amount = ORDER_USDT / order_price
         amount_str = exchange.amount_to_precision(symbol, amount)
 
-        # 设置杠杆和逐仓
         exchange.set_leverage(LEVERAGE, symbol)
         exchange.set_margin_mode('isolated', symbol)
 
-        # 发送 IOC 订单
         order = exchange.create_order(
-            symbol=symbol,
-            type='limit',
-            side=side,
-            amount=amount_str,
-            price=order_price_str,
+            symbol=symbol, type='limit', side=side,
+            amount=amount_str, price=order_price_str,
             params={'timeInForce': 'IOC'}
         )
 
         if not order:
             return None, "提交失败"
 
-        # ----- 解析成交结果 -----
-        filled = 0.0
-        avg_price = 0.0
-
-        # 从基础字段读取
-        if order.get('filled'):
-            filled = float(order['filled'])
-        if order.get('average'):
-            avg_price = float(order['average'])
-
-        # 备选：从 info 中提取
+        filled = float(order.get('filled', 0))
+        avg_price = float(order.get('average', 0))
         if filled <= 0 or avg_price <= 0:
             info = order.get('info', {})
             cum_qty = float(info.get('cumQty', 0))
@@ -128,30 +134,26 @@ def place_order(symbol, side, price):
                 filled = cum_qty
 
         if filled > 0 and avg_price > 0:
-            print(f"✅ IOC 成交: {symbol} {side} @ {avg_price:.6f} 量:{filled} (本:{price:.6f})")
+            print(f"✅ 成交: {symbol} {side} @ {avg_price:.6f} 量:{filled}")
             return avg_price, order
         else:
-            # 未成交，记录价格对比
-            print(f"⚠ IOC 未成交: {symbol} {side} 本:{price:.6f} 买一:{bid:.6f} 卖一:{ask:.6f} 下单:{order_price_str}")
+            print(f"⚠ IOC 未成交: {symbol} {side}")
             return None, "IOC未成交"
 
     except ccxt.InsufficientFunds:
         return None, "保证金不足"
     except ccxt.PermissionDenied as e:
         return None, f"无交易权限: {e}"
-    except ccxt.BadSymbol as e:
-        return None, f"无效币种: {e}"
     except Exception as e:
         print(f"❌ 下单异常 {symbol}: {e}")
-        return None, f"异常:{str(e)[:60]}"
+        return None, str(e)[:100]
 
 def update_positions_after_fill(symbol, side, entry_price, order):
     try:
         qty_val = float(order.get('filled') or order.get('amount') or 0)
     except:
         qty_val = 0.0
-    if qty_val <= 0:
-        return
+    if qty_val <= 0: return
     pos_side = "LONG" if side == "buy" else "SHORT"
     positions[symbol] = {
         'side': pos_side,
@@ -161,7 +163,7 @@ def update_positions_after_fill(symbol, side, entry_price, order):
         'lowest_price': entry_price,
         'trailing_activated': False
     }
-    print(f"📊 持仓记录: {symbol} {pos_side} @ {entry_price:.6f} 数量:{qty_val}")
+    print(f"📊 持仓: {symbol} {pos_side} @ {entry_price:.6f} 量:{qty_val}")
 
 def check_and_trail_positions():
     if not positions: return
@@ -214,7 +216,7 @@ def main():
         print(f"⚠ 加载市场失败: {e}")
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True, bufsize=1)
-    send_tg("🤖 引擎启动 (IOC 0.2%滑点·成交解析优化)")
+    send_tg("🤖 引擎启动 (抗API异常+IOC)")
 
     last_b_signal = {}
     last_a_push = {}
@@ -264,7 +266,6 @@ def main():
             else:
                 err_msg = str(order_info) if order_info else "未成交"
                 tg_lines.append(f"❌ 未成交: {err_msg[:80]}")
-
             tg_lines.append(f"🛑 止损: {stop_loss:.6f} | 🎯 止盈: {take_profit:.6f}")
             send_tg("\n".join(tg_lines))
 
