@@ -68,38 +68,35 @@ Signal SignalDetector::check(const OrderBook& ob) {
     double wall = wall_raw;
     if (wall_raw <= 0.001 || wall_raw >= 0.999) wall = 0.5;
 
-    // 非对称参数
-    constexpr double LONG_DEV_THRESH  = 3.2;
+    // 非对称参数（已调整）
+    constexpr double LONG_DEV_THRESH  = 2.8;   // 稍微放宽，增加做多频率
     constexpr double LONG_OSC_MAX     = 0.15;
     constexpr double LONG_WALL_MIN    = 0.65;
     constexpr double LONG_RSI_MAX     = 30;
 
     constexpr double SHORT_DEV_THRESH = 1.9;
     constexpr double SHORT_OSC_MIN    = 0.65;
-    constexpr double SHORT_WALL_MAX   = 0.4;
+    constexpr double SHORT_WALL_MAX   = 0.65;  // 从 0.4 放宽至 0.65
 
     bool decay_long = check_momentum_decay("LONG");
     bool decay_short = check_momentum_decay("SHORT");
 
-    // ----- 暴力入场：偏离度超过 5σ 时无需衰减确认 -----
+    // 暴力入场：偏离度 >5σ 时跳过动能衰减确认
     constexpr double ULTRA_EXTREME_SIGMA = 5.0;
     bool is_ultra = (std::abs(dev) > ULTRA_EXTREME_SIGMA);
 
     // 做多信号
-    bool long_ok = (dev > LONG_DEV_THRESH && osc < LONG_OSC_MAX && wall > LONG_WALL_MIN &&
-                    (decay_long || (is_ultra && dev > LONG_DEV_THRESH && osc < LONG_OSC_MAX))) &&
-                   ind_.rsi(14) < LONG_RSI_MAX;
-    if (long_ok) {
+    if (dev > LONG_DEV_THRESH && osc < LONG_OSC_MAX && wall > LONG_WALL_MIN &&
+        (decay_long || (is_ultra && dev > LONG_DEV_THRESH))) {
         sig.valid = true; sig.side = "LONG";
         sig.price = solve_critical_price(ob, "LONG");
         sig.score = std::min(100.0, dev * 30.0 + (1.0 - osc) * 30.0 + wall * 40.0);
         return sig;
     }
 
-    // 做空信号：正常条件 或 超极端无需衰减
-    bool short_ok = (dev < -SHORT_DEV_THRESH && osc > SHORT_OSC_MIN && wall < SHORT_WALL_MAX &&
-                     (decay_short || (is_ultra && dev < -SHORT_DEV_THRESH && osc > SHORT_OSC_MIN)));
-    if (short_ok) {
+    // 做空信号：放宽 wall，且超极端无需 decay
+    if (dev < -SHORT_DEV_THRESH && osc > SHORT_OSC_MIN && wall < SHORT_WALL_MAX &&
+        (decay_short || (is_ultra && dev < -SHORT_DEV_THRESH))) {
         sig.valid = true; sig.side = "SHORT";
         sig.price = solve_critical_price(ob, "SHORT");
         sig.score = std::min(100.0, (-dev) * 30.0 + osc * 30.0 + (1.0 - wall) * 40.0);
