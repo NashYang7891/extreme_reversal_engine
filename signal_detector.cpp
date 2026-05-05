@@ -45,6 +45,7 @@ bool SignalDetector::check_momentum_decay(const std::string& side) {
         double cur = prices.back();
         for (size_t i = prices.size()-5; i < prices.size()-1; ++i)
             if (prices[i] < cur) { is_low = false; break; }
+        // 连续两个加速度为正，且处于低位，或价格已开始回升
         return (accel0 > 0 && accel1 > 0) || (price_rising && is_low);
     } else {
         bool is_high = true;
@@ -68,13 +69,14 @@ Signal SignalDetector::check(const OrderBook& ob) {
     double wall = wall_raw;
     if (wall_raw <= 0.001 || wall_raw >= 0.999) wall = 0.5;
 
-    // 做多强化参数
-    constexpr double LONG_DEV_THRESH  = 2.4;   // 原 1.9 → 2.4（更深坑）
-    constexpr double LONG_OSC_MAX     = 0.35;
-    constexpr double LONG_WALL_MIN    = 0.65;  // 原 0.6 → 0.65（更严买盘）
-    constexpr double LONG_RSI_MAX     = 30;    // 15m RSI 必须 <30
+    // ---------- 非对称参数 ----------
+    // 做多：极其严苛（只在深插针后绝望时刻出手）
+    constexpr double LONG_DEV_THRESH  = 3.2;      // 原 2.4 → 3.2
+    constexpr double LONG_OSC_MAX     = 0.15;     // 原 0.35 → 0.15
+    constexpr double LONG_WALL_MIN    = 0.65;
+    constexpr double LONG_RSI_MAX     = 30;
 
-    // 做空保持原参数
+    // 做空：保持原参数，捕捉上涨衰竭
     constexpr double SHORT_DEV_THRESH = 1.9;
     constexpr double SHORT_OSC_MIN    = 0.65;
     constexpr double SHORT_WALL_MAX   = 0.4;
@@ -87,14 +89,14 @@ Signal SignalDetector::check(const OrderBook& ob) {
         spdlog::info("B层: dev={:.2f} osc={:.2f} wall={:.2f} rsi={:.1f} decay_long={} decay_short={}",
                      dev, osc, wall, ind_.rsi(14), decay_long, decay_short);
 
-    // 做多信号（增加 RSI 过滤）
+    // 做多信号（在极值处触发）
     if (dev > LONG_DEV_THRESH && osc < LONG_OSC_MAX && wall > LONG_WALL_MIN && decay_long &&
         ind_.rsi(14) < LONG_RSI_MAX) {
         sig.valid = true; sig.side = "LONG";
         sig.price = solve_critical_price(ob, "LONG");
         sig.score = std::min(100.0, dev * 30.0 + (1.0 - osc) * 30.0 + wall * 40.0);
     }
-    // 做空信号（参数不变，无额外 RSI 限制）
+    // 做空信号（参数保持不变）
     else if (dev < -SHORT_DEV_THRESH && osc > SHORT_OSC_MIN && wall < SHORT_WALL_MAX && decay_short) {
         sig.valid = true; sig.side = "SHORT";
         sig.price = solve_critical_price(ob, "SHORT");
