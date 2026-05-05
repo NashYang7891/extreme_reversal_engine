@@ -29,9 +29,8 @@ double SignalDetector::solve_critical_price(const OrderBook& ob, const std::stri
 
 bool SignalDetector::check_momentum_decay(const std::string& side) {
     const auto& prices = ind_.prices();
-    if (prices.size() < 7) return false;  // 需要更多数据计算两个加速度
+    if (prices.size() < 7) return false;
 
-    // 计算两个连续加速度
     double v0 = prices.back() - prices[prices.size()-2];
     double v1 = prices[prices.size()-2] - prices[prices.size()-3];
     double v2 = prices[prices.size()-3] - prices[prices.size()-4];
@@ -46,15 +45,13 @@ bool SignalDetector::check_momentum_decay(const std::string& side) {
         double cur = prices.back();
         for (size_t i = prices.size()-5; i < prices.size()-1; ++i)
             if (prices[i] < cur) { is_low = false; break; }
-        // 连续两个加速度均为正，或价格回升
-        return (accel0 > 0 && accel1 > 0) || price_rising && is_low;
+        return (accel0 > 0 && accel1 > 0) || (price_rising && is_low);
     } else {
         bool is_high = true;
         double cur = prices.back();
         for (size_t i = prices.size()-5; i < prices.size()-1; ++i)
             if (prices[i] > cur) { is_high = false; break; }
-        // 连续两个加速度均为负，或价格回落
-        return (accel0 < 0 && accel1 < 0) || price_falling && is_high;
+        return (accel0 < 0 && accel1 < 0) || (price_falling && is_high);
     }
 }
 
@@ -71,9 +68,13 @@ Signal SignalDetector::check(const OrderBook& ob) {
     double wall = wall_raw;
     if (wall_raw <= 0.001 || wall_raw >= 0.999) wall = 0.5;
 
-    constexpr double LONG_DEV_THRESH  = 1.9;
+    // 做多强化参数
+    constexpr double LONG_DEV_THRESH  = 2.4;   // 原 1.9 → 2.4（更深坑）
     constexpr double LONG_OSC_MAX     = 0.35;
-    constexpr double LONG_WALL_MIN    = 0.6;
+    constexpr double LONG_WALL_MIN    = 0.65;  // 原 0.6 → 0.65（更严买盘）
+    constexpr double LONG_RSI_MAX     = 30;    // 15m RSI 必须 <30
+
+    // 做空保持原参数
     constexpr double SHORT_DEV_THRESH = 1.9;
     constexpr double SHORT_OSC_MIN    = 0.65;
     constexpr double SHORT_WALL_MAX   = 0.4;
@@ -83,14 +84,18 @@ Signal SignalDetector::check(const OrderBook& ob) {
 
     static int log_cnt = 0;
     if (++log_cnt % 100 == 0)
-        spdlog::info("B层: dev={:.2f} osc={:.2f} wall={:.2f} decay_long={} decay_short={}",
-                     dev, osc, wall, decay_long, decay_short);
+        spdlog::info("B层: dev={:.2f} osc={:.2f} wall={:.2f} rsi={:.1f} decay_long={} decay_short={}",
+                     dev, osc, wall, ind_.rsi(14), decay_long, decay_short);
 
-    if (dev > LONG_DEV_THRESH && osc < LONG_OSC_MAX && wall > LONG_WALL_MIN && decay_long) {
+    // 做多信号（增加 RSI 过滤）
+    if (dev > LONG_DEV_THRESH && osc < LONG_OSC_MAX && wall > LONG_WALL_MIN && decay_long &&
+        ind_.rsi(14) < LONG_RSI_MAX) {
         sig.valid = true; sig.side = "LONG";
         sig.price = solve_critical_price(ob, "LONG");
         sig.score = std::min(100.0, dev * 30.0 + (1.0 - osc) * 30.0 + wall * 40.0);
-    } else if (dev < -SHORT_DEV_THRESH && osc > SHORT_OSC_MIN && wall < SHORT_WALL_MAX && decay_short) {
+    }
+    // 做空信号（参数不变，无额外 RSI 限制）
+    else if (dev < -SHORT_DEV_THRESH && osc > SHORT_OSC_MIN && wall < SHORT_WALL_MAX && decay_short) {
         sig.valid = true; sig.side = "SHORT";
         sig.price = solve_critical_price(ob, "SHORT");
         sig.score = std::min(100.0, (-dev) * 30.0 + osc * 30.0 + (1.0 - wall) * 40.0);
