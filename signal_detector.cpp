@@ -29,7 +29,7 @@ double SignalDetector::solve_critical_price(const OrderBook& ob, const std::stri
 
 // 连续 N 个加速度均为正/负的判定
 static bool consecutive_accel(const std::deque<double>& prices, int count, bool positive) {
-    if (prices.size() < count + 3) return false; // 至少需要 count+3 个点
+    if (prices.size() < count + 3) return false;
     int cnt = 0;
     for (size_t i = prices.size() - count; i < prices.size(); ++i) {
         double v0 = prices[i] - prices[i-1];
@@ -60,7 +60,6 @@ bool SignalDetector::check_momentum_decay(const std::string& side) {
         double cur = prices.back();
         for (size_t i = prices.size()-5; i < prices.size()-1; ++i)
             if (prices[i] < cur) { is_low = false; break; }
-        // 要求连续2个加速度为正，且价格处于近期低位或已经回升
         return (accel0 > 0 && accel1 > 0) || (price_rising && is_low);
     } else {
         bool is_high = true;
@@ -84,20 +83,20 @@ Signal SignalDetector::check(const OrderBook& ob) {
     double wall = wall_raw;
     if (wall_raw <= 0.001 || wall_raw >= 0.999) wall = 0.5;
 
-    // ---------- 非对称参数 (新) ----------
+    // ---------- 非对称参数 (平衡版) ----------
     // 做多：极度严苛，等待深坑 + 止跌横盘
     constexpr double LONG_DEV_THRESH  = 3.5;
     constexpr double LONG_OSC_MAX     = 0.15;
     constexpr double LONG_WALL_MIN    = 0.65;
-    constexpr double LONG_RSI_MAX     = 25;       // 更低的RSI
+    constexpr double LONG_RSI_MAX     = 25;
 
-    // 做空：宽松捕获过热，wall几乎不限
-    constexpr double SHORT_DEV_THRESH = 2.2;      // 弱偏离度就能关注
+    // 做空：适度收紧，减少噪音
+    constexpr double SHORT_DEV_THRESH = 2.5;      // 偏离度提高到 -2.5σ
     constexpr double SHORT_OSC_MIN    = 0.65;
-    constexpr double SHORT_WALL_MAX   = 0.8;      // 几乎等于不限
-    constexpr double SHORT_ULTRA_DEV  = 4.5;      // 超强特权偏离度
+    constexpr double SHORT_WALL_MAX   = 0.7;      // 挂单壁收紧到 0.7
+    constexpr double SHORT_ULTRA_DEV  = 4.5;      // 超强特权保留
 
-    // ---------- 做空信号 (优先判断，因为机会多) ----------
+    // ---------- 做空信号 (优先) ----------
     // 超强特权：偏离度超过 4.5σ 直接开空，无视其他条件
     if (dev < -SHORT_ULTRA_DEV) {
         sig.valid = true; sig.side = "SHORT";
@@ -106,7 +105,6 @@ Signal SignalDetector::check(const OrderBook& ob) {
         return sig;
     }
 
-    // 普通做空：偏离度、振荡器、挂单壁、动能衰减
     bool decay_short = check_momentum_decay("SHORT");
     if (dev < -SHORT_DEV_THRESH && osc > SHORT_OSC_MIN && wall < SHORT_WALL_MAX && decay_short) {
         sig.valid = true; sig.side = "SHORT";
@@ -116,10 +114,8 @@ Signal SignalDetector::check(const OrderBook& ob) {
     }
 
     // ---------- 做多信号 ----------
-    // 要求连续 3 个加速度为正（止跌确认）
     bool accel_3up = consecutive_accel(ind_.prices(), 3, true);
     bool decay_long = check_momentum_decay("LONG");
-    // 必须同时满足：a) 原始衰减逻辑 b) 连续3个加速度向上
     bool long_decay_ok = decay_long && accel_3up;
 
     if (dev > LONG_DEV_THRESH && osc < LONG_OSC_MAX && wall > LONG_WALL_MIN &&
