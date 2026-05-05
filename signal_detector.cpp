@@ -45,7 +45,6 @@ bool SignalDetector::check_momentum_decay(const std::string& side) {
         double cur = prices.back();
         for (size_t i = prices.size()-5; i < prices.size()-1; ++i)
             if (prices[i] < cur) { is_low = false; break; }
-        // 连续两个加速度为正，且处于低位，或价格已开始回升
         return (accel0 > 0 && accel1 > 0) || (price_rising && is_low);
     } else {
         bool is_high = true;
@@ -69,14 +68,12 @@ Signal SignalDetector::check(const OrderBook& ob) {
     double wall = wall_raw;
     if (wall_raw <= 0.001 || wall_raw >= 0.999) wall = 0.5;
 
-    // ---------- 非对称参数 ----------
-    // 做多：极其严苛（只在深插针后绝望时刻出手）
-    constexpr double LONG_DEV_THRESH  = 3.2;      // 原 2.4 → 3.2
-    constexpr double LONG_OSC_MAX     = 0.15;     // 原 0.35 → 0.15
+    // 非对称参数
+    constexpr double LONG_DEV_THRESH  = 3.2;
+    constexpr double LONG_OSC_MAX     = 0.15;
     constexpr double LONG_WALL_MIN    = 0.65;
     constexpr double LONG_RSI_MAX     = 30;
 
-    // 做空：保持原参数，捕捉上涨衰竭
     constexpr double SHORT_DEV_THRESH = 1.9;
     constexpr double SHORT_OSC_MIN    = 0.65;
     constexpr double SHORT_WALL_MAX   = 0.4;
@@ -84,23 +81,30 @@ Signal SignalDetector::check(const OrderBook& ob) {
     bool decay_long = check_momentum_decay("LONG");
     bool decay_short = check_momentum_decay("SHORT");
 
-    static int log_cnt = 0;
-    if (++log_cnt % 100 == 0)
-        spdlog::info("B层: dev={:.2f} osc={:.2f} wall={:.2f} rsi={:.1f} decay_long={} decay_short={}",
-                     dev, osc, wall, ind_.rsi(14), decay_long, decay_short);
+    // ----- 暴力入场：偏离度超过 5σ 时无需衰减确认 -----
+    constexpr double ULTRA_EXTREME_SIGMA = 5.0;
+    bool is_ultra = (std::abs(dev) > ULTRA_EXTREME_SIGMA);
 
-    // 做多信号（在极值处触发）
-    if (dev > LONG_DEV_THRESH && osc < LONG_OSC_MAX && wall > LONG_WALL_MIN && decay_long &&
-        ind_.rsi(14) < LONG_RSI_MAX) {
+    // 做多信号
+    bool long_ok = (dev > LONG_DEV_THRESH && osc < LONG_OSC_MAX && wall > LONG_WALL_MIN &&
+                    (decay_long || (is_ultra && dev > LONG_DEV_THRESH && osc < LONG_OSC_MAX))) &&
+                   ind_.rsi(14) < LONG_RSI_MAX;
+    if (long_ok) {
         sig.valid = true; sig.side = "LONG";
         sig.price = solve_critical_price(ob, "LONG");
         sig.score = std::min(100.0, dev * 30.0 + (1.0 - osc) * 30.0 + wall * 40.0);
+        return sig;
     }
-    // 做空信号（参数保持不变）
-    else if (dev < -SHORT_DEV_THRESH && osc > SHORT_OSC_MIN && wall < SHORT_WALL_MAX && decay_short) {
+
+    // 做空信号：正常条件 或 超极端无需衰减
+    bool short_ok = (dev < -SHORT_DEV_THRESH && osc > SHORT_OSC_MIN && wall < SHORT_WALL_MAX &&
+                     (decay_short || (is_ultra && dev < -SHORT_DEV_THRESH && osc > SHORT_OSC_MIN)));
+    if (short_ok) {
         sig.valid = true; sig.side = "SHORT";
         sig.price = solve_critical_price(ob, "SHORT");
         sig.score = std::min(100.0, (-dev) * 30.0 + osc * 30.0 + (1.0 - wall) * 40.0);
+        return sig;
     }
+
     return sig;
 }
