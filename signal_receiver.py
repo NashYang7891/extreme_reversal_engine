@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import subprocess, json, time, os, sys
+import subprocess, json, time, os, sys, threading
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
@@ -27,17 +27,17 @@ TRAILING_ACTIVATION_PCT = 3.0
 TRAILING_CALLBACK_PCT = 1.2
 TRAILING_CALLBACK_PCT_SHORT = 1.2
 
-positions = {}
+positions = {}           # symbol -> 持仓信息
+pending_orders = {}      # order_id -> dict(symbol, side, price, time)  待成交订单
 
-# 全局消息频率控制
+# TG 频率控制
 LAST_TG_SEND = 0
-TG_RATE_LIMIT_SEC = 0.5   # 每秒最多发 2 条
+TG_RATE_LIMIT_SEC = 0.5
 
 def send_tg(msg):
     global LAST_TG_SEND
     now = time.time()
     if now - LAST_TG_SEND < TG_RATE_LIMIT_SEC:
-        # 合并消息或跳过
         return
     LAST_TG_SEND = now
     try:
@@ -63,6 +63,7 @@ def place_order(symbol, side, price):
     if side not in ('buy', 'sell'):
         print(f"❌ 无效方向: {side}")
         return None, None
+
     try:
         if not exchange.markets: exchange.load_markets()
         ticker = exchange.fetch_ticker(symbol)
@@ -72,17 +73,34 @@ def place_order(symbol, side, price):
             order_price = min(price, ask * 1.0005)
         else:
             order_price = max(price, bid * 0.9995)
-        order_price = exchange.price_to_precision(symbol, order_price)
-        amount = ORDER_USDT / float(order_price)
-        amount = exchange.amount_to_precision(symbol, amount)
+        order_price_str = exchange.price_to_precision(symbol, order_price)
+        amount = ORDER_USDT / order_price
+        amount_str = exchange.amount_to_precision(symbol, amount)
+
         exchange.set_leverage(LEVERAGE, symbol)
         exchange.set_margin_mode('isolated', symbol)
+
         order = exchange.create_order(
-            symbol=symbol, type='limit', side=side, amount=amount, price=order_price,
+            symbol=symbol, type='limit', side=side, amount=amount_str, price=order_price_str,
             params={'timeInForce': 'GTX', 'postOnly': True}
         )
-        print(f"✅ 下单成功: {symbol} {side} @ {order_price} (推导:{price}) Qty:{amount}")
-        return order_price, order
+
+        if order and order.get('status') == 'rejected':
+            print(f"❌ 订单被拒绝: {order.get('info', {})}")
+            return None, f"订单被拒绝: {order.get('info', {}).get('msg', '未知原因')}"
+
+        actual_price = float(order.get('average') or order.get('price') or order_price)
+        print(f"✅ 下单成功: {symbol} {side} @ {actual_price:.6f} (推导:{price:.6f}) Qty:{order['amount']}")
+
+        # 记录待成交订单（用于超时撤单）
+        pending_orders[order['id']] = {
+            'symbol': symbol,
+            'side': side,
+            'price': actual_price,
+            'time': time.time()
+        }
+        return actual_price, order
+
     except Exception as e:
         print(f"❌ 下单失败 {symbol}: {e}")
         return None, str(e)[:100]
@@ -90,26 +108,39 @@ def place_order(symbol, side, price):
 def cancel_order(order_id, symbol):
     try:
         exchange.cancel_order(order_id, symbol)
+        pending_orders.pop(order_id, None)   # 从待成交列表中移除
         print(f"🗑 已撤单 {symbol} {order_id}")
     except Exception as e:
         print(f"⚠ 撤单失败 {symbol} {order_id}: {e}")
 
+def check_pending_orders():
+    """检查超过1分钟未成交的订单，自动撤单"""
+    now = time.time()
+    to_cancel = []
+    for oid, info in pending_orders.items():
+        if now - info['time'] > 60:   # 1 分钟超时
+            to_cancel.append((oid, info['symbol']))
+    for oid, sym in to_cancel:
+        print(f"⏰ 订单 {oid} 超时未成交，自动撤单")
+        cancel_order(oid, sym)
+
 def update_positions_after_fill(symbol, side, entry_price, order):
     try:
-        qty = float(order['info'].get('executedQty', 0))
-        if qty == 0: qty = float(order.get('filled', 0))
+        qty_val = float(order.get('filled') or order.get('amount') or 0)
     except:
-        qty = 0
+        qty_val = 0.0
+    if qty_val <= 0:
+        return   # 未实际成交，不记录持仓
     pos_side = "LONG" if side == "buy" else "SHORT"
     positions[symbol] = {
         'side': pos_side,
         'entry_price': entry_price,
-        'qty': qty,
+        'qty': qty_val,
         'highest_price': entry_price,
         'lowest_price': entry_price,
         'trailing_activated': False
     }
-    print(f"📊 持仓记录: {symbol} {pos_side} @ {entry_price:.6f} 数量:{qty}")
+    print(f"📊 持仓记录: {symbol} {pos_side} @ {entry_price:.6f} 数量:{qty_val}")
 
 def check_and_trail_positions():
     if not positions: return
@@ -162,12 +193,10 @@ def main():
         print(f"⚠ 加载市场失败: {e}")
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True, bufsize=1)
-    send_tg("🤖 引擎已启动 (防刷屏+跟踪止盈)")
+    send_tg("🤖 引擎已启动 (1分钟未成交撤单)")
 
     last_b_signal = {}
     last_a_push = {}
-    active_a_orders = {}
-    A_ORDER_TIMEOUT_SEC = 15 * 60
     main.last_trail_check = 0
 
     for line in proc.stdout:
@@ -179,6 +208,7 @@ def main():
         now = time.time()
         if now - main.last_trail_check > 30:
             check_and_trail_positions()
+            check_pending_orders()   # 检查超时未成交订单
             main.last_trail_check = now
 
         t = msg.get("type", "")
@@ -204,24 +234,23 @@ def main():
             if sym in last_b_signal and now - last_b_signal[sym] < 600: continue
             if is_quiet_period(): continue
 
-            actual_price, order = place_order(sym, side, price_derived)
+            actual_price, order_info = place_order(sym, side, price_derived)
 
             tg_lines = [f"🎯 {side.upper()} {sym} 评分:{score:.1f}"]
-            if actual_price:
+            if actual_price and order_info:
                 tg_lines.append(f"✅ 下单成功: {actual_price:.6f}")
-                update_positions_after_fill(sym, side, actual_price, order)
+                # 撤单逻辑将在下次定时检查中处理，这里不立即标记持仓，只有成交后才更新
                 last_b_signal[sym] = now
+                # 注意：持仓信息会在订单成交后由跟踪止盈模块检查，但我们没有主动轮询成交状态
+                # 可在后续版本中增加成交监听。目前若未立即成交，不会记录持仓。
             else:
-                tg_lines.append(f"❌ 下单失败: {order[:80] if isinstance(order,str) else '未知'}")
+                err_msg = str(order_info) if order_info else "未知错误"
+                tg_lines.append(f"❌ 下单失败: {err_msg[:80]}")
 
             tg_lines.append(f"🛑 止损: {stop_loss:.6f} | 🎯 止盈: {take_profit:.6f}")
             send_tg("\n".join(tg_lines))
 
-        # 清理过期A层订单（如果使用）
-        for key in list(active_a_orders.keys()):
-            if time.time() - active_a_orders[key]['time'] > A_ORDER_TIMEOUT_SEC:
-                cancel_order(active_a_orders[key]['order'].get('id',''), active_a_orders[key]['symbol'])
-                del active_a_orders[key]
+    proc.wait()
 
 if __name__ == "__main__":
     main()
