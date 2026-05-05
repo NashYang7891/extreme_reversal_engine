@@ -94,6 +94,7 @@ struct SymbolContext {
     MLOptimizer ml{3};
     SignalDetector detector{ml, indicators};
     std::atomic<int64_t> last_active_time{0};
+    std::atomic<int64_t> last_b_push_ms{0};   // B层冷却：10秒内不重复输出同一个币种
 };
 
 std::map<std::string, SymbolContext> contexts;
@@ -224,6 +225,10 @@ void run_detection() {
                     if (last_active > 0 && (now_ms - last_active) < 15*60*1000) {
                         auto sig = ctx.detector.check(ctx.orderbook);
                         if (sig.valid) {
+                            // B层冷却：同一个币种 10 秒内只输出一次
+                            if (now_ms - ctx.last_b_push_ms.load() < 10000) continue;
+                            ctx.last_b_push_ms = now_ms;
+
                             json b_msg;
                             b_msg["type"] = "SIGNAL";
                             b_msg["symbol"] = sym;
@@ -236,14 +241,12 @@ void run_detection() {
                             double atr = ctx.indicators.atr();
                             double p   = sig.price;
 
-                            // 新止损距离：3倍ATR，不低于1.5%价格，不高于5%价格
                             double stop_dist = std::max(atr * 3.0, p * 0.015);
                             if (stop_dist > p * 0.05) stop_dist = p * 0.05;
 
                             if (sig.side == "LONG") {
                                 b_msg["stop_loss"]   = p - stop_dist;
                                 b_msg["take_profit"] = std::max(p + atr * 5.0, p * 1.015);
-                                // 硬限制
                                 if (b_msg["stop_loss"] < p * 0.95) b_msg["stop_loss"] = p * 0.95;
                                 if (b_msg["take_profit"] <= p) b_msg["take_profit"] = p * 1.02;
                             } else {
@@ -272,7 +275,7 @@ int main() {
     std::cout.setf(std::ios::unitbuf);
 
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
-    spdlog::info(">>> 极端反转引擎 [优化盈亏比版] 启动...");
+    spdlog::info(">>> 极端反转引擎 [防刷屏版] 启动...");
 
     auto symbols = fetch_top_symbols(100, 30000000.0);
     {

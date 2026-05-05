@@ -23,14 +23,23 @@ exchange = ccxt.binance({
 LEVERAGE = 3
 ORDER_USDT = 10.0
 
-# 跟踪止盈参数
-TRAILING_ACTIVATION_PCT = 3.0      # 盈利 3% 激活移动止损
-TRAILING_CALLBACK_PCT = 1.2        # 回撤 1.2% 触发平仓 (做多)
-TRAILING_CALLBACK_PCT_SHORT = 1.2  # 做空反弹 1.2% 触发平仓
+TRAILING_ACTIVATION_PCT = 3.0
+TRAILING_CALLBACK_PCT = 1.2
+TRAILING_CALLBACK_PCT_SHORT = 1.2
 
-positions = {}   # symbol -> {side, entry, qty, highest, lowest, activated}
+positions = {}
+
+# 全局消息频率控制
+LAST_TG_SEND = 0
+TG_RATE_LIMIT_SEC = 0.5   # 每秒最多发 2 条
 
 def send_tg(msg):
+    global LAST_TG_SEND
+    now = time.time()
+    if now - LAST_TG_SEND < TG_RATE_LIMIT_SEC:
+        # 合并消息或跳过
+        return
+    LAST_TG_SEND = now
     try:
         import requests
         requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
@@ -126,7 +135,7 @@ def check_and_trail_positions():
                                           amount=exchange.amount_to_precision(sym, qty),
                                           params={'reduceOnly': True})
                     del positions[sym]
-        else:  # SHORT
+        else:
             if current_price < pos['lowest_price']: pos['lowest_price'] = current_price
             pnl_pct = (entry - current_price) / entry * 100
             if pnl_pct >= TRAILING_ACTIVATION_PCT: pos['trailing_activated'] = True
@@ -153,12 +162,13 @@ def main():
         print(f"⚠ 加载市场失败: {e}")
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True, bufsize=1)
-    send_tg("🤖 极端反转引擎已启动 (优化止盈止损+跟踪)")
+    send_tg("🤖 引擎已启动 (防刷屏+跟踪止盈)")
 
     last_b_signal = {}
     last_a_push = {}
-    active_a_orders = {}            # A层埋单记录，用于撤单
+    active_a_orders = {}
     A_ORDER_TIMEOUT_SEC = 15 * 60
+    main.last_trail_check = 0
 
     for line in proc.stdout:
         line = line.strip()
@@ -167,9 +177,6 @@ def main():
         except: print("C++:", line); continue
 
         now = time.time()
-        # 定期执行跟踪止盈
-        if not hasattr(main, 'last_trail_check'):
-            main.last_trail_check = 0
         if now - main.last_trail_check > 30:
             check_and_trail_positions()
             main.last_trail_check = now
@@ -186,9 +193,6 @@ def main():
             d_str = f" | 偏离度:{dev:.1f}" if dev else ""
             send_tg(f"🔥 {sym} 异动 | 价:{price:.4f} | 涨跌:{change:+.2f}% | 量比:{vol_r:.1f}x{d_str}")
             last_a_push[sym] = now
-
-            # A层抢跑（可选功能，暂不启用）
-            # if dev and abs(dev) > 1.3: ...
 
         elif t == "SIGNAL":
             side = msg.get("side", "")
@@ -213,9 +217,11 @@ def main():
             tg_lines.append(f"🛑 止损: {stop_loss:.6f} | 🎯 止盈: {take_profit:.6f}")
             send_tg("\n".join(tg_lines))
 
-        # 清理过期的A层埋单（如果不使用A层抢跑，可忽略）
-        # for key in list(active_a_orders.keys()):
-        #    ...
+        # 清理过期A层订单（如果使用）
+        for key in list(active_a_orders.keys()):
+            if time.time() - active_a_orders[key]['time'] > A_ORDER_TIMEOUT_SEC:
+                cancel_order(active_a_orders[key]['order'].get('id',''), active_a_orders[key]['symbol'])
+                del active_a_orders[key]
 
 if __name__ == "__main__":
     main()
