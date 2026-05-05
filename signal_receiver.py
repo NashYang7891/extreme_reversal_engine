@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import subprocess, json, time, os, sys, threading
+import subprocess, json, time, os, sys
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
@@ -22,15 +22,16 @@ exchange = ccxt.binance({
 
 LEVERAGE = 3
 ORDER_USDT = 10.0
+SLIPPAGE_TOLERANCE = 0.002          # 0.2% 滑点
 
-TRAILING_ACTIVATION_PCT = 3.0
-TRAILING_CALLBACK_PCT = 1.2
-TRAILING_CALLBACK_PCT_SHORT = 1.2
+# 跟踪止损参数
+TRAILING_ACTIVATION_PCT = 3.0       # 盈利 3% 激活
+TRAILING_CALLBACK_PCT = 1.2         # 回撤 1.2% 平仓 (做多)
+TRAILING_CALLBACK_PCT_SHORT = 1.2   # 做空反弹 1.2% 平仓
 
-positions = {}           # symbol -> 持仓信息
-pending_orders = {}      # order_id -> dict(symbol, side, price, time)  待成交订单
+positions = {}                       # 持仓记录
 
-# TG 频率控制
+# TG 消息频率控制
 LAST_TG_SEND = 0
 TG_RATE_LIMIT_SEC = 0.5
 
@@ -58,83 +59,91 @@ def is_quiet_period():
 
 def place_order(symbol, side, price):
     """
-    IOC 模式下单，直接使用 C++ 传入的 current_price 作为价格基准，
-    做多时以 max(推导价, 卖一价) 下单，做空时以 min(推导价, 买一价) 下单，
-    并且不获取 ticker，从而消除延迟。
+    IOC 限价单 + 0.2% 滑点。
+    返回 (实际成交均价, 订单对象) 或 (None, 详细错误描述)。
     """
     side = side.lower()
     if side == "long": side = "buy"
     elif side == "short": side = "sell"
     if side not in ('buy', 'sell'):
-        return None, None
+        return None, "无效方向"
 
     try:
         if not exchange.markets:
             exchange.load_markets()
 
-        # 获取实时盘口价（必须，用于设置 IOC 保护）
+        # 获取最新盘口
         ticker = exchange.fetch_ticker(symbol)
-        ask = ticker['ask'] if ticker['ask'] else price
-        bid = ticker['bid'] if ticker['bid'] else price
+        ask = ticker.get('ask')
+        bid = ticker.get('bid')
+        if not ask or not bid:
+            return None, "盘口数据缺失"
 
-        # 激进下单：做多卖出价，做空买入价，较大可能立刻成交
+        # 计算下单价格 (含 0.2% 滑点)
         if side == 'buy':
-            order_price = max(price, ask)   # 不低于卖一，可能作为taker
+            base_price = max(price, ask)
+            order_price = base_price * 1.002
         else:
-            order_price = min(price, bid)   # 不高于买一
+            base_price = min(price, bid)
+            order_price = base_price * 0.998
 
         order_price_str = exchange.price_to_precision(symbol, order_price)
         amount = ORDER_USDT / order_price
         amount_str = exchange.amount_to_precision(symbol, amount)
 
+        # 设置杠杆和逐仓
         exchange.set_leverage(LEVERAGE, symbol)
         exchange.set_margin_mode('isolated', symbol)
 
+        # 发送 IOC 订单
         order = exchange.create_order(
             symbol=symbol,
             type='limit',
             side=side,
             amount=amount_str,
             price=order_price_str,
-            params={'timeInForce': 'IOC'}   # 立即成交或取消
+            params={'timeInForce': 'IOC'}
         )
 
-        if order and order.get('status') == 'rejected':
-            msg = order.get('info', {}).get('msg', '未知原因')
-            print(f"❌ 订单被拒绝: {msg}")
-            return None, f"被拒: {msg}"
+        if not order:
+            return None, "提交失败"
 
-        # IOC 可能部分成交，此处用 average 作为实际成交均价
-        actual_price = float(order.get('average') or order_price)
-        filled = float(order.get('filled') or 0)
-        if filled > 0:
-            print(f"✅ 成交: {symbol} {side} @ {actual_price:.6f} (推导:{price:.6f}) 量:{filled}")
-            return actual_price, order
+        # ----- 解析成交结果 -----
+        filled = 0.0
+        avg_price = 0.0
+
+        # 从基础字段读取
+        if order.get('filled'):
+            filled = float(order['filled'])
+        if order.get('average'):
+            avg_price = float(order['average'])
+
+        # 备选：从 info 中提取
+        if filled <= 0 or avg_price <= 0:
+            info = order.get('info', {})
+            cum_qty = float(info.get('cumQty', 0))
+            cum_quote = float(info.get('cumQuote', 0))
+            if cum_qty > 0 and cum_quote > 0:
+                avg_price = cum_quote / cum_qty
+                filled = cum_qty
+
+        if filled > 0 and avg_price > 0:
+            print(f"✅ IOC 成交: {symbol} {side} @ {avg_price:.6f} 量:{filled} (本:{price:.6f})")
+            return avg_price, order
         else:
-            print(f"⚠ IOC 未成交: {symbol} {side} @ {order_price_str} (推导:{price:.6f})，已自动取消")
-            return None, None
+            # 未成交，记录价格对比
+            print(f"⚠ IOC 未成交: {symbol} {side} 本:{price:.6f} 买一:{bid:.6f} 卖一:{ask:.6f} 下单:{order_price_str}")
+            return None, "IOC未成交"
+
+    except ccxt.InsufficientFunds:
+        return None, "保证金不足"
+    except ccxt.PermissionDenied as e:
+        return None, f"无交易权限: {e}"
+    except ccxt.BadSymbol as e:
+        return None, f"无效币种: {e}"
     except Exception as e:
         print(f"❌ 下单异常 {symbol}: {e}")
-        return None, str(e)[:100]
-    
-def cancel_order(order_id, symbol):
-    try:
-        exchange.cancel_order(order_id, symbol)
-        pending_orders.pop(order_id, None)   # 从待成交列表中移除
-        print(f"🗑 已撤单 {symbol} {order_id}")
-    except Exception as e:
-        print(f"⚠ 撤单失败 {symbol} {order_id}: {e}")
-
-def check_pending_orders():
-    """检查超过1分钟未成交的订单，自动撤单"""
-    now = time.time()
-    to_cancel = []
-    for oid, info in pending_orders.items():
-        if now - info['time'] > 60:   # 1 分钟超时
-            to_cancel.append((oid, info['symbol']))
-    for oid, sym in to_cancel:
-        print(f"⏰ 订单 {oid} 超时未成交，自动撤单")
-        cancel_order(oid, sym)
+        return None, f"异常:{str(e)[:60]}"
 
 def update_positions_after_fill(symbol, side, entry_price, order):
     try:
@@ -142,7 +151,7 @@ def update_positions_after_fill(symbol, side, entry_price, order):
     except:
         qty_val = 0.0
     if qty_val <= 0:
-        return   # 未实际成交，不记录持仓
+        return
     pos_side = "LONG" if side == "buy" else "SHORT"
     positions[symbol] = {
         'side': pos_side,
@@ -205,7 +214,7 @@ def main():
         print(f"⚠ 加载市场失败: {e}")
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True, bufsize=1)
-    send_tg("🤖 引擎已启动 (1分钟未成交撤单)")
+    send_tg("🤖 引擎启动 (IOC 0.2%滑点·成交解析优化)")
 
     last_b_signal = {}
     last_a_push = {}
@@ -220,7 +229,6 @@ def main():
         now = time.time()
         if now - main.last_trail_check > 30:
             check_and_trail_positions()
-            check_pending_orders()   # 检查超时未成交订单
             main.last_trail_check = now
 
         t = msg.get("type", "")
@@ -250,14 +258,12 @@ def main():
 
             tg_lines = [f"🎯 {side.upper()} {sym} 评分:{score:.1f}"]
             if actual_price and order_info:
-                tg_lines.append(f"✅ 下单成功: {actual_price:.6f}")
-                # 撤单逻辑将在下次定时检查中处理，这里不立即标记持仓，只有成交后才更新
+                tg_lines.append(f"✅ 成交: {actual_price:.6f}")
+                update_positions_after_fill(sym, side, actual_price, order_info)
                 last_b_signal[sym] = now
-                # 注意：持仓信息会在订单成交后由跟踪止盈模块检查，但我们没有主动轮询成交状态
-                # 可在后续版本中增加成交监听。目前若未立即成交，不会记录持仓。
             else:
-                err_msg = str(order_info) if order_info else "未知错误"
-                tg_lines.append(f"❌ 下单失败: {err_msg[:80]}")
+                err_msg = str(order_info) if order_info else "未成交"
+                tg_lines.append(f"❌ 未成交: {err_msg[:80]}")
 
             tg_lines.append(f"🛑 止损: {stop_loss:.6f} | 🎯 止盈: {take_profit:.6f}")
             send_tg("\n".join(tg_lines))
