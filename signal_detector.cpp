@@ -27,6 +27,7 @@ double SignalDetector::solve_critical_price(const OrderBook& ob, const std::stri
     return (lo + hi) / 2.0;
 }
 
+// 连续 N 个加速度均为正/负的判定
 static bool consecutive_accel(const std::deque<double>& prices, int count, bool positive) {
     if (prices.size() < count + 3) return false;
     int cnt = 0;
@@ -83,17 +84,17 @@ Signal SignalDetector::check(const OrderBook& ob) {
     if (wall_raw <= 0.001 || wall_raw >= 0.999) wall = 0.5;
 
     // ---------- 重新平衡的参数 ----------
-    // 做多：大幅放宽，更容易捕捉超跌反弹
-    constexpr double LONG_DEV_THRESH  = 2.5;     // 原 3.5 → 2.5
-    constexpr double LONG_OSC_MAX     = 0.22;    // 原 0.15 → 0.22
-    constexpr double LONG_WALL_MIN    = 0.55;    // 原 0.65 → 0.55
-    constexpr double LONG_RSI_MAX     = 35;      // 原 25 → 35
+    // 做多：深度超卖才出手
+    constexpr double LONG_DEV_THRESH  = 3.0;     // 偏离度 >= 3.0σ
+    constexpr double LONG_OSC_MAX     = 0.18;    // 振荡器 <= 0.18
+    constexpr double LONG_WALL_MIN    = 0.60;    // 买方深度 >= 0.60
+    constexpr double LONG_RSI_MAX     = 30;      // RSI <= 30
 
     // 做空：适度收紧，减少噪音
-    constexpr double SHORT_DEV_THRESH = 3.0;     // 原 2.8 → 3.0
-    constexpr double SHORT_OSC_MIN    = 0.75;    // 原 0.70 → 0.75
-    constexpr double SHORT_WALL_MAX   = 0.5;     // 原 0.6 → 0.5
-    constexpr double SHORT_RSI_MIN    = 80;      // 原 75 → 80
+    constexpr double SHORT_DEV_THRESH = 3.0;     // 偏离度 <= -3.0σ
+    constexpr double SHORT_OSC_MIN    = 0.75;    // 振荡器 >= 0.75
+    constexpr double SHORT_WALL_MAX   = 0.5;     // 卖方深度 <= 0.5 (即买方占比低)
+    constexpr double SHORT_RSI_MIN    = 80;      // RSI >= 80
 
     bool decay_long = check_momentum_decay("LONG");
     bool decay_short = check_momentum_decay("SHORT");
