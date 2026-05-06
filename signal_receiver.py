@@ -1,271 +1,539 @@
 #!/usr/bin/env python3
-"""
-signal_receiver.py - 独立标的趋势防线（方案二，最终版）
-用法：
-  USE_MOCK_DATA=True  → 用模拟行情，测试拦截/死亡开关
-  USE_MOCK_DATA=False → 连接真实交易所 (ccxt)
-"""
+import subprocess, json, time, os, sys, threading, requests
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from dotenv import load_dotenv
+import ccxt
 
-import socket
-import json
-import time
-import sys
-import threading
-from collections import defaultdict
+basedir = Path(__file__).resolve().parent
+load_dotenv(basedir / '.env')
 
-# ========== 调试开关：True 用模拟极端行情测试，False 用真实行情 ==========
-USE_MOCK_DATA = False
+API_KEY = os.getenv("BINANCE_API_KEY")
+SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
+TG_TOKEN = os.getenv("TG_BOT_TOKEN")
+TG_CHAT = "5372217316"
 
-# ========== 行情获取 ==========
-def get_mock_ohlcv(symbol, timeframe, limit=5):
-    """根据币种模拟不同的行情走势"""
-    if timeframe != '1h':
-        return []
-    # 设定不同币种的极端走势
-    if 'BTC' in symbol:
-        # 强上升：价格大幅高于均线
-        closes = [78000, 80000, 82000, 84000, 87000]  # 当前 87000，5日均线约 82200，价差5.8%
-    elif 'ETH' in symbol:
-        # 温和震荡
-        closes = [2400, 2420, 2410, 2430, 2425]
-    elif 'ADA' in symbol:
-        # 强下降趋势
-        closes = [0.35, 0.34, 0.33, 0.32, 0.30]
-    elif 'DOGE' in symbol:
-        # 强下降
-        closes = [0.18, 0.17, 0.16, 0.15, 0.14]
-    else:
-        closes = [100, 101, 102, 101, 100]
-    closes = closes[-limit:]
-    return [[0, 0, 0, 0, c, 0] for c in closes]
+exchange = ccxt.binance({
+    'apiKey': API_KEY,
+    'secret': SECRET_KEY,
+    'enableRateLimit': True,
+    'options': {'defaultType': 'future'},
+})
 
-if USE_MOCK_DATA:
-    print("⚙️  使用模拟行情（极端走势测试模式）")
-    def fetch_ohlcv(symbol, timeframe, limit):
-        return get_mock_ohlcv(symbol, timeframe, limit)
-else:
+LEVERAGE = 3
+ORDER_USDT = 10.0
+SLIPPAGE_TOLERANCE = 0.002
+MAX_ACTIVE_ORDERS = 5
+
+TRAIL_ACT_LONG = 1.5
+TRAIL_CB_LONG = 0.5
+TRAIL_ACT_SHORT = 2.0
+TRAIL_CB_SHORT = 0.8
+
+positions = {}               # 持仓记录
+active_a_orders = {}         # 限价单记录
+last_b_signal = {}
+last_fail_push = {}
+last_a_push = {}
+
+# 死亡开关
+stop_loss_counter = {}        # symbol -> 止损次数
+BLACKLIST = {}                # symbol -> 解封时间戳 (epoch)
+BLACKLIST_DURATION = 4 * 3600  # 拉黑4小时
+STOP_LOSS_THRESHOLD = 2       # 连续止损2次触发
+last_htf_check = {}            # 1h趋势防线时间戳
+trend_status = {}              # symbol -> "STRONG_BULL"/"STRONG_BEAR"/"NORMAL"
+
+LAST_TG_SEND = 0
+TG_RATE_LIMIT_SEC = 0.5
+
+api_fail_count = 0
+API_FAIL_THRESHOLD = 5
+api_pause_until = 0
+PAUSE_MINUTES = 10
+
+def send_tg(msg):
+    global LAST_TG_SEND
+    now = time.time()
+    if now - LAST_TG_SEND < TG_RATE_LIMIT_SEC:
+        return
+    LAST_TG_SEND = now
     try:
-        import ccxt
-        exchange = ccxt.binance()
-        print("已连接 Binance 交易所")
-        def fetch_ohlcv(symbol, timeframe, limit):
-            return exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                      json={"chat_id": TG_CHAT, "text": msg, "parse_mode": "Markdown"}, timeout=8)
     except Exception as e:
-        print(f"无法连接交易所 ({e})，回退到模拟数据")
-        fetch_ohlcv = get_mock_ohlcv
+        print(f"TG推送失败: {e}")
 
-# ========== 每个标的的独立趋势 ==========
-trend_status = {}
-last_htf_check = {}
+def is_quiet_period():
+    now = datetime.now(timezone.utc)
+    if now.hour == 0 and now.minute < 5: return True
+    for h in [0, 8, 16]:
+        start = now.replace(hour=h, minute=0, second=0) - timedelta(minutes=5)
+        end = now.replace(hour=h, minute=0, second=0) + timedelta(minutes=5)
+        if start <= now <= end: return True
+    return False
 
+# ---------- 1h 趋势防线 ----------
 def update_htf_trend_for_symbol(symbol):
     now = time.time()
-    if symbol in last_htf_check and (now - last_htf_check[symbol]) < 900:
+    if symbol in last_htf_check and now - last_htf_check[symbol] < 900:
         return
     last_htf_check[symbol] = now
     try:
-        ohlcv = fetch_ohlcv(symbol, '1h', 5)
+        ohlcv = exchange.fetch_ohlcv(symbol, '1h', 5)
         if not ohlcv or len(ohlcv) < 3:
             return
         closes = [c[4] for c in ohlcv]
         ema = sum(closes) / len(closes)
-        cur_price = closes[-1]
+        cur = closes[-1]
         slope = closes[-1] - closes[-2]
-        if cur_price > ema * 1.05 and slope > 0 and closes[-1] > closes[-3]:
+        if cur > ema * 1.05 and slope > 0 and closes[-1] > closes[-3]:
             trend_status[symbol] = "STRONG_BULL"
-        elif cur_price < ema * 0.95 and slope < 0 and closes[-1] < closes[-3]:
+        elif cur < ema * 0.95 and slope < 0 and closes[-1] < closes[-3]:
             trend_status[symbol] = "STRONG_BEAR"
         else:
             trend_status[symbol] = "NORMAL"
-        print(f"[{time.strftime('%H:%M:%S')}] {symbol} 1H趋势 → {trend_status[symbol]} （价格={cur_price}, 均线={ema:.2f}）")
     except Exception as e:
-        print(f"更新 {symbol} 趋势失败: {e}")
+        print(f"⚠ 趋势更新失败 {symbol}: {e}")
 
-# ========== 死亡开关 ==========
-stop_loss_counter = defaultdict(int)
-blacklist = {}
+def is_against_trend(symbol, side):
+    """检查开仓方向是否与1h强趋势相反，返回True表示被拦截"""
+    update_htf_trend_for_symbol(symbol)
+    trend = trend_status.get(symbol, "NORMAL")
+    if side == "SHORT" and trend == "STRONG_BULL":
+        send_tg(f"🛑 拦截 {symbol} 做空\n原因: 1H 强牛趋势")
+        return True
+    if side == "LONG" and trend == "STRONG_BEAR":
+        send_tg(f"🛑 拦截 {symbol} 做多\n原因: 1H 强熊趋势")
+        return True
+    return False
 
+# ---------- 死亡开关 ----------
 def record_stop_loss(symbol):
-    stop_loss_counter[symbol] += 1
-    print(f"⚠️  {symbol} 止损计数: {stop_loss_counter[symbol]}")
-    if stop_loss_counter[symbol] >= 2:
-        blacklist[symbol] = time.time() + 4 * 3600
-        print(f"🚫 {symbol} 触发死亡开关，拉黑至 {time.ctime(blacklist[symbol])}")
+    stop_loss_counter[symbol] = stop_loss_counter.get(symbol, 0) + 1
+    msg = f"⚠ {symbol} 止损计数: {stop_loss_counter[symbol]}/{STOP_LOSS_THRESHOLD}"
+    print(msg); send_tg(msg)
+    if stop_loss_counter[symbol] >= STOP_LOSS_THRESHOLD:
+        BLACKLIST[symbol] = time.time() + BLACKLIST_DURATION
+        msg = f"🚫 {symbol} 触发死亡开关，拉黑 {BLACKLIST_DURATION//3600} 小时"
+        print(msg); send_tg(msg)
 
 def is_blacklisted(symbol):
-    if symbol in blacklist:
-        if time.time() < blacklist[symbol]:
+    if symbol in BLACKLIST:
+        if time.time() < BLACKLIST[symbol]:
             return True
         else:
-            del blacklist[symbol]
+            del BLACKLIST[symbol]
             stop_loss_counter[symbol] = 0
     return False
 
-# ========== 动态阈值 ==========
-def get_sigma_thresholds(symbol):
+# ---------- 启动同步 ----------
+def sync_positions_on_start():
     try:
-        ohlcv = fetch_ohlcv(symbol, '1h', 2)
-        if len(ohlcv) >= 2:
-            change = (ohlcv[-1][4] / ohlcv[-2][4] - 1) * 100
-        else:
-            change = 0
-    except:
-        change = 0
-    if change >= 3.0:
-        return 2.2, 5.5
-    elif change <= -3.0:
-        return 5.5, 2.2
-    else:
-        return 3.0, 3.0
+        pos_list = exchange.fetch_positions()
+        live_positions = set()
+        for p in pos_list:
+            amount = float(p.get('contracts', 0))
+            if amount > 0:
+                symbol = p['symbol']
+                side = 'LONG' if p.get('side') == 'long' else 'SHORT'
+                entry_price = float(p.get('entryPrice', 0))
+                if entry_price > 0:
+                    positions[symbol] = {
+                        'side': side,
+                        'entry_price': entry_price,
+                        'qty': amount,
+                        'highest_price': entry_price,
+                        'lowest_price': entry_price,
+                        'trailing_activated': False,
+                        'stop_order_id': None
+                    }
+                    live_positions.add(symbol)
+                    last_b_signal[symbol] = time.time()
+                    print(f"📥 恢复持仓: {symbol} {side} @ {entry_price:.6f} Qty:{amount}")
 
-# ========== 引擎客户端 ==========
-class RealTradingClient:
-    def __init__(self, host='127.0.0.1', port=5555):
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock.settimeout(5)
-        self.sock.connect((host, port))
-        self.buffer = b""
-        print(f"已连接 C++ 引擎 {host}:{port}")
+        orders = exchange.fetch_open_orders()
+        for order in orders:
+            sym = order.get('symbol')
+            if order.get('type') == 'STOP_MARKET' and order.get('reduceOnly') and sym in positions:
+                positions[sym]['stop_order_id'] = order.get('id')
+                print(f"🔒 保留止损单: {sym} ID:{order['id']}")
+            else:
+                try:
+                    exchange.cancel_order(order['id'], sym)
+                    print(f"🧹 启动清理多余挂单: {sym} ID:{order['id']}")
+                except Exception as e:
+                    print(f"⚠ 取消 {sym} 订单 {order['id']} 失败: {e}")
 
-    def send_signal(self, signal_dict):
-        msg = json.dumps(signal_dict) + "\n"
-        self.sock.sendall(msg.encode())
-        while b"\n" not in self.buffer:
-            data = self.sock.recv(4096)
-            if not data:
-                raise ConnectionError("引擎断开")
-            self.buffer += data
-        line, self.buffer = self.buffer.split(b"\n", 1)
-        return json.loads(line.decode())
+        for sym in list(positions.keys()):
+            if sym not in live_positions:
+                force_clear_all_orders(sym)
+                del positions[sym]
+                print(f"🧹 清理已消失持仓的挂单: {sym}")
 
-    def send_order_with_stop(self, symbol, side, quantity,
-                             order_type, trigger_price, limit_price):
-        signal = {
-            "action": "order_with_stop",
-            "symbol": symbol, "side": side, "quantity": quantity,
-            "order_type": order_type,
-            "stop_loss": {
-                "trigger_price": trigger_price,
-                "limit_price": limit_price,
-                "quantity": quantity
-            }
-        }
-        return self.send_signal(signal)
-
-    def close(self):
-        self.sock.close()
-
-class MockTradingClient:
-    def send_signal(self, signal_dict):
-        print(f"[模拟引擎] 收到信号: {json.dumps(signal_dict, indent=2)}")
-        return {
-            "status": "ok",
-            "main_order": {"order_id": 99999, "status": "filled"},
-            "stop_order": {"order_id": 88888, "status": "pending_stop", "parent_order_id": 99999}
-        }
-
-    def send_order_with_stop(self, symbol, side, quantity,
-                             order_type, trigger_price, limit_price):
-        return self.send_signal({
-            "action": "order_with_stop",
-            "symbol": symbol, "side": side, "quantity": quantity,
-            "order_type": order_type,
-            "stop_loss": {
-                "trigger_price": trigger_price,
-                "limit_price": limit_price,
-                "quantity": quantity
-            }
-        })
-
-    def close(self):
-        pass
-
-# ========== 信号处理 ==========
-def signal_handler(symbol, side, current_price, z_score, client):
-    update_htf_trend_for_symbol(symbol)
-    current_trend = trend_status.get(symbol, "NORMAL")
-
-    if is_blacklisted(symbol):
-        print(f"🚷 {symbol} 在黑名单中，跳过信号")
-        return
-
-    if side == "SHORT" and current_trend == "STRONG_BULL":
-        print(f"🚨 拦截 {symbol} 空单：该币1H处于强牛趋势")
-        return
-    if side == "LONG" and current_trend == "STRONG_BEAR":
-        print(f"🚨 拦截 {symbol} 多单：该币1H处于强熊趋势")
-        return
-
-    long_z, short_z = get_sigma_thresholds(symbol)
-    if side == "LONG" and abs(z_score) < long_z:
-        print(f"⛔ {symbol} 做多z值 {z_score:.2f} < {long_z}，不满足阈值")
-        return
-    if side == "SHORT" and abs(z_score) < short_z:
-        print(f"⛔ {symbol} 做空z值 {z_score:.2f} < {short_z}，不满足阈值")
-        return
-
-    stop_pct = 0.01
-    if side == "LONG":
-        trigger = current_price * (1 - stop_pct)
-        limit = trigger * 0.999
-        order_side = "buy"
-    else:
-        trigger = current_price * (1 + stop_pct)
-        limit = trigger * 1.001
-        order_side = "sell"
-
-    try:
-        resp = client.send_order_with_stop(
-            symbol, order_side, 1, "market", trigger, limit
-        )
-        print(f"✅ 下单成功: {json.dumps(resp, indent=2)}")
+        active_a_orders.clear()
+        print(f"📋 当前持仓 {len(positions)} 个，挂单已同步")
     except Exception as e:
-        print(f"❌ 下单失败: {e}")
+        print(f"⚠ 同步持仓失败: {e}")
 
-# ========== 主程序 ==========
-def main():
+# ---------- 轻量强制清空挂单 ----------
+def force_clear_all_orders(symbol):
     try:
-        client = RealTradingClient()
+        orders = exchange.fetch_open_orders(symbol)
+        if not orders:
+            return True
+        for o in orders:
+            try:
+                exchange.cancel_order(o['id'], symbol)
+                active_a_orders.pop(o['id'], None)
+                if symbol in positions and positions[symbol].get('stop_order_id') == o['id']:
+                    positions[symbol]['stop_order_id'] = None
+            except Exception as e:
+                print(f"⚠ 取消 {symbol} 订单 {o['id']} 失败: {e}")
+        time.sleep(0.5)
+        remaining = exchange.fetch_open_orders(symbol)
+        if remaining:
+            for o in remaining:
+                try:
+                    exchange.cancel_order(o['id'], symbol)
+                except: pass
+        return True
+    except Exception as e:
+        print(f"⚠ 清理 {symbol} 挂单异常: {e}")
+        return False
+
+# ---------- IOC 下单 ----------
+def get_market_price(symbol, fallback):
+    global api_fail_count, api_pause_until
+    if time.time() < api_pause_until:
+        return fallback, fallback, True
+    try:
+        ticker = exchange.fetch_ticker(symbol)
+        api_fail_count = 0
+        ask = ticker.get('ask') or ticker.get('last') or fallback
+        bid = ticker.get('bid') or ticker.get('last') or fallback
+        return bid, ask, False
+    except Exception as e:
+        api_fail_count += 1
+        if api_fail_count >= API_FAIL_THRESHOLD:
+            api_pause_until = time.time() + PAUSE_MINUTES * 60
+            send_tg(f"🚨 API 异常，暂停下单 {PAUSE_MINUTES} 分钟")
+        return fallback, fallback, True
+
+def place_order_ioc(symbol, side, price):
+    side = side.lower()
+    if side == "long": side = "buy"
+    elif side == "short": side = "sell"
+    if side not in ('buy', 'sell'):
+        return None, "无效方向"
+
+    if symbol in positions:
+        return None, "已有持仓"
+    if is_blacklisted(symbol):
+        return None, "死亡开关拉黑"
+
+    if time.time() < api_pause_until:
+        return None, "API熔断暂停"
+
+    try:
+        if not exchange.markets:
+            exchange.load_markets()
+        bid, ask, troubled = get_market_price(symbol, price)
+        if troubled and api_fail_count >= API_FAIL_THRESHOLD:
+            return None, "API严重异常"
+
+        if side == 'buy':
+            base_price = max(price, ask)
+            order_price = base_price * (1.0 + SLIPPAGE_TOLERANCE)
+        else:
+            base_price = min(price, bid)
+            order_price = base_price * (1.0 - SLIPPAGE_TOLERANCE)
+
+        order_price_str = exchange.price_to_precision(symbol, order_price)
+        amount = ORDER_USDT / order_price
+        amount_str = exchange.amount_to_precision(symbol, amount)
+
+        exchange.set_leverage(LEVERAGE, symbol)
+        exchange.set_margin_mode('isolated', symbol)
+
+        order = exchange.create_order(
+            symbol=symbol, type='limit', side=side,
+            amount=amount_str, price=order_price_str,
+            params={'timeInForce': 'IOC'}
+        )
+        if not order:
+            return None, "提交失败"
+
+        filled = float(order.get('filled', 0))
+        avg_price = float(order.get('average', 0))
+        if filled <= 0 or avg_price <= 0:
+            info = order.get('info', {})
+            cum_qty = float(info.get('cumQty', 0))
+            cum_quote = float(info.get('cumQuote', 0))
+            if cum_qty > 0 and cum_quote > 0:
+                avg_price = cum_quote / cum_qty
+                filled = cum_qty
+
+        if filled > 0 and avg_price > 0:
+            print(f"✅ 成交: {symbol} {side} @ {avg_price:.6f} 量:{filled}")
+            return avg_price, order
+        else:
+            print(f"⚠ IOC 未成交: {symbol} {side}")
+            return None, "IOC未成交"
+
+    except ccxt.InsufficientFunds:
+        return None, "保证金不足"
+    except ccxt.PermissionDenied as e:
+        return None, f"无交易权限: {e}"
+    except Exception as e:
+        err_msg = str(e)[:200]
+        print(f"❌ 下单异常 {symbol}: {err_msg}")
+        return None, err_msg
+
+def place_order(symbol, side, price):
+    cleared = force_clear_all_orders(symbol)
+    avg, err = place_order_ioc(symbol, side, price)
+    if avg is not None:
+        return avg, err
+    if isinstance(err, str) and "-4067" in err:
+        force_clear_all_orders(symbol)
+        time.sleep(1)
+        avg, err = place_order_ioc(symbol, side, price)
+    return avg, err
+
+# ---------- 止损挂单 ----------
+def place_stop_loss_order(symbol, side, qty, stop_price):
+    try:
+        if side.upper() == 'LONG':
+            stop_side = 'sell'
+        else:
+            stop_side = 'buy'
+        stop_price_str = exchange.price_to_precision(symbol, stop_price)
+        qty_str = exchange.amount_to_precision(symbol, qty)
+        params = {'stopPrice': stop_price_str, 'reduceOnly': True, 'workingType': 'MARK_PRICE'}
+        order = exchange.create_order(symbol, 'STOP_MARKET', stop_side, qty_str, None, params)
+        print(f"🛑 止损单已挂: {symbol} {stop_side} @ {stop_price_str}")
+        return order
+    except Exception as e:
+        print(f"❌ 挂止损单失败 {symbol}: {e}")
+        return None
+
+def cancel_stop_order(symbol):
+    if symbol in positions and positions[symbol].get('stop_order_id'):
+        oid = positions[symbol]['stop_order_id']
+        try:
+            exchange.cancel_order(oid, symbol)
+            positions[symbol]['stop_order_id'] = None
+            print(f"🗑 已取消原止损单 {symbol} {oid}")
+        except Exception as e:
+            print(f"⚠ 取消止损单失败 {symbol} {oid}: {e}")
+
+def update_positions_after_fill(symbol, side, entry_price, order, stop_loss):
+    try:
+        qty_val = float(order.get('filled') or order.get('amount') or 0)
     except:
-        print("无法连接 C++ 引擎，使用模拟客户端")
-        client = MockTradingClient()
+        qty_val = 0.0
+    if qty_val <= 0: return
+    pos_side = "LONG" if side == "buy" else "SHORT"
+    positions[symbol] = {
+        'side': pos_side,
+        'entry_price': entry_price,
+        'qty': qty_val,
+        'highest_price': entry_price,
+        'lowest_price': entry_price,
+        'trailing_activated': False,
+        'stop_order_id': None
+    }
+    stop_order = place_stop_loss_order(symbol, pos_side, qty_val, stop_loss)
+    if stop_order:
+        positions[symbol]['stop_order_id'] = stop_order['id']
+    print(f"📊 持仓记录: {symbol} {pos_side} @ {entry_price:.6f} 数量:{qty_val}")
 
-    # 预热几个常见标的
-    def preheat():
-        common = ["BTC/USDT", "ETH/USDT", "ADA/USDT", "DOGE/USDT"]
-        for sym in common:
-            update_htf_trend_for_symbol(sym)
-        while True:
-            time.sleep(60)
-    threading.Thread(target=preheat, daemon=True).start()
-    time.sleep(2)
-
-    print("\n>>> 开始发送测试信号\n")
-
-    # ---- 测试用例 ----
-    # 1. BTC 强牛，做空应被拦截
-    signal_handler("BTC/USDT", "SHORT", 87000, -4.2, client)
-
-    # 2. ETH 震荡市，做多 z 不够
-    signal_handler("ETH/USDT", "LONG", 2425, 2.8, client)
-
-    # 3. ADA 强熊，做多应被拦截
-    signal_handler("ADA/USDT", "LONG", 0.30, 3.5, client)
-
-    # 4. DOGE 强熊，做空应允许 (强熊不做多，做空放行)
-    signal_handler("DOGE/USDT", "SHORT", 0.14, -4.0, client)
-
-    # 5. 死亡开关测试
-    record_stop_loss("ADA/USDT")
-    record_stop_loss("ADA/USDT")
-    signal_handler("ADA/USDT", "SHORT", 0.29, -4.0, client)  # 被拉黑
-
-    print("\n按 Ctrl+C 退出...")
+# ---------- 安全平仓 ----------
+def safe_close_position(symbol, side, reason=""):
     try:
-        while True:
-            time.sleep(10)
-    except KeyboardInterrupt:
-        print("退出")
+        positions_info = exchange.fetch_positions(symbols=[symbol])
+        if not positions_info or len(positions_info) == 0:
+            print(f"⚠ 未找到 {symbol} 持仓")
+            return
+        pos_info = positions_info[0]
+        actual_qty = abs(float(pos_info.get('contracts', 0)))
+        if actual_qty <= 0:
+            print(f"⚠ {symbol} 持仓为0")
+            return
+        qty_str = exchange.amount_to_precision(symbol, actual_qty)
+        if float(qty_str) == 0:
+            return
+        cancel_stop_order(symbol)
+        order_side = 'sell' if side.upper() == 'LONG' else 'buy'
+        exchange.create_order(symbol=symbol, type='market', side=order_side,
+                              amount=qty_str, params={'reduceOnly': True})
+        entry = positions[symbol]['entry_price'] if symbol in positions else 0
+        mark_price = pos_info.get('markPrice', 0)
+        pnl_pct = ((mark_price - entry) / entry * 100) if entry > 0 else 0
+        send_tg(f"🔻 {side} {symbol} 平仓\n价格: {mark_price:.6f}\n数量: {actual_qty}\n盈亏: {pnl_pct:+.2f}%\n原因: {reason}")
+        print(f"✅ 平仓成功: {symbol} {side} Qty:{qty_str} ({reason})")
+        # 死亡开关记录
+        if pnl_pct < 0 and reason.find("跟踪止盈") >= 0:
+            record_stop_loss(symbol)
+        elif pnl_pct < 0 and reason.find("止损") >= 0:
+            record_stop_loss(symbol)
+        if symbol in positions:
+            del positions[symbol]
+    except Exception as e:
+        print(f"❌ 平仓失败 {symbol}: {e}")
+
+# ---------- 跟踪止盈 ----------
+def check_and_trail_positions():
+    if not positions:
+        return
+
+    try:
+        current_positions = exchange.fetch_positions()
+        real_pos = {p['symbol']: p for p in current_positions if float(p.get('contracts', 0)) > 0}
+        closed_syms = [sym for sym in positions if sym not in real_pos]
+        for sym in closed_syms:
+            entry = positions[sym]['entry_price']
+            side = positions[sym]['side']
+            send_tg(f"ℹ️ 检测到 {sym} {side} 已不在持仓中（可能已被止损）")
+            force_clear_all_orders(sym)
+            # 记录可能是止损触发的亏损
+            try:
+                last_pnl = (current_positions[sym]['markPrice'] - entry) / entry * 100 if side == 'LONG' else (entry - current_positions[sym]['markPrice']) / entry * 100
+            except:
+                last_pnl = 0
+            if last_pnl < 0:
+                record_stop_loss(sym)
+            del positions[sym]
+    except Exception as e:
+        print(f"⚠ 持仓同步检查失败: {e}")
+
+    for sym in list(positions.keys()):
+        if sym not in positions:
+            continue
+        pos = positions[sym]
+        try:
+            ticker = exchange.fetch_ticker(sym)
+            current_price = ticker['last']
+            if not current_price: continue
+        except: continue
+        side = pos['side']
+        entry = pos['entry_price']
+
+        if side == 'LONG':
+            if current_price > pos['highest_price']: pos['highest_price'] = current_price
+            pnl_pct = (current_price - entry) / entry * 100
+            if pnl_pct >= TRAIL_ACT_LONG: pos['trailing_activated'] = True
+            if pos['trailing_activated']:
+                stop_price = pos['highest_price'] * (1 - TRAIL_CB_LONG/100)
+                if current_price <= stop_price:
+                    send_tg(f"🛑 做多跟踪止盈触发平仓 {sym} @ {current_price:.6f}")
+                    safe_close_position(sym, 'LONG', "跟踪止盈")
+        else:
+            if current_price < pos['lowest_price']: pos['lowest_price'] = current_price
+            pnl_pct = (entry - current_price) / entry * 100
+            if pnl_pct >= TRAIL_ACT_SHORT: pos['trailing_activated'] = True
+            if pos['trailing_activated']:
+                stop_price = pos['lowest_price'] * (1 + TRAIL_CB_SHORT/100)
+                if current_price >= stop_price:
+                    send_tg(f"🛑 做空跟踪止盈触发平仓 {sym} @ {current_price:.6f}")
+                    safe_close_position(sym, 'SHORT', "跟踪止盈")
+
+def main():
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    engine_path = os.path.join(script_dir, "build", "engine")
+    if not os.path.exists(engine_path):
+        print("engine 未编译")
+        sys.exit(1)
+
+    try:
+        exchange.load_markets()
+        print("✅ 市场数据已加载")
+    except Exception as e:
+        print(f"⚠ 加载市场失败: {e}")
+
+    sync_positions_on_start()
+    send_tg("🤖 引擎已启动 (趋势防线+死亡开关)")
+
+    proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True, bufsize=1)
+    main.last_trail_check = 0
+
+    for line in proc.stdout:
+        line = line.strip()
+        if not line: continue
+        try: msg = json.loads(line)
+        except: print("C++:", line); continue
+
+        now = time.time()
+        if now - main.last_trail_check > 30:
+            check_and_trail_positions()
+            main.last_trail_check = now
+
+        t = msg.get("type", "")
+        sym = msg.get("symbol", "")
+
+        if t == "A_ACTIVE":
+            if sym in last_a_push and now - last_a_push[sym] < 300: continue
+            price = msg.get("price", 0)
+            change = msg.get("change_pct", 0)
+            vol_r = msg.get("vol_ratio", 0)
+            dev = msg.get("dev", None)
+            d_str = f" | 偏离度:{dev:.1f}" if dev else ""
+            send_tg(f"🔥 {sym} 异动 | 价:{price:.4f} | 涨跌:{change:+.2f}% | 量比:{vol_r:.1f}x{d_str}")
+            last_a_push[sym] = now
+
+        elif t == "SIGNAL":
+            msg_ts = msg.get("timestamp", 0)
+            if msg_ts > 0 and (time.time() - msg_ts) > 2.0:
+                continue
+
+            side = msg.get("side", "")
+            price_derived = msg.get("price", 0)
+            score = msg.get("score", 0)
+            stop_loss = msg.get("stop_loss", 0)
+            take_profit = msg.get("take_profit", 0)
+
+            if sym in last_b_signal and now - last_b_signal[sym] < 600: continue
+            if is_quiet_period(): continue
+            if is_blacklisted(sym):
+                print(f"🚫 {sym} 死亡开关生效，跳过")
+                continue
+
+            # 1h趋势防线
+            if is_against_trend(sym, side):
+                continue
+
+            if len(active_a_orders) >= MAX_ACTIVE_ORDERS:
+                print(f"🛑 挂单已满，拦截 {sym}")
+                continue
+
+            actual_price, order_info = place_order(sym, side, price_derived)
+            if actual_price and order_info:
+                tg_msg = (f"🎯 {side.upper()} {sym} 评分:{score:.1f}\n"
+                          f"✅ 成交: {actual_price:.6f}\n"
+                          f"🛑 止损: {stop_loss:.6f} | 🎯 止盈: {take_profit:.6f}")
+                send_tg(tg_msg)
+                update_positions_after_fill(sym, side, actual_price, order_info, stop_loss)
+                last_b_signal[sym] = now
+                order_key = f"{sym}_{side.lower()}"
+                if order_key in active_a_orders:
+                    try:
+                        exchange.cancel_order(active_a_orders[order_key]['order']['id'], sym)
+                        del active_a_orders[order_key]
+                    except: pass
+            else:
+                fail_key = f"{sym}_{side.lower()}"
+                if fail_key in last_fail_push and now - last_fail_push[fail_key] < 300:
+                    continue
+                reason = order_info or "未知"
+                tg_msg = (f"⚠ {side.upper()} {sym} 评分:{score:.1f}\n"
+                          f"📛 未成交: {reason}\n"
+                          f"🛑 止损: {stop_loss:.6f} | 🎯 止盈: {take_profit:.6f}")
+                send_tg(tg_msg)
+                last_fail_push[fail_key] = now
+                last_b_signal[sym] = now
+
+    proc.wait()
 
 if __name__ == "__main__":
     main()
