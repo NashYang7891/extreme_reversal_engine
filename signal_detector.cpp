@@ -83,21 +83,22 @@ Signal SignalDetector::check(const OrderBook& ob) {
     double wall = wall_raw;
     if (wall_raw <= 0.001 || wall_raw >= 0.999) wall = 0.5;
 
-    // ---------- 非对称参数 (平衡版) ----------
+    // ---------- 非对称参数（做空防守加强） ----------
     // 做多：极度严苛，等待深坑 + 止跌横盘
     constexpr double LONG_DEV_THRESH  = 3.5;
     constexpr double LONG_OSC_MAX     = 0.15;
     constexpr double LONG_WALL_MIN    = 0.65;
     constexpr double LONG_RSI_MAX     = 25;
 
-    // 做空：适度收紧，减少噪音
-    constexpr double SHORT_DEV_THRESH = 2.5;      // 偏离度提高到 -2.5σ
+    // 做空：大幅提高门槛，防止过早介入
+    constexpr double SHORT_DEV_THRESH = 3.5;      // 从 2.5 提高到 3.5
     constexpr double SHORT_OSC_MIN    = 0.65;
-    constexpr double SHORT_WALL_MAX   = 0.7;      // 挂单壁收紧到 0.7
-    constexpr double SHORT_ULTRA_DEV  = 4.5;      // 超强特权保留
+    constexpr double SHORT_WALL_MAX   = 0.5;      // 从 0.7 收紧到 0.5
+    constexpr double SHORT_RSI_MIN    = 80;       // 新增：RSI 必须 > 80
+    constexpr double SHORT_ULTRA_DEV  = 5.0;      // 提高到 5.0σ 才无条件开空
 
     // ---------- 做空信号 (优先) ----------
-    // 超强特权：偏离度超过 4.5σ 直接开空，无视其他条件
+    // 超强特权：偏离度超过 5.0σ 直接开空，无视其他条件
     if (dev < -SHORT_ULTRA_DEV) {
         sig.valid = true; sig.side = "SHORT";
         sig.price = solve_critical_price(ob, "SHORT");
@@ -105,8 +106,10 @@ Signal SignalDetector::check(const OrderBook& ob) {
         return sig;
     }
 
+    // 普通做空：必须同时满足偏离度、振荡器、挂单壁、动能衰减、RSI
     bool decay_short = check_momentum_decay("SHORT");
-    if (dev < -SHORT_DEV_THRESH && osc > SHORT_OSC_MIN && wall < SHORT_WALL_MAX && decay_short) {
+    if (dev < -SHORT_DEV_THRESH && osc > SHORT_OSC_MIN && wall < SHORT_WALL_MAX &&
+        decay_short && ind_.rsi(14) > SHORT_RSI_MIN) {
         sig.valid = true; sig.side = "SHORT";
         sig.price = solve_critical_price(ob, "SHORT");
         sig.score = std::min(100.0, (-dev) * 30.0 + osc * 30.0 + (1.0 - wall) * 40.0);
