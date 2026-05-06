@@ -453,7 +453,7 @@ def main():
         print(f"⚠ 加载市场失败: {e}")
 
     sync_positions_on_start()
-    send_tg("🤖 引擎已启动 | 杠杆5倍 | 跟踪止盈3.5/1.5U | 价格按信号原价")
+    send_tg("🤖 引擎已启动 | 杠杆5倍/30U | 跟踪止盈3.5/1.5U | 价格原价 | 延迟30秒开仓")
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True, bufsize=1)
     main.last_trail_check = 0
@@ -484,17 +484,17 @@ def main():
 
         elif t == "SIGNAL":
             msg_ts = msg.get("timestamp", 0)
-            if msg_ts > 0 and (time.time() - msg_ts) > 2.0:
-                continue
-
             side = msg.get("side", "")
             price_derived = msg.get("price", 0)
             score = msg.get("score", 0)
             stop_loss = msg.get("stop_loss", 0)
             take_profit = msg.get("take_profit", 0)
 
-            if sym in last_b_signal and now - last_b_signal[sym] < 600: continue
-            if is_quiet_period(): continue
+            # 基本过滤条件（立即检查，避免无效定时器）
+            if sym in last_b_signal and time.time() - last_b_signal[sym] < 600:
+                continue
+            if is_quiet_period():
+                continue
             if is_blacklisted(sym):
                 print(f"🚫 {sym} 死亡开关生效，跳过")
                 continue
@@ -504,31 +504,56 @@ def main():
                 print(f"🛑 挂单已满，拦截 {sym}")
                 continue
 
-            actual_price, order_info = place_order(sym, side, price_derived)
-            if actual_price and order_info:
-                tg_msg = (f"🎯 {side.upper()} {sym} 评分:{score:.1f}\n"
-                          f"✅ 成交: {actual_price:.6f}\n"
-                          f"🛑 止损: {stop_loss:.6f} | 🎯 止盈: {take_profit:.6f}")
-                send_tg(tg_msg)
-                update_positions_after_fill(sym, side, actual_price, order_info, stop_loss)
-                last_b_signal[sym] = now
-                order_key = f"{sym}_{side.lower()}"
-                if order_key in active_a_orders:
-                    try:
-                        exchange.cancel_order(active_a_orders[order_key]['order']['id'], sym)
-                        del active_a_orders[order_key]
-                    except: pass
-            else:
-                fail_key = f"{sym}_{side.lower()}"
-                if fail_key in last_fail_push and now - last_fail_push[fail_key] < 300:
-                    continue
-                reason = order_info or "未知"
-                tg_msg = (f"⚠ {side.upper()} {sym} 评分:{score:.1f}\n"
-                          f"📛 未成交: {reason}\n"
-                          f"🛑 止损: {stop_loss:.6f} | 🎯 止盈: {take_profit:.6f}")
-                send_tg(tg_msg)
-                last_fail_push[fail_key] = now
-                last_b_signal[sym] = now
+            # --- 定义延迟开仓函数（30秒后执行）---
+            def delayed_open(sym, side, price_derived, score, stop_loss, take_profit, msg_ts):
+                # 检查信号是否过期（超过35秒放弃）
+                if time.time() - msg_ts > 35:
+                    print(f"⏰ 延迟开仓超时 {sym} {side}，信号已过期")
+                    return
+                # 重新检查各项条件（因为30秒内可能发生变化）
+                if sym in positions:
+                    print(f"⏰ 延迟开仓被跳过 {sym}：已有持仓")
+                    return
+                if is_blacklisted(sym):
+                    print(f"⏰ 延迟开仓被跳过 {sym}：死亡开关")
+                    return
+                if is_against_trend(sym, side):
+                    print(f"⏰ 延迟开仓被跳过 {sym}：逆趋势")
+                    return
+                if len(active_a_orders) >= MAX_ACTIVE_ORDERS:
+                    print(f"⏰ 延迟开仓被跳过 {sym}：挂单已满")
+                    return
+                # 再次检查静默期（可选）
+                if is_quiet_period():
+                    print(f"⏰ 延迟开仓被跳过 {sym}：静默期")
+                    return
+
+                # 执行开仓（使用原始价格 price_derived）
+                actual_price, order_info = place_order(sym, side, price_derived)
+                if actual_price and order_info:
+                    tg_msg = (f"🎯 {side.upper()} {sym} 评分:{score:.1f} (延迟30s)\n"
+                              f"✅ 成交: {actual_price:.6f}\n"
+                              f"🛑 止损: {stop_loss:.6f} | 🎯 止盈: {take_profit:.6f}")
+                    send_tg(tg_msg)
+                    update_positions_after_fill(sym, side, actual_price, order_info, stop_loss)
+                    # 更新最后信号时间，避免短时间内再次重复（已经由外部设置，这里不再重复设）
+                else:
+                    reason = order_info or "未知"
+                    tg_msg = (f"⚠ {side.upper()} {sym} 评分:{score:.1f} (延迟30s)\n"
+                              f"📛 未成交: {reason}\n"
+                              f"🛑 止损: {stop_loss:.6f} | 🎯 止盈: {take_profit:.6f}")
+                    send_tg(tg_msg)
+
+            # 启动30秒定时器
+            timer = threading.Timer(30.0, delayed_open,
+                                    args=(sym, side, price_derived, score,
+                                          stop_loss, take_profit, msg_ts))
+            timer.daemon = True
+            timer.start()
+
+            # 发送提示，并记录最后一次信号时间（防止重复信号）
+            send_tg(f"⏳ {side.upper()} {sym} 评分:{score:.1f}，30秒后按原价 {price_derived:.6f} 开仓")
+            last_b_signal[sym] = time.time()
 
     proc.wait()
 
