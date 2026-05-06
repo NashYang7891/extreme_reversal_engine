@@ -27,7 +27,6 @@ double SignalDetector::solve_critical_price(const OrderBook& ob, const std::stri
     return (lo + hi) / 2.0;
 }
 
-// 连续 N 个加速度均为正/负的判定
 static bool consecutive_accel(const std::deque<double>& prices, int count, bool positive) {
     if (prices.size() < count + 3) return false;
     int cnt = 0;
@@ -83,32 +82,31 @@ Signal SignalDetector::check(const OrderBook& ob) {
     double wall = wall_raw;
     if (wall_raw <= 0.001 || wall_raw >= 0.999) wall = 0.5;
 
-    // ---------- 非对称参数（做空防守加强） ----------
-    // 做多：极度严苛，等待深坑 + 止跌横盘
-    constexpr double LONG_DEV_THRESH  = 3.5;
+    // ---------- 实盘优化参数 ----------
+    // 做多：适当放宽，捕捉更多深坑反弹
+    constexpr double LONG_DEV_THRESH  = 3.2;    // 原 3.5 → 3.2
     constexpr double LONG_OSC_MAX     = 0.15;
     constexpr double LONG_WALL_MIN    = 0.65;
-    constexpr double LONG_RSI_MAX     = 25;
+    constexpr double LONG_RSI_MAX     = 28;      // 原 25 → 28
 
-    // 做空：大幅提高门槛，防止过早介入
-    constexpr double SHORT_DEV_THRESH = 3.5;      // 从 2.5 提高到 3.5
-    constexpr double SHORT_OSC_MIN    = 0.65;
-    constexpr double SHORT_WALL_MAX   = 0.5;      // 从 0.7 收紧到 0.5
-    constexpr double SHORT_RSI_MIN    = 80;       // 新增：RSI 必须 > 80
-    constexpr double SHORT_ULTRA_DEV  = 5.0;      // 提高到 5.0σ 才无条件开空
+    // 做空：收紧，减少噪音微亏
+    constexpr double SHORT_DEV_THRESH = 2.8;     // 原 2.5 → 2.8
+    constexpr double SHORT_OSC_MIN    = 0.70;    // 原 0.65 → 0.70
+    constexpr double SHORT_WALL_MAX   = 0.6;     // 原 0.7 → 0.6
+    constexpr double SHORT_RSI_MIN    = 75;      // 新增 RSI 过热过滤
+    constexpr double SHORT_ULTRA_DEV  = 5.0;     // 原 4.5 → 5.0 提高特权门槛
 
     // ---------- 做空信号 (优先) ----------
-    // 超强特权：偏离度超过 5.0σ 直接开空，无视其他条件
-    if (dev < -SHORT_ULTRA_DEV) {
+    // 超强特权：偏离度超过 5.0σ 且 RSI 极高时直接开空
+    if (dev < -SHORT_ULTRA_DEV && ind_.rsi(14) > SHORT_RSI_MIN) {
         sig.valid = true; sig.side = "SHORT";
         sig.price = solve_critical_price(ob, "SHORT");
         sig.score = std::min(100.0, (-dev) * 30.0 + osc * 30.0 + (1.0 - wall) * 40.0);
         return sig;
     }
 
-    // 普通做空：必须同时满足偏离度、振荡器、挂单壁、动能衰减、RSI
     bool decay_short = check_momentum_decay("SHORT");
-    if (dev < -SHORT_DEV_THRESH && osc > SHORT_OSC_MIN && wall < SHORT_WALL_MAX &&
+    if (dev < -SHORT_DEV_THRESH && osc > SHORT_OSC_MIN && wall < SHORT_WALL_MAX && 
         decay_short && ind_.rsi(14) > SHORT_RSI_MIN) {
         sig.valid = true; sig.side = "SHORT";
         sig.price = solve_critical_price(ob, "SHORT");
