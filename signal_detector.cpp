@@ -82,48 +82,41 @@ Signal SignalDetector::check(const OrderBook& ob) {
     double wall = wall_raw;
     if (wall_raw <= 0.001 || wall_raw >= 0.999) wall = 0.5;
 
-    // ---------- 实盘优化参数 ----------
-    // 做多：适当放宽，捕捉更多深坑反弹
-    constexpr double LONG_DEV_THRESH  = 3.2;    // 原 3.5 → 3.2
-    constexpr double LONG_OSC_MAX     = 0.15;
-    constexpr double LONG_WALL_MIN    = 0.65;
-    constexpr double LONG_RSI_MAX     = 28;      // 原 25 → 28
+    // ---------- 重新平衡的参数 ----------
+    // 做多：大幅放宽，更容易捕捉超跌反弹
+    constexpr double LONG_DEV_THRESH  = 2.5;     // 原 3.5 → 2.5
+    constexpr double LONG_OSC_MAX     = 0.22;    // 原 0.15 → 0.22
+    constexpr double LONG_WALL_MIN    = 0.55;    // 原 0.65 → 0.55
+    constexpr double LONG_RSI_MAX     = 35;      // 原 25 → 35
 
-    // 做空：收紧，减少噪音微亏
-    constexpr double SHORT_DEV_THRESH = 2.8;     // 原 2.5 → 2.8
-    constexpr double SHORT_OSC_MIN    = 0.70;    // 原 0.65 → 0.70
-    constexpr double SHORT_WALL_MAX   = 0.6;     // 原 0.7 → 0.6
-    constexpr double SHORT_RSI_MIN    = 75;      // 新增 RSI 过热过滤
-    constexpr double SHORT_ULTRA_DEV  = 5.0;     // 原 4.5 → 5.0 提高特权门槛
+    // 做空：适度收紧，减少噪音
+    constexpr double SHORT_DEV_THRESH = 3.0;     // 原 2.8 → 3.0
+    constexpr double SHORT_OSC_MIN    = 0.75;    // 原 0.70 → 0.75
+    constexpr double SHORT_WALL_MAX   = 0.5;     // 原 0.6 → 0.5
+    constexpr double SHORT_RSI_MIN    = 80;      // 原 75 → 80
 
-    // ---------- 做空信号 (优先) ----------
-    // 超强特权：偏离度超过 5.0σ 且 RSI 极高时直接开空
-    if (dev < -SHORT_ULTRA_DEV && ind_.rsi(14) > SHORT_RSI_MIN) {
-        sig.valid = true; sig.side = "SHORT";
-        sig.price = solve_critical_price(ob, "SHORT");
-        sig.score = std::min(100.0, (-dev) * 30.0 + osc * 30.0 + (1.0 - wall) * 40.0);
-        return sig;
-    }
-
-    bool decay_short = check_momentum_decay("SHORT");
-    if (dev < -SHORT_DEV_THRESH && osc > SHORT_OSC_MIN && wall < SHORT_WALL_MAX && 
-        decay_short && ind_.rsi(14) > SHORT_RSI_MIN) {
-        sig.valid = true; sig.side = "SHORT";
-        sig.price = solve_critical_price(ob, "SHORT");
-        sig.score = std::min(100.0, (-dev) * 30.0 + osc * 30.0 + (1.0 - wall) * 40.0);
-        return sig;
-    }
-
-    // ---------- 做多信号 ----------
-    bool accel_3up = consecutive_accel(ind_.prices(), 3, true);
     bool decay_long = check_momentum_decay("LONG");
-    bool long_decay_ok = decay_long && accel_3up;
+    bool decay_short = check_momentum_decay("SHORT");
 
+    // 极端特殊待遇：偏离度 >5σ 仍可无视动能衰减
+    constexpr double ULTRA_EXTREME_SIGMA = 5.0;
+    bool is_ultra = (std::abs(dev) > ULTRA_EXTREME_SIGMA);
+
+    // --- 做多信号 ---
     if (dev > LONG_DEV_THRESH && osc < LONG_OSC_MAX && wall > LONG_WALL_MIN &&
-        long_decay_ok && ind_.rsi(14) < LONG_RSI_MAX) {
+        (decay_long || (is_ultra && dev > LONG_DEV_THRESH)) && ind_.rsi(14) < LONG_RSI_MAX) {
         sig.valid = true; sig.side = "LONG";
         sig.price = solve_critical_price(ob, "LONG");
         sig.score = std::min(100.0, dev * 30.0 + (1.0 - osc) * 30.0 + wall * 40.0);
+        return sig;
+    }
+
+    // --- 做空信号 ---
+    if (dev < -SHORT_DEV_THRESH && osc > SHORT_OSC_MIN && wall < SHORT_WALL_MAX &&
+        (decay_short || (is_ultra && dev < -SHORT_DEV_THRESH)) && ind_.rsi(14) > SHORT_RSI_MIN) {
+        sig.valid = true; sig.side = "SHORT";
+        sig.price = solve_critical_price(ob, "SHORT");
+        sig.score = std::min(100.0, (-dev) * 30.0 + osc * 30.0 + (1.0 - wall) * 40.0);
         return sig;
     }
 
