@@ -1,305 +1,225 @@
-#include <boost/beast/core.hpp>
-#include <boost/beast/websocket.hpp>
-#include <boost/beast/ssl.hpp>
-#include <boost/asio/connect.hpp>
-#include <boost/asio/ip/tcp.hpp>
-#include <boost/asio/ssl.hpp>
-#include <nlohmann/json.hpp>
-#include <spdlog/spdlog.h>
+/*
+ * main.cpp - 交易执行引擎（开仓自动挂对应止损单）
+ * 依赖：nlohmann/json.hpp (同目录下单头文件)
+ * 编译：g++ -std=c++11 -pthread main.cpp -o engine
+ */
+
 #include <iostream>
-#include <thread>
-#include <atomic>
-#include <map>
-#include <vector>
 #include <string>
-#include <chrono>
-#include <cctype>
-#include <shared_mutex>
-#include <curl/curl.h>
-#include "orderbook.h"
-#include "indicators.h"
-#include "signal_detector.h"
-#include "ml_optimizer.h"
+#include <thread>
+#include <map>
+#include <atomic>
+#include <cstring>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
-namespace beast = boost::beast;
-namespace ws   = beast::websocket;
-namespace net  = boost::asio;
-namespace ssl  = boost::asio::ssl;
-using tcp = net::ip::tcp;
 
-std::atomic<bool> keep_running{true};
+const int PORT = 5555;
+const int BUFFER_SIZE = 4096;
 
-static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *userp) {
-    ((std::string*)userp)->append((char*)contents, size * nmemb);
-    return size * nmemb;
-}
+std::atomic<int> next_order_id{10000};
 
-const std::vector<std::string> ULTIMATE_FALLBACK = {
-    "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","TRXUSDT",
-    "BNBUSDT","ZECUSDT","BIOUSDT","ORDIUSDT","TSTUSDT","BABYUSDT",
-    "FHEUSDT","BUSDT","AIGENSYNUSDT","AKTUSDT","PARTIUSDT",
-    "TAGUSDT","BSBUSDT","GENIUSUSDT"
+struct OrderRecord {
+    int order_id;
+    int stop_order_id;          // 关联止损单 ID
+    std::string symbol;
+    std::string side;
+    int quantity;
+    std::string status;         // filled, cancelled, pending_stop ...
 };
 
-std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 30000000.0) {
-    std::vector<std::pair<std::string, double>> tickers;
-    CURL *curl = curl_easy_init();
-    if (curl) {
-        std::string response;
-        curl_easy_setopt(curl, CURLOPT_URL, "https://fapi.binance.com/fapi/v1/ticker/24hr");
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-        CURLcode res = curl_easy_perform(curl);
-        if (res == CURLE_OK) {
-            try {
-                auto data = json::parse(response);
-                for (auto& item : data) {
-                    std::string sym = item["symbol"];
-                    if (sym.size()>4 && sym.compare(sym.size()-4,4,"USDT")==0 &&
-                        sym.find('_')==std::string::npos && sym!="USDCUSDT") {
-                        double vol = std::stod(item["quoteVolume"].get<std::string>());
-                        if (vol >= min_vol) tickers.emplace_back(sym, vol);
-                    }
-                }
-            } catch (...) { spdlog::error("解析 ticker 失败，使用兜底列表"); }
-        } else {
-            spdlog::error("获取 ticker 失败: {}，使用兜底列表", curl_easy_strerror(res));
+std::map<int, OrderRecord> order_book;
+
+// 模拟下单（实际应接入券商/交易所 API）
+int simulate_order(const std::string &symbol, const std::string &side, 
+                   int quantity, const std::string &order_type) {
+    int id = next_order_id++;
+    std::cout << "[ORDER] id=" << id << " " << symbol << " " << side 
+              << " qty=" << quantity << " type=" << order_type << std::endl;
+    OrderRecord rec;
+    rec.order_id = id;
+    rec.stop_order_id = 0;
+    rec.symbol = symbol;
+    rec.side = side;
+    rec.quantity = quantity;
+    rec.status = "filled";
+    order_book[id] = rec;
+    return id;
+}
+
+// 模拟条件止损挂单
+int simulate_stop_order(int parent_order_id, const std::string &symbol, 
+                        const std::string &side, int quantity,
+                        double trigger_price, double limit_price) {
+    int stop_id = next_order_id++;
+    std::cout << "[STOP] id=" << stop_id << " parent=" << parent_order_id
+              << " " << symbol << " " << side << " qty=" << quantity
+              << " trigger=" << trigger_price << " limit=" << limit_price << std::endl;
+    if (order_book.count(parent_order_id)) {
+        order_book[parent_order_id].stop_order_id = stop_id;
+    }
+    OrderRecord stop_rec;
+    stop_rec.order_id = stop_id;
+    stop_rec.stop_order_id = 0;
+    stop_rec.symbol = symbol;
+    stop_rec.side = side;
+    stop_rec.quantity = quantity;
+    stop_rec.status = "pending_stop";
+    order_book[stop_id] = stop_rec;
+    return stop_id;
+}
+
+// 处理开仓+止损信号
+std::string process_order_with_stop(const json &order) {
+    if (!order.contains("symbol") || !order.contains("side") ||
+        !order.contains("quantity") || !order.contains("order_type")) {
+        return "{\"error\": \"Missing required fields\"}";
+    }
+    if (!order.contains("stop_loss")) {
+        return "{\"error\": \"stop_loss object required\"}";
+    }
+    auto sl = order["stop_loss"];
+    if (!sl.contains("trigger_price") || !sl.contains("limit_price")) {
+        return "{\"error\": \"stop_loss must have trigger_price and limit_price\"}";
+    }
+
+    std::string symbol = order["symbol"];
+    std::string side = order["side"];
+    int quantity = order["quantity"];
+    std::string order_type = order.value("order_type", "market");
+    double trigger_price = sl["trigger_price"];
+    double limit_price = sl["limit_price"];
+    int sl_qty = sl.value("quantity", quantity);
+
+    std::string stop_side = (side == "buy") ? "sell" : "buy";
+
+    int main_id = simulate_order(symbol, side, quantity, order_type);
+    int stop_id = simulate_stop_order(main_id, symbol, stop_side, 
+                                      sl_qty, trigger_price, limit_price);
+
+    json resp;
+    resp["status"] = "ok";
+    resp["main_order"] = {
+        {"order_id", main_id},
+        {"symbol", symbol},
+        {"side", side},
+        {"quantity", quantity},
+        {"status", "filled"}
+    };
+    resp["stop_order"] = {
+        {"order_id", stop_id},
+        {"parent_order_id", main_id},
+        {"symbol", symbol},
+        {"side", stop_side},
+        {"quantity", sl_qty},
+        {"trigger_price", trigger_price},
+        {"limit_price", limit_price},
+        {"status", "pending_stop"}
+    };
+    return resp.dump();
+}
+
+// 处理撤单（撤主单自动联动撤销止损单）
+std::string process_cancel(const json &cancel) {
+    if (!cancel.contains("order_id")) {
+        return "{\"error\": \"Missing order_id\"}";
+    }
+    int order_id = cancel["order_id"];
+    auto it = order_book.find(order_id);
+    if (it == order_book.end()) {
+        return "{\"error\": \"Order not found\"}";
+    }
+    it->second.status = "cancelled";
+    std::cout << "[CANCEL] order_id=" << order_id << std::endl;
+
+    if (it->second.stop_order_id != 0) {
+        int stop_id = it->second.stop_order_id;
+        if (order_book.count(stop_id)) {
+            order_book[stop_id].status = "cancelled";
+            std::cout << "[AUTO CANCEL STOP] stop_id=" << stop_id << std::endl;
         }
-        curl_easy_cleanup(curl);
-    } else {
-        spdlog::error("curl 初始化失败，使用兜底列表");
     }
 
-    std::sort(tickers.begin(), tickers.end(),
-              [](const auto& a, const auto& b) { return a.second > b.second; });
-
-    std::vector<std::string> result;
-    for (size_t i = 0; i < tickers.size() && i < (size_t)top_n; ++i)
-        result.push_back(tickers[i].first);
-
-    if (result.size() < 10) {
-        spdlog::warn("实时合约不足 10 个，切换为兜底列表");
-        return ULTIMATE_FALLBACK;
-    }
-    spdlog::info("最终监控 {} 个合约, 前3: {}", result.size(),
-                 result.size()>=3 ? result[0]+","+result[1]+","+result[2] : "");
-    return result;
+    json resp;
+    resp["status"] = "cancelled";
+    resp["order_id"] = order_id;
+    return resp.dump();
 }
 
-struct SymbolContext {
-    OrderBook orderbook;
-    Indicators indicators;
-    MLOptimizer ml{3};
-    SignalDetector detector{ml, indicators};
-    std::atomic<int64_t> last_active_time{0};
-    std::atomic<int64_t> last_b_push_ms{0};
-    std::atomic<double> last_active_change{0.0};
-};
-
-std::map<std::string, SymbolContext> contexts;
-std::shared_mutex contexts_mutex;
-
-// A层（数据不足60点不输出）
-bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, double& out_vol_ratio) {
-    if (ind.prices().size() < 60) return false;
-
-    double change_3m = ind.price_change_pct(3*60);
-    if (std::abs(change_3m) > 0.20) return false;
-    if (std::abs(change_3m) < 0.012) return false;
-
-    double recent_vol = ob.recent_volume(3*60*1000);
-    double avg_vol = ind.get_volume_ema();
-    if (avg_vol <= 1e-9) {
-        ind.update_volume(recent_vol);
-        out_change = change_3m;
-        out_vol_ratio = 1.0;
-        return true;
-    }
-
-    double vol_ratio = recent_vol / avg_vol;
-    if (vol_ratio < 1.5) return false;
-
-    ind.update_volume(recent_vol);
-    out_change = change_3m;
-    out_vol_ratio = vol_ratio;
-    return true;
-}
-
-void process_json_msg(const json& msg) {
-    if (!msg.contains("stream") || !msg.contains("data")) return;
-
-    std::string stream = msg["stream"];
-    auto& data = msg["data"];
-
-    size_t pos = stream.find('@');
-    if (pos == std::string::npos) return;
-    std::string sym = stream.substr(0, pos);
-    for (char& c : sym) c = std::toupper(c);
-
-    std::unique_lock lock(contexts_mutex);
-    auto it = contexts.find(sym);
-    if (it == contexts.end()) return;
-
+std::string handle_message(const std::string &msg) {
     try {
-        if (stream.find("@depth") != std::string::npos) {
-            it->second.orderbook.update_depth(data);
-            double mp = it->second.orderbook.micro_price();
-            if (mp > 0) it->second.indicators.update(mp);
+        json j = json::parse(msg);
+        std::string action = j.value("action", "");
+        if (action == "order_with_stop") {
+            return process_order_with_stop(j);
+        } else if (action == "cancel") {
+            return process_cancel(j);
+        } else {
+            return "{\"error\": \"Unknown action\"}";
         }
-    } catch (const std::exception& e) {
-        spdlog::warn("数据处理异常 [{}]: {}", sym, e.what());
+    } catch (json::parse_error &e) {
+        return "{\"error\": \"JSON parse error: " + std::string(e.what()) + "\"}";
     }
 }
 
-void run_websocket(const std::vector<std::string>& symbols) {
-    while (keep_running) {
-        try {
-            net::io_context ioc;
-            ssl::context ctx{ssl::context::tls_client};
-            ctx.set_options(ssl::context::default_workarounds | ssl::context::no_sslv2 | ssl::context::no_sslv3);
-            ctx.set_default_verify_paths(); ctx.set_verify_mode(ssl::verify_peer);
-            ws::stream<beast::ssl_stream<tcp::socket>> ws_stream(ioc, ctx);
-            tcp::resolver resolver(ioc);
-            auto const results = resolver.resolve("fstream.binance.com", "443");
-            net::connect(ws_stream.next_layer().next_layer(), results.begin(), results.end());
-            ws_stream.next_layer().handshake(ssl::stream_base::client);
-            ws_stream.handshake("fstream.binance.com", "/stream");
-
-            std::vector<std::string> streams;
-            for (const auto& sym : symbols) {
-                std::string s = sym;
-                for (char& c : s) c = std::tolower(c);
-                streams.push_back(s + "@depth@500ms");
+void client_handler(int client_sock) {
+    char buffer[BUFFER_SIZE];
+    std::string data;
+    while (true) {
+        memset(buffer, 0, sizeof(buffer));
+        int bytes = recv(client_sock, buffer, BUFFER_SIZE - 1, 0);
+        if (bytes <= 0) {
+            std::cout << "Client disconnected\n";
+            break;
+        }
+        data.append(buffer, bytes);
+        size_t pos;
+        while ((pos = data.find('\n')) != std::string::npos) {
+            std::string msg = data.substr(0, pos);
+            data.erase(0, pos + 1);
+            if (!msg.empty()) {
+                std::string resp = handle_message(msg) + "\n";
+                send(client_sock, resp.c_str(), resp.size(), 0);
             }
-            json sub_msg = {{"method","SUBSCRIBE"}, {"params",streams}, {"id",1}};
-            ws_stream.write(net::buffer(sub_msg.dump()));
-            spdlog::info("WebSocket 连接成功，已订阅 {} 个流", streams.size());
-
-            beast::flat_buffer buffer;
-            while (keep_running) {
-                ws_stream.read(buffer);
-                auto msg = json::parse(beast::buffers_to_string(buffer.data()));
-                buffer.clear();
-                process_json_msg(msg);
-            }
-        } catch (const std::exception& e) {
-            spdlog::error("WebSocket 异常: {}，10秒后重连", e.what());
-            std::this_thread::sleep_for(std::chrono::seconds(10));
         }
     }
-}
-
-void run_detection() {
-    while (keep_running) {
-        auto start = std::chrono::steady_clock::now();
-        {
-            std::shared_lock lock(contexts_mutex);
-            auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
-
-            for (auto& [sym, ctx] : contexts) {
-                if (ctx.indicators.is_stale(60000)) continue;
-                try {
-                    double change_pct = 0.0, vol_ratio = 0.0;
-                    if (active_layer(ctx.orderbook, ctx.indicators, change_pct, vol_ratio)) {
-                        ctx.last_active_time = now_ms;
-                        ctx.last_active_change = change_pct;
-
-                        json a_msg;
-                        a_msg["type"] = "A_ACTIVE";
-                        a_msg["symbol"] = sym;
-                        a_msg["current_price"] = ctx.indicators.price();
-                        a_msg["price"] = ctx.indicators.price();
-                        a_msg["change_pct"] = change_pct * 100.0;
-                        a_msg["vol_ratio"] = vol_ratio;
-                        a_msg["timestamp"] = std::time(nullptr);
-                        double atr = ctx.indicators.atr();
-                        if (atr > 1e-9) {
-                            double dev = (ctx.indicators.ema20() - ctx.indicators.price()) / atr;
-                            if (std::abs(dev) < 50.0) a_msg["dev"] = dev;
-                        }
-                        std::cout << a_msg.dump() << std::endl;
-                    }
-
-                    int64_t last_active = ctx.last_active_time.load();
-                    if (last_active > 0 && (now_ms - last_active) < 15*60*1000) {
-                        auto sig = ctx.detector.check(ctx.orderbook);
-                        if (sig.valid) {
-                            if (sig.side == "LONG" && ctx.last_active_change.load() > -0.025)
-                                continue;
-                            if (sig.side == "SHORT" && ctx.last_active_change.load() < 0.012)
-                                continue;
-
-                            if (now_ms - ctx.last_b_push_ms.load() < 10000) continue;
-                            ctx.last_b_push_ms = now_ms;
-
-                            json b_msg;
-                            b_msg["type"] = "SIGNAL";
-                            b_msg["symbol"] = sym;
-                            b_msg["side"]   = sig.side;
-                            b_msg["price"]  = sig.price;
-                            b_msg["score"]  = sig.score;
-                            b_msg["timestamp"] = std::time(nullptr);
-                            b_msg["current_price"] = ctx.indicators.price();
-
-                            double atr = ctx.indicators.atr();
-                            double p   = sig.price;
-
-                            double stop_dist = std::max(atr * 3.0, p * 0.015);
-                            if (stop_dist > p * 0.04) stop_dist = p * 0.04;
-
-                            if (sig.side == "LONG") {
-                                b_msg["stop_loss"]   = p - stop_dist;
-                                b_msg["take_profit"] = p + std::max(atr * 5.0, p * 0.015);
-                                if (b_msg["stop_loss"] < p * 0.95) b_msg["stop_loss"] = p * 0.95;
-                                if (b_msg["take_profit"] <= p) b_msg["take_profit"] = p * 1.02;
-                            } else { // SHORT
-                                b_msg["stop_loss"]   = p + stop_dist;
-                                b_msg["take_profit"] = p - std::max(atr * 5.0, p * 0.015);
-                                if (b_msg["stop_loss"] > p * 1.05) b_msg["stop_loss"] = p * 1.05;
-                                if (b_msg["take_profit"] >= p) b_msg["take_profit"] = p - std::max(atr * 5.0, p * 0.015);
-                            }
-                            std::cout << b_msg.dump() << std::endl;
-                            ctx.last_active_time = 0;
-                        }
-                    }
-                } catch (const std::exception& e) {
-                    spdlog::warn("检测异常 [{}]: {}", sym, e.what());
-                }
-            }
-        }
-        auto elapsed = std::chrono::steady_clock::now() - start;
-        if (elapsed < std::chrono::milliseconds(5))
-            std::this_thread::sleep_for(std::chrono::milliseconds(5) - elapsed);
-    }
+    close(client_sock);
 }
 
 int main() {
-    setvbuf(stdout, NULL, _IONBF, 0);
-    std::cout.setf(std::ios::unitbuf);
+    int server_fd;
+    struct sockaddr_in address;
+    int opt = 1;
 
-    spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
-    spdlog::info(">>> 极端反转引擎 [最终修正版] 启动...");
-
-    auto symbols = fetch_top_symbols(100, 30000000.0);
-    {
-        std::unique_lock lock(contexts_mutex);
-        for (const auto& sym : symbols)
-            contexts.emplace(std::piecewise_construct, std::forward_as_tuple(sym), std::forward_as_tuple());
+    if ((server_fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
+        perror("socket failed"); exit(EXIT_FAILURE);
     }
-    spdlog::info("引擎启动，监控 {} 个合约", symbols.size());
-
-    std::thread ws_thread(run_websocket, symbols);
-    std::thread detect_thread(run_detection);
-    spdlog::info("✅ 所有线程已启动");
-
-    while (keep_running) {
-        std::this_thread::sleep_for(std::chrono::seconds(30));
-        spdlog::info("💓 保活心跳, 监控 {} 个合约", contexts.size());
+    if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt))) {
+        perror("setsockopt"); exit(EXIT_FAILURE);
     }
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = INADDR_ANY;
+    address.sin_port = htons(PORT);
 
-    if (ws_thread.joinable()) ws_thread.join();
-    if (detect_thread.joinable()) detect_thread.join();
+    if (bind(server_fd, (struct sockaddr *)&address, sizeof(address)) < 0) {
+        perror("bind failed"); exit(EXIT_FAILURE);
+    }
+    if (listen(server_fd, 3) < 0) {
+        perror("listen"); exit(EXIT_FAILURE);
+    }
+    std::cout << "Engine with auto-stop on port " << PORT << std::endl;
+
+    while (true) {
+        socklen_t addrlen = sizeof(address);
+        int client_sock = accept(server_fd, (struct sockaddr *)&address, &addrlen);
+        if (client_sock < 0) {
+            perror("accept"); continue;
+        }
+        std::thread(client_handler, client_sock).detach();
+    }
     return 0;
 }
