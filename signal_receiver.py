@@ -20,14 +20,14 @@ exchange = ccxt.binance({
     'options': {'defaultType': 'future'},
 })
 
-LEVERAGE = 35
-ORDER_USDT = 30.0
+LEVERAGE = 5                      # 杠杆倍数（已改为5倍）
+ORDER_USDT = 30.0                 # 开仓金额 (USDT) 保证金
 SLIPPAGE_TOLERANCE = 0.002
 MAX_ACTIVE_ORDERS = 5
 
-# ---------- 跟踪止盈新参数（固定U数） ----------
-TRAIL_ACTIVE_PROFIT_U = 3.5        # 盈利超过1U激活跟踪
-TRAIL_CALLBACK_U = 1.5             # 回撤0.3U平仓
+# ---------- 跟踪止盈参数（固定U数） ----------
+TRAIL_ACTIVE_PROFIT_U = 3.5       # 盈利超过3.5U激活跟踪
+TRAIL_CALLBACK_U = 1.5            # 回撤1.5U平仓
 
 positions = {}               # 持仓记录
 active_a_orders = {}         # 限价单记录
@@ -192,7 +192,7 @@ def _force_clear_all(symbol):
         print(f"⚠ 清空 {symbol} 挂单失败: {e}")
         return False
 
-# ---------- IOC 下单 ----------
+# ---------- IOC 下单（修正数量计算） ----------
 def get_market_price(symbol, fallback):
     global api_fail_count, api_pause_until
     if time.time() < api_pause_until:
@@ -227,6 +227,24 @@ def place_order_ioc(symbol, side, price):
     try:
         if not exchange.markets:
             exchange.load_markets()
+
+        # 获取市场信息用于最小名义价值检查
+        market = exchange.market(symbol)
+        min_notional = 5.0  # 默认兜底值
+        if market['limits'] and market['limits']['cost'] and market['limits']['cost'].get('min'):
+            min_notional = market['limits']['cost']['min']
+
+        # 获取步长精度
+        step_size = 0.001
+        if market['precision'] and market['precision']['amount']:
+            step_size = market['precision']['amount']
+        else:
+            filters = market.get('info', {}).get('filters', [])
+            lot_filter = next((f for f in filters if f.get('filterType') == 'LOT_SIZE'), {})
+            step_size_str = lot_filter.get('stepSize')
+            if step_size_str:
+                step_size = float(step_size_str)
+
         bid, ask, troubled = get_market_price(symbol, price)
         if troubled and api_fail_count >= API_FAIL_THRESHOLD:
             return None, "API严重异常"
@@ -239,8 +257,22 @@ def place_order_ioc(symbol, side, price):
             order_price = base_price * (1.0 - SLIPPAGE_TOLERANCE)
 
         order_price_str = exchange.price_to_precision(symbol, order_price)
-        amount = ORDER_USDT / order_price
-        amount_str = exchange.amount_to_precision(symbol, amount)
+
+        # ========== 核心修正：计算数量 ==========
+        desired_notional = ORDER_USDT * LEVERAGE  # 名义价值 = 保证金 × 杠杆
+        if desired_notional < min_notional:
+            desired_notional = min_notional
+            print(f"⚠️ {symbol} 名义价值 {ORDER_USDT}*{LEVERAGE}={ORDER_USDT*LEVERAGE} USDT 低于最小限制 {min_notional}，已上调至 {min_notional} USDT")
+
+        raw_amount = desired_notional / order_price
+        # 根据步长取整
+        raw_amount = (raw_amount // step_size) * step_size
+        amount_str = exchange.amount_to_precision(symbol, raw_amount)
+
+        # 最终名义价值校验
+        final_notional = float(amount_str) * order_price
+        if final_notional < min_notional - 1e-9:
+            return None, f"调整后名义价值 {final_notional:.2f} USDT 仍低于最小限制 {min_notional}"
 
         exchange.set_leverage(LEVERAGE, symbol)
         exchange.set_margin_mode('isolated', symbol)
@@ -427,17 +459,14 @@ def check_and_trail_positions():
         qty = pos['qty']
 
         if side == 'LONG':
-            # 更新最高价
             if current_price > pos['highest_price']:
                 pos['highest_price'] = current_price
 
-            # 计算盈利U
             profit_u = (current_price - entry) * qty
             if profit_u >= TRAIL_ACTIVE_PROFIT_U:
                 pos['trailing_activated'] = True
 
             if pos['trailing_activated']:
-                # 回撤U = (最高价 - 当前价) * 数量
                 drawdown_u = (pos['highest_price'] - current_price) * qty
                 if drawdown_u >= TRAIL_CALLBACK_U:
                     send_tg(f"🛑 做多跟踪止盈平仓 {sym} @ {current_price:.6f} (回撤 {drawdown_u:.2f}U)")
@@ -470,7 +499,7 @@ def main():
         print(f"⚠ 加载市场失败: {e}")
 
     sync_positions_on_start()
-    send_tg("🤖 引擎已启动 (固定U跟踪止盈)")
+    send_tg("🤖 引擎已启动 (固定U跟踪止盈 | 杠杆5倍 | 名义价值150U)")
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True, bufsize=1)
     main.last_trail_check = 0
