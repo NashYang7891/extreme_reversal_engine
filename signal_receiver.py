@@ -20,14 +20,14 @@ exchange = ccxt.binance({
     'options': {'defaultType': 'future'},
 })
 
-LEVERAGE = 3
-ORDER_USDT = 10.0
+LEVERAGE = 35
+ORDER_USDT = 30.0
 SLIPPAGE_TOLERANCE = 0.002
 MAX_ACTIVE_ORDERS = 5
 
 # ---------- 跟踪止盈新参数（固定U数） ----------
-TRAIL_ACTIVE_PROFIT_U = 1.0        # 盈利超过1U激活跟踪
-TRAIL_CALLBACK_U = 0.3             # 回撤0.3U平仓
+TRAIL_ACTIVE_PROFIT_U = 3.5        # 盈利超过1U激活跟踪
+TRAIL_CALLBACK_U = 1.5             # 回撤0.3U平仓
 
 positions = {}               # 持仓记录
 active_a_orders = {}         # 限价单记录
