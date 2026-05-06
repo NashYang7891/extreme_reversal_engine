@@ -30,7 +30,7 @@ TRAIL_CB_LONG = 0.5
 TRAIL_ACT_SHORT = 2.0
 TRAIL_CB_SHORT = 0.8
 
-positions = {}               # 持仓记录 {symbol: {side, entry, qty, highest, lowest, trailing_activated, stop_order_id}}
+positions = {}               # 持仓记录
 active_a_orders = {}         # 限价单记录
 last_b_signal = {}
 last_fail_push = {}
@@ -66,10 +66,11 @@ def is_quiet_period():
         if start <= now <= end: return True
     return False
 
-# ---------- 启动时同步持仓与挂单 ----------
+# ---------- 启动时同步持仓（只保留对应止损单，取消多余挂单） ----------
 def sync_positions_on_start():
     try:
         pos_list = exchange.fetch_positions()
+        live_positions = set()
         for p in pos_list:
             amount = float(p.get('contracts', 0))
             if amount > 0:
@@ -86,51 +87,55 @@ def sync_positions_on_start():
                         'trailing_activated': False,
                         'stop_order_id': None
                     }
+                    live_positions.add(symbol)
                     last_b_signal[symbol] = time.time()
                     print(f"📥 恢复持仓: {symbol} {side} @ {entry_price:.6f} Qty:{amount}")
 
         orders = exchange.fetch_open_orders()
         for order in orders:
-            if order.get('type') == 'limit' and order.get('status') == 'open':
-                active_a_orders[order['id']] = {
-                    'symbol': order['symbol'],
-                    'side': order.get('side', ''),
-                    'order': order,
-                    'time': order.get('timestamp', 0)/1000
-                }
-            if order.get('type') == 'STOP_MARKET' and order.get('reduceOnly'):
-                sym = order.get('symbol')
-                if sym in positions:
-                    positions[sym]['stop_order_id'] = order.get('id')
-        print(f"📋 已同步 {len(positions)} 个持仓, {len(active_a_orders)} 个限价挂单")
+            sym = order.get('symbol')
+            if order.get('type') == 'STOP_MARKET' and order.get('reduceOnly') and sym in positions:
+                positions[sym]['stop_order_id'] = order.get('id')
+                print(f"🔒 保留止损单: {sym} ID:{order['id']}")
+            else:
+                try:
+                    exchange.cancel_order(order['id'], sym)
+                    print(f"🧹 启动清理多余挂单: {sym} {order.get('type','')} ID:{order['id']}")
+                except Exception as e:
+                    print(f"⚠ 取消 {sym} 订单 {order['id']} 失败: {e}")
+
+        active_a_orders.clear()
+        print(f"📋 当前持仓 {len(positions)} 个，挂单已清理同步")
     except Exception as e:
         print(f"⚠ 同步持仓失败: {e}")
 
-# ---------- 取消指定币种的所有挂单 ----------
+# ---------- 取消指定币种的所有挂单（重试直至清空） ----------
 def cancel_all_orders_for_symbol(symbol):
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            orders = exchange.fetch_open_orders(symbol)
+            if not orders:
+                return True
+            for o in orders:
+                try:
+                    exchange.cancel_order(o['id'], symbol)
+                    active_a_orders.pop(o['id'], None)
+                    if symbol in positions and positions[symbol].get('stop_order_id') == o['id']:
+                        positions[symbol]['stop_order_id'] = None
+                except Exception as e:
+                    print(f"⚠ 取消 {symbol} 订单 {o['id']} 失败: {e}")
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"⚠ 查询 {symbol} 挂单失败 (尝试 {attempt+1}): {e}")
+            time.sleep(0.5)
     try:
-        orders = exchange.fetch_open_orders(symbol)
-        for o in orders:
-            try:
-                exchange.cancel_order(o['id'], symbol)
-                active_a_orders.pop(o['id'], None)
-                if symbol in positions and positions[symbol].get('stop_order_id') == o['id']:
-                    positions[symbol]['stop_order_id'] = None
-            except Exception as e:
-                print(f"⚠ 取消 {symbol} 订单失败 {o['id']}: {e}")
-        time.sleep(0.3)
         remaining = exchange.fetch_open_orders(symbol)
-        for o in remaining:
-            try:
-                exchange.cancel_order(o['id'], symbol)
-                active_a_orders.pop(o['id'], None)
-                if symbol in positions and positions[symbol].get('stop_order_id') == o['id']:
-                    positions[symbol]['stop_order_id'] = None
-            except: pass
-        return True
-    except Exception as e:
-        print(f"⚠ 清理 {symbol} 挂单异常: {e}")
-        return False
+        if remaining:
+            print(f"⚠ {symbol} 仍有 {len(remaining)} 个挂单无法取消")
+            return False
+    except: pass
+    return True
 
 # ---------- IOC 下单 ----------
 def get_market_price(symbol, fallback):
@@ -223,17 +228,22 @@ def place_order_ioc(symbol, side, price):
 def place_order(symbol, side, price):
     # 首次清理
     cancel_all_orders_for_symbol(symbol)
-    time.sleep(0.2)
+    time.sleep(0.3)
+
+    # 如果本地还有止损单记录，强制取消
+    if symbol in positions and positions[symbol].get('stop_order_id'):
+        cancel_stop_order(symbol)
 
     avg_price, order_or_err = place_order_ioc(symbol, side, price)
     if avg_price is not None:
         return avg_price, order_or_err
 
-    # -4067 重试
     if isinstance(order_or_err, str) and ("-4067" in order_or_err or "Position side" in order_or_err):
-        print(f"🔄 挂单冲突，深度清理后重试 {symbol}")
+        print(f"🔄 深度清理 {symbol} ...")
         cancel_all_orders_for_symbol(symbol)
         time.sleep(1.0)
+        if symbol in positions and positions[symbol].get('stop_order_id'):
+            cancel_stop_order(symbol)
         avg_price, order_or_err = place_order_ioc(symbol, side, price)
     return avg_price, order_or_err
 
@@ -304,7 +314,7 @@ def update_positions_after_fill(symbol, side, entry_price, order, stop_loss):
         positions[symbol]['stop_order_id'] = stop_order['id']
     print(f"📊 持仓记录: {symbol} {pos_side} @ {entry_price:.6f} 数量:{qty_val}")
 
-# ---------- 安全平仓（带通知） ----------
+# ---------- 安全平仓 ----------
 def safe_close_position(symbol, side, reason=""):
     try:
         positions_info = exchange.fetch_positions(symbols=[symbol])
@@ -321,14 +331,13 @@ def safe_close_position(symbol, side, reason=""):
             return
         cancel_stop_order(symbol)
         order_side = 'sell' if side.upper() == 'LONG' else 'buy'
-        order = exchange.create_order(
+        exchange.create_order(
             symbol=symbol,
             type='market',
             side=order_side,
             amount=qty_str,
             params={'reduceOnly': True}
         )
-        # 发送平仓通知
         entry = positions[symbol]['entry_price'] if symbol in positions else 0
         pnl_pct = ((pos_info['markPrice'] - entry) / entry * 100) if entry > 0 else 0
         send_tg(f"🔻 {side} {symbol} 平仓\n价格: {pos_info['markPrice']:.6f}\n数量: {actual_qty}\n盈亏: {pnl_pct:+.2f}%\n原因: {reason}")
@@ -338,22 +347,12 @@ def safe_close_position(symbol, side, reason=""):
     except Exception as e:
         print(f"❌ 平仓失败 {symbol}: {e}")
 
-# ---------- 持仓与止损单状态查询 ----------
-def get_positions_status():
-    if not positions:
-        return "当前无持仓记录"
-    lines = ["📊 当前持仓与止损单:"]
-    for sym, pos in positions.items():
-        stop_id = pos.get('stop_order_id', '无')
-        lines.append(f"{sym} {pos['side']} 入场:{pos['entry_price']:.6f} 数量:{pos['qty']} 止损ID:{stop_id}")
-    return "\n".join(lines)
-
-# ---------- 跟踪止盈（增加持仓存在性检查） ----------
+# ---------- 跟踪止盈（含持仓同步） ----------
 def check_and_trail_positions():
     if not positions:
         return
 
-    # 1. 检查是否有持仓已被交易所平仓（例如止损单触发），但本地未更新
+    # 自动检测已经被交易所止损平掉的持仓
     try:
         current_positions = exchange.fetch_positions()
         real_pos = {p['symbol']: p for p in current_positions if float(p.get('contracts', 0)) > 0}
@@ -367,9 +366,9 @@ def check_and_trail_positions():
     except Exception as e:
         print(f"⚠ 持仓同步检查失败: {e}")
 
-    # 2. 跟踪止盈逻辑
+    # 跟踪止盈逻辑
     for sym in list(positions.keys()):
-        if sym not in positions:  # 可能已被上面逻辑删除
+        if sym not in positions:
             continue
         pos = positions[sym]
         try:
@@ -417,7 +416,7 @@ def main():
         print(f"⚠ 加载市场失败: {e}")
 
     sync_positions_on_start()
-    send_tg("🤖 引擎已启动 (持仓止损监测已启用)")
+    send_tg("🤖 引擎已启动 (启动清理多余挂单)")
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True, bufsize=1)
     main.last_trail_check = 0
@@ -429,7 +428,6 @@ def main():
         except: print("C++:", line); continue
 
         now = time.time()
-        # 每30秒执行跟踪止盈和持仓状态同步
         if now - main.last_trail_check > 30:
             check_and_trail_positions()
             main.last_trail_check = now
@@ -487,10 +485,6 @@ def main():
                 send_tg(tg_msg)
                 last_fail_push[fail_key] = now
                 last_b_signal[sym] = now
-
-        # 定期处理 TG 命令（简单模拟，实际可增加 webhook，这里只是示意）
-        # 你可以通过发送 "status" 到机器人来触发持仓查询，但需要另外的轮询机制，暂时略过
-        # 可以直接在 VPS 上执行查询命令
 
     proc.wait()
 
