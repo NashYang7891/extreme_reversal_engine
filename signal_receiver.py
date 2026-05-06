@@ -107,7 +107,29 @@ def sync_positions_on_start():
     except Exception as e:
         print(f"⚠ 同步持仓失败: {e}")
 
-# ---------- IOC 下单 ----------
+# ---------- 取消指定币种的所有挂单 ----------
+def cancel_all_orders_for_symbol(symbol):
+    """取消指定币种的所有挂单（包括限价单和止损单），返回取消的订单数量"""
+    cancelled = 0
+    try:
+        orders = exchange.fetch_open_orders(symbol)
+        for o in orders:
+            try:
+                exchange.cancel_order(o['id'], symbol)
+                cancelled += 1
+                # 从内存记录中移除
+                active_a_orders.pop(o['id'], None)
+                if symbol in positions and positions[symbol].get('stop_order_id') == o['id']:
+                    positions[symbol]['stop_order_id'] = None
+            except Exception as e:
+                print(f"⚠ 取消订单失败 {symbol} {o['id']}: {e}")
+        if cancelled > 0:
+            print(f"🧹 已取消 {symbol} 的 {cancelled} 个旧挂单")
+    except Exception as e:
+        print(f"⚠ 获取 {symbol} 挂单失败: {e}")
+    return cancelled
+
+# ---------- IOC 下单（开仓前自动清理旧挂单）----------
 def get_market_price(symbol, fallback):
     global api_fail_count, api_pause_until
     if time.time() < api_pause_until:
@@ -137,6 +159,9 @@ def place_order(symbol, side, price):
 
     if time.time() < api_pause_until:
         return None, "API熔断暂停"
+
+    # ---- 开仓前清理该币种所有旧挂单 ----
+    cancel_all_orders_for_symbol(symbol)
 
     try:
         if not exchange.markets:
@@ -264,7 +289,6 @@ def update_positions_after_fill(symbol, side, entry_price, order, stop_loss):
 def safe_close_position(symbol, side, reason=""):
     """安全平仓：先获取交易所实际持仓数量，再下单"""
     try:
-        # 获取该币种的实际持仓
         positions_info = exchange.fetch_positions(symbols=[symbol])
         if not positions_info or len(positions_info) == 0:
             print(f"⚠ 未找到 {symbol} 持仓，跳过平仓")
@@ -281,10 +305,8 @@ def safe_close_position(symbol, side, reason=""):
             print(f"⚠ {symbol} 平仓数量精度归零，跳过")
             return
 
-        # 取消止损单
         cancel_stop_order(symbol)
 
-        # 市价平仓
         order_side = 'sell' if side.upper() == 'LONG' else 'buy'
         exchange.create_order(
             symbol=symbol,
@@ -294,7 +316,6 @@ def safe_close_position(symbol, side, reason=""):
             params={'reduceOnly': True}
         )
         print(f"✅ 平仓成功: {symbol} {side} Qty:{qty_str} ({reason})")
-        # 移除本地持仓记录
         if symbol in positions:
             del positions[symbol]
     except Exception as e:
@@ -349,7 +370,7 @@ def main():
         print(f"⚠ 加载市场失败: {e}")
 
     sync_positions_on_start()
-    send_tg("🤖 引擎已启动 (实盘止损+优化参数)")
+    send_tg("🤖 引擎已启动 (开仓前自动清理旧挂单)")
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True, bufsize=1)
     main.last_trail_check = 0
