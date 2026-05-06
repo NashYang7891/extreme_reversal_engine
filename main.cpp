@@ -15,7 +15,6 @@
 #include <chrono>
 #include <cctype>
 #include <shared_mutex>
-#include <cmath>
 #include <curl/curl.h>
 #include "orderbook.h"
 #include "indicators.h"
@@ -96,8 +95,6 @@ struct SymbolContext {
     std::atomic<int64_t> last_active_time{0};
     std::atomic<int64_t> last_b_push_ms{0};
     std::atomic<double> last_active_change{0.0};
-
-    // 单边识别：连续创新高/新低计数
     double highest_since_reset = 0.0;
     double lowest_since_reset = std::numeric_limits<double>::max();
     int consecutive_highs = 0;
@@ -153,8 +150,6 @@ void process_json_msg(const json& msg) {
             double mp = it->second.orderbook.micro_price();
             if (mp > 0) {
                 it->second.indicators.update(mp);
-
-                // 单边识别更新
                 auto& ctx = it->second;
                 if (mp > ctx.highest_since_reset) {
                     ctx.highest_since_reset = mp;
@@ -165,7 +160,6 @@ void process_json_msg(const json& msg) {
                     ctx.consecutive_lows++;
                     ctx.consecutive_highs = 0;
                 } else {
-                    // 未创新高/新低，重置计数
                     ctx.consecutive_highs = 0;
                     ctx.consecutive_lows = 0;
                 }
@@ -238,8 +232,6 @@ void run_detection() {
                         a_msg["change_pct"] = change_pct * 100.0;
                         a_msg["vol_ratio"] = vol_ratio;
                         a_msg["timestamp"] = std::time(nullptr);
-                        a_msg["consecutive_highs"] = ctx.consecutive_highs;
-                        a_msg["consecutive_lows"] = ctx.consecutive_lows;
                         double atr = ctx.indicators.atr();
                         if (atr > 1e-9) {
                             double dev = (ctx.indicators.ema20() - ctx.indicators.price()) / atr;
@@ -268,19 +260,21 @@ void run_detection() {
                             b_msg["score"]  = sig.score;
                             b_msg["timestamp"] = std::time(nullptr);
                             b_msg["current_price"] = ctx.indicators.price();
-                            b_msg["consecutive_highs"] = ctx.consecutive_highs;
-                            b_msg["consecutive_lows"] = ctx.consecutive_lows;
 
                             double atr = ctx.indicators.atr();
                             double p   = sig.price;
 
                             if (sig.side == "LONG") {
+                                // 做多止盈正确计算：入场价 + 盈利空间
+                                double profit_dist = std::max(atr * 8.0, p * 0.025);
+                                b_msg["take_profit"] = p + profit_dist;
+                                // 止损距离
                                 double stop_dist = std::max(atr * 3.0, p * 0.015);
                                 if (stop_dist > p * 0.04) stop_dist = p * 0.04;
-                                b_msg["stop_loss"]   = p - stop_dist;
-                                b_msg["take_profit"] = p + std::max(atr * 5.0, p * 0.015);
-                                if (b_msg["stop_loss"] < p * 0.95) b_msg["stop_loss"] = p * 0.95;
+                                b_msg["stop_loss"] = p - stop_dist;
+                                // 保护修正
                                 if (b_msg["take_profit"] <= p) b_msg["take_profit"] = p * 1.02;
+                                if (b_msg["stop_loss"] < p * 0.95) b_msg["stop_loss"] = p * 0.95;
                             } else { // SHORT
                                 double profit_dist = std::max(atr * 5.0, p * 0.03);
                                 b_msg["take_profit"] = p - profit_dist;
@@ -310,7 +304,7 @@ int main() {
     std::cout.setf(std::ios::unitbuf);
 
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
-    spdlog::info(">>> 极端反转引擎 [单边识别版] 启动...");
+    spdlog::info(">>> 极端反转引擎 [修正做多止盈] 启动...");
 
     auto symbols = fetch_top_symbols(100, 30000000.0);
     {

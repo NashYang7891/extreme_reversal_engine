@@ -25,10 +25,9 @@ ORDER_USDT = 10.0
 SLIPPAGE_TOLERANCE = 0.002
 MAX_ACTIVE_ORDERS = 5
 
-TRAIL_ACT_LONG = 1.5
-TRAIL_CB_LONG = 0.5
-TRAIL_ACT_SHORT = 2.0
-TRAIL_CB_SHORT = 0.8
+# ---------- 跟踪止盈新参数（固定U数） ----------
+TRAIL_ACTIVE_PROFIT_U = 1.0        # 盈利超过1U激活跟踪
+TRAIL_CALLBACK_U = 0.3             # 回撤0.3U平仓
 
 positions = {}               # 持仓记录
 active_a_orders = {}         # 限价单记录
@@ -175,18 +174,15 @@ def sync_positions_on_start():
     except Exception as e:
         print(f"⚠ 同步持仓失败: {e}")
 
-# ---------- 彻底清空该币种所有挂单（使用 cancel_all_orders） ----------
+# ---------- 彻底清空该币种所有挂单 ----------
 def _force_clear_all(symbol):
-    """直接调用交易所 cancel_all_orders 接口，确保该币种无任何挂单"""
     try:
         exchange.cancel_all_orders(symbol)
         time.sleep(0.5)
-        # 二次确认
         remaining = exchange.fetch_open_orders(symbol)
         if remaining:
             exchange.cancel_all_orders(symbol)
             time.sleep(0.3)
-        # 最终检查
         final = exchange.fetch_open_orders(symbol)
         if final:
             print(f"⚠ {symbol} 仍有 {len(final)} 个挂单无法取消")
@@ -284,12 +280,10 @@ def place_order_ioc(symbol, side, price):
         return None, err_msg
 
 def place_order(symbol, side, price):
-    # 开仓前，强制清空该币种所有挂单（包括无法撤销的止损单）
     _force_clear_all(symbol)
     avg, err = place_order_ioc(symbol, side, price)
     if avg is not None:
         return avg, err
-    # 如果还是 -4067，再强制清空一次并重试
     if isinstance(err, str) and "-4067" in err:
         print(f"🔄 再次强制清空 {symbol} 挂单")
         _force_clear_all(symbol)
@@ -376,8 +370,8 @@ def safe_close_position(symbol, side, reason=""):
         pnl_pct = ((mark_price - entry) / entry * 100) if entry > 0 else 0
         send_tg(f"🔻 {side} {symbol} 平仓\n价格: {mark_price:.6f}\n数量: {actual_qty}\n盈亏: {pnl_pct:+.2f}%\n原因: {reason}")
         print(f"✅ 平仓成功: {symbol} {side} Qty:{qty_str} ({reason})")
-        # 亏损记录死亡开关
-        if pnl_pct < 0 and reason.find("止盈") >= 0:
+        # 死亡开关记录
+        if pnl_pct < 0 and reason.find("跟踪止盈") >= 0:
             record_stop_loss(symbol)
         elif pnl_pct < 0 and reason.find("止损") >= 0:
             record_stop_loss(symbol)
@@ -386,11 +380,12 @@ def safe_close_position(symbol, side, reason=""):
     except Exception as e:
         print(f"❌ 平仓失败 {symbol}: {e}")
 
-# ---------- 跟踪止盈 ----------
+# ---------- 跟踪止盈（固定U数版） ----------
 def check_and_trail_positions():
     if not positions:
         return
 
+    # 1. 检测已消失的持仓（被止损单平仓）
     try:
         current_positions = exchange.fetch_positions()
         real_pos = {p['symbol']: p for p in current_positions if float(p.get('contracts', 0)) > 0}
@@ -400,20 +395,24 @@ def check_and_trail_positions():
             side = positions[sym]['side']
             send_tg(f"ℹ️ 检测到 {sym} {side} 已不在持仓中（可能已被止损）")
             _force_clear_all(sym)
+            # 尝试记录止损次数
             try:
                 mark_price = real_pos.get(sym, {}).get('markPrice', 0)
-                if side == 'LONG':
-                    last_pnl = (mark_price - entry) / entry * 100 if mark_price and entry else 0
+                if side == 'LONG' and mark_price and entry:
+                    last_pnl = (mark_price - entry) / entry * 100
+                elif side == 'SHORT' and mark_price and entry:
+                    last_pnl = (entry - mark_price) / entry * 100
                 else:
-                    last_pnl = (entry - mark_price) / entry * 100 if mark_price and entry else 0
+                    last_pnl = 0
+                if last_pnl < 0:
+                    record_stop_loss(sym)
             except:
-                last_pnl = 0
-            if last_pnl < 0:
-                record_stop_loss(sym)
+                pass
             del positions[sym]
     except Exception as e:
         print(f"⚠ 持仓同步检查失败: {e}")
 
+    # 2. 跟踪止盈逻辑（用U计算）
     for sym in list(positions.keys()):
         if sym not in positions:
             continue
@@ -425,25 +424,37 @@ def check_and_trail_positions():
         except: continue
         side = pos['side']
         entry = pos['entry_price']
+        qty = pos['qty']
 
         if side == 'LONG':
-            if current_price > pos['highest_price']: pos['highest_price'] = current_price
-            pnl_pct = (current_price - entry) / entry * 100
-            if pnl_pct >= TRAIL_ACT_LONG: pos['trailing_activated'] = True
+            # 更新最高价
+            if current_price > pos['highest_price']:
+                pos['highest_price'] = current_price
+
+            # 计算盈利U
+            profit_u = (current_price - entry) * qty
+            if profit_u >= TRAIL_ACTIVE_PROFIT_U:
+                pos['trailing_activated'] = True
+
             if pos['trailing_activated']:
-                stop_price = pos['highest_price'] * (1 - TRAIL_CB_LONG/100)
-                if current_price <= stop_price:
-                    send_tg(f"🛑 做多跟踪止盈触发平仓 {sym} @ {current_price:.6f}")
-                    safe_close_position(sym, 'LONG', "跟踪止盈")
-        else:
-            if current_price < pos['lowest_price']: pos['lowest_price'] = current_price
-            pnl_pct = (entry - current_price) / entry * 100
-            if pnl_pct >= TRAIL_ACT_SHORT: pos['trailing_activated'] = True
+                # 回撤U = (最高价 - 当前价) * 数量
+                drawdown_u = (pos['highest_price'] - current_price) * qty
+                if drawdown_u >= TRAIL_CALLBACK_U:
+                    send_tg(f"🛑 做多跟踪止盈平仓 {sym} @ {current_price:.6f} (回撤 {drawdown_u:.2f}U)")
+                    safe_close_position(sym, 'LONG', f"跟踪止盈回撤{drawdown_u:.2f}U")
+        else:  # SHORT
+            if current_price < pos['lowest_price']:
+                pos['lowest_price'] = current_price
+
+            profit_u = (entry - current_price) * qty
+            if profit_u >= TRAIL_ACTIVE_PROFIT_U:
+                pos['trailing_activated'] = True
+
             if pos['trailing_activated']:
-                stop_price = pos['lowest_price'] * (1 + TRAIL_CB_SHORT/100)
-                if current_price >= stop_price:
-                    send_tg(f"🛑 做空跟踪止盈触发平仓 {sym} @ {current_price:.6f}")
-                    safe_close_position(sym, 'SHORT', "跟踪止盈")
+                drawdown_u = (current_price - pos['lowest_price']) * qty
+                if drawdown_u >= TRAIL_CALLBACK_U:
+                    send_tg(f"🛑 做空跟踪止盈平仓 {sym} @ {current_price:.6f} (回撤 {drawdown_u:.2f}U)")
+                    safe_close_position(sym, 'SHORT', f"跟踪止盈回撤{drawdown_u:.2f}U")
 
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -459,7 +470,7 @@ def main():
         print(f"⚠ 加载市场失败: {e}")
 
     sync_positions_on_start()
-    send_tg("🤖 引擎已启动 (彻底清理挂单)")
+    send_tg("🤖 引擎已启动 (固定U跟踪止盈)")
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True, bufsize=1)
     main.last_trail_check = 0
