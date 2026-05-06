@@ -14,7 +14,7 @@ import threading
 from collections import defaultdict
 
 # ========== 调试开关：True 用模拟极端行情测试，False 用真实行情 ==========
-USE_MOCK_DATA = True
+USE_MOCK_DATA = False
 
 # ========== 行情获取 ==========
 def get_mock_ohlcv(symbol, timeframe, limit=5):
