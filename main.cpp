@@ -35,7 +35,6 @@ static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *use
     return size * nmemb;
 }
 
-// 兜底合约列表（20个主流币）
 const std::vector<std::string> ULTIMATE_FALLBACK = {
     "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","TRXUSDT",
     "BNBUSDT","ZECUSDT","BIOUSDT","ORDIUSDT","TSTUSDT","BABYUSDT",
@@ -43,7 +42,6 @@ const std::vector<std::string> ULTIMATE_FALLBACK = {
     "TAGUSDT","BSBUSDT","GENIUSUSDT"
 };
 
-// 获取成交量前100的USDT永续合约，失败回退兜底列表
 std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 30000000.0) {
     std::vector<std::pair<std::string, double>> tickers;
     CURL *curl = curl_easy_init();
@@ -95,8 +93,8 @@ struct SymbolContext {
     MLOptimizer ml{3};
     SignalDetector detector{ml, indicators};
     std::atomic<int64_t> last_active_time{0};
-    std::atomic<int64_t> last_b_push_ms{0};        // B层冷却：10秒内不重复输出同一个币种
-    std::atomic<double> last_active_change{0.0};    // 记录A层触发时的原始涨跌幅（小数）
+    std::atomic<int64_t> last_b_push_ms{0};
+    std::atomic<double> last_active_change{0.0};
 };
 
 std::map<std::string, SymbolContext> contexts;
@@ -206,7 +204,7 @@ void run_detection() {
                     double change_pct = 0.0, vol_ratio = 0.0;
                     if (active_layer(ctx.orderbook, ctx.indicators, change_pct, vol_ratio)) {
                         ctx.last_active_time = now_ms;
-                        ctx.last_active_change = change_pct;   // 存储原始涨跌幅
+                        ctx.last_active_change = change_pct;
 
                         json a_msg;
                         a_msg["type"] = "A_ACTIVE";
@@ -228,13 +226,11 @@ void run_detection() {
                     if (last_active > 0 && (now_ms - last_active) < 15*60*1000) {
                         auto sig = ctx.detector.check(ctx.orderbook);
                         if (sig.valid) {
-                            // 做多必须来自大插针（A层跌幅 < -2.5%），做空要求 A 层涨幅 > 1.2%
                             if (sig.side == "LONG" && ctx.last_active_change.load() > -0.025)
                                 continue;
                             if (sig.side == "SHORT" && ctx.last_active_change.load() < 0.012)
                                 continue;
 
-                            // B层冷却：同一个币种 10 秒内只输出一次
                             if (now_ms - ctx.last_b_push_ms.load() < 10000) continue;
                             ctx.last_b_push_ms = now_ms;
 
@@ -251,7 +247,7 @@ void run_detection() {
                             double p   = sig.price;
 
                             double stop_dist = std::max(atr * 3.0, p * 0.015);
-                            if (stop_dist > p * 0.05) stop_dist = p * 0.05;
+                            if (stop_dist > p * 0.04) stop_dist = p * 0.04;
 
                             if (sig.side == "LONG") {
                                 b_msg["stop_loss"]   = p - stop_dist;
@@ -262,7 +258,7 @@ void run_detection() {
                                 b_msg["stop_loss"]   = p + stop_dist;
                                 b_msg["take_profit"] = p - std::max(atr * 5.0, p * 0.015);
                                 if (b_msg["stop_loss"] > p * 1.05) b_msg["stop_loss"] = p * 1.05;
-                                if (b_msg["take_profit"] >= p) b_msg["take_profit"] = p * 0.98;
+                                if (b_msg["take_profit"] >= p) b_msg["take_profit"] = p - std::max(atr * 5.0, p * 0.015);
                             }
                             std::cout << b_msg.dump() << std::endl;
                             ctx.last_active_time = 0;
@@ -284,7 +280,7 @@ int main() {
     std::cout.setf(std::ios::unitbuf);
 
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
-    spdlog::info(">>> 极端反转引擎 [非对称版] 启动...");
+    spdlog::info(">>> 极端反转引擎 [最终修正版] 启动...");
 
     auto symbols = fetch_top_symbols(100, 30000000.0);
     {
