@@ -37,12 +37,12 @@ last_fail_push = {}
 last_a_push = {}
 
 # 死亡开关
-stop_loss_counter = {}        # symbol -> 止损次数
-BLACKLIST = {}                # symbol -> 解封时间戳 (epoch)
-BLACKLIST_DURATION = 4 * 3600  # 拉黑4小时
-STOP_LOSS_THRESHOLD = 2       # 连续止损2次触发
-last_htf_check = {}            # 1h趋势防线时间戳
-trend_status = {}              # symbol -> "STRONG_BULL"/"STRONG_BEAR"/"NORMAL"
+stop_loss_counter = {}
+BLACKLIST = {}
+BLACKLIST_DURATION = 4 * 3600
+STOP_LOSS_THRESHOLD = 2
+last_htf_check = {}
+trend_status = {}
 
 LAST_TG_SEND = 0
 TG_RATE_LIMIT_SEC = 0.5
@@ -97,7 +97,6 @@ def update_htf_trend_for_symbol(symbol):
         print(f"⚠ 趋势更新失败 {symbol}: {e}")
 
 def is_against_trend(symbol, side):
-    """检查开仓方向是否与1h强趋势相反，返回True表示被拦截"""
     update_htf_trend_for_symbol(symbol)
     trend = trend_status.get(symbol, "NORMAL")
     if side == "SHORT" and trend == "STRONG_BULL":
@@ -167,7 +166,7 @@ def sync_positions_on_start():
 
         for sym in list(positions.keys()):
             if sym not in live_positions:
-                force_clear_all_orders(sym)
+                _force_clear_all(sym)
                 del positions[sym]
                 print(f"🧹 清理已消失持仓的挂单: {sym}")
 
@@ -176,30 +175,25 @@ def sync_positions_on_start():
     except Exception as e:
         print(f"⚠ 同步持仓失败: {e}")
 
-# ---------- 轻量强制清空挂单 ----------
-def force_clear_all_orders(symbol):
+# ---------- 彻底清空该币种所有挂单（使用 cancel_all_orders） ----------
+def _force_clear_all(symbol):
+    """直接调用交易所 cancel_all_orders 接口，确保该币种无任何挂单"""
     try:
-        orders = exchange.fetch_open_orders(symbol)
-        if not orders:
-            return True
-        for o in orders:
-            try:
-                exchange.cancel_order(o['id'], symbol)
-                active_a_orders.pop(o['id'], None)
-                if symbol in positions and positions[symbol].get('stop_order_id') == o['id']:
-                    positions[symbol]['stop_order_id'] = None
-            except Exception as e:
-                print(f"⚠ 取消 {symbol} 订单 {o['id']} 失败: {e}")
+        exchange.cancel_all_orders(symbol)
         time.sleep(0.5)
+        # 二次确认
         remaining = exchange.fetch_open_orders(symbol)
         if remaining:
-            for o in remaining:
-                try:
-                    exchange.cancel_order(o['id'], symbol)
-                except: pass
+            exchange.cancel_all_orders(symbol)
+            time.sleep(0.3)
+        # 最终检查
+        final = exchange.fetch_open_orders(symbol)
+        if final:
+            print(f"⚠ {symbol} 仍有 {len(final)} 个挂单无法取消")
+            return False
         return True
     except Exception as e:
-        print(f"⚠ 清理 {symbol} 挂单异常: {e}")
+        print(f"⚠ 清空 {symbol} 挂单失败: {e}")
         return False
 
 # ---------- IOC 下单 ----------
@@ -231,7 +225,6 @@ def place_order_ioc(symbol, side, price):
         return None, "已有持仓"
     if is_blacklisted(symbol):
         return None, "死亡开关拉黑"
-
     if time.time() < api_pause_until:
         return None, "API熔断暂停"
 
@@ -291,15 +284,25 @@ def place_order_ioc(symbol, side, price):
         return None, err_msg
 
 def place_order(symbol, side, price):
-    cleared = force_clear_all_orders(symbol)
+    # 开仓前，强制清空该币种所有挂单（包括无法撤销的止损单）
+    _force_clear_all(symbol)
     avg, err = place_order_ioc(symbol, side, price)
     if avg is not None:
         return avg, err
+    # 如果还是 -4067，再强制清空一次并重试
     if isinstance(err, str) and "-4067" in err:
-        force_clear_all_orders(symbol)
+        print(f"🔄 再次强制清空 {symbol} 挂单")
+        _force_clear_all(symbol)
         time.sleep(1)
         avg, err = place_order_ioc(symbol, side, price)
     return avg, err
+
+def cancel_order(order_id, symbol):
+    try:
+        exchange.cancel_order(order_id, symbol)
+        print(f"🗑 已撤单 {symbol} {order_id}")
+    except Exception as e:
+        print(f"⚠ 撤单失败 {symbol} {order_id}: {e}")
 
 # ---------- 止损挂单 ----------
 def place_stop_loss_order(symbol, side, qty, stop_price):
@@ -373,8 +376,8 @@ def safe_close_position(symbol, side, reason=""):
         pnl_pct = ((mark_price - entry) / entry * 100) if entry > 0 else 0
         send_tg(f"🔻 {side} {symbol} 平仓\n价格: {mark_price:.6f}\n数量: {actual_qty}\n盈亏: {pnl_pct:+.2f}%\n原因: {reason}")
         print(f"✅ 平仓成功: {symbol} {side} Qty:{qty_str} ({reason})")
-        # 死亡开关记录
-        if pnl_pct < 0 and reason.find("跟踪止盈") >= 0:
+        # 亏损记录死亡开关
+        if pnl_pct < 0 and reason.find("止盈") >= 0:
             record_stop_loss(symbol)
         elif pnl_pct < 0 and reason.find("止损") >= 0:
             record_stop_loss(symbol)
@@ -396,10 +399,13 @@ def check_and_trail_positions():
             entry = positions[sym]['entry_price']
             side = positions[sym]['side']
             send_tg(f"ℹ️ 检测到 {sym} {side} 已不在持仓中（可能已被止损）")
-            force_clear_all_orders(sym)
-            # 记录可能是止损触发的亏损
+            _force_clear_all(sym)
             try:
-                last_pnl = (current_positions[sym]['markPrice'] - entry) / entry * 100 if side == 'LONG' else (entry - current_positions[sym]['markPrice']) / entry * 100
+                mark_price = real_pos.get(sym, {}).get('markPrice', 0)
+                if side == 'LONG':
+                    last_pnl = (mark_price - entry) / entry * 100 if mark_price and entry else 0
+                else:
+                    last_pnl = (entry - mark_price) / entry * 100 if mark_price and entry else 0
             except:
                 last_pnl = 0
             if last_pnl < 0:
@@ -453,7 +459,7 @@ def main():
         print(f"⚠ 加载市场失败: {e}")
 
     sync_positions_on_start()
-    send_tg("🤖 引擎已启动 (趋势防线+死亡开关)")
+    send_tg("🤖 引擎已启动 (彻底清理挂单)")
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True, bufsize=1)
     main.last_trail_check = 0
@@ -498,11 +504,8 @@ def main():
             if is_blacklisted(sym):
                 print(f"🚫 {sym} 死亡开关生效，跳过")
                 continue
-
-            # 1h趋势防线
             if is_against_trend(sym, side):
                 continue
-
             if len(active_a_orders) >= MAX_ACTIVE_ORDERS:
                 print(f"🛑 挂单已满，拦截 {sym}")
                 continue
