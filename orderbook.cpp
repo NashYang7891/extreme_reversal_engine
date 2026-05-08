@@ -66,15 +66,15 @@ void OrderBook::prune() {
     }
 }
 
+// ============================================================================
+// 核心修改：微价格改为直接使用盘口中间价 (best_bid + best_ask) / 2
+// 原加权逻辑因易被深度操纵且偏离实际市场价，已废弃。
+// ============================================================================
 double OrderBook::micro_price() const {
     if (bids.empty() || asks.empty()) return 0.0;
-    double best_bid_ = bids.rbegin()->first;
-    double best_ask_ = asks.begin()->first;
-    double bv = buy_volume();
-    double sv = sell_volume();
-    double total = bv + sv;
-    if (total <= 1e-12) return (best_bid_ + best_ask_) / 2.0;
-    return (best_ask_ * bv + best_bid_ * sv) / total;
+    double best_bid_ = bids.rbegin()->first;   // 最高买价
+    double best_ask_ = asks.begin()->first;    // 最低卖价
+    return (best_bid_ + best_ask_) / 2.0;
 }
 
 double OrderBook::imbalance() const {

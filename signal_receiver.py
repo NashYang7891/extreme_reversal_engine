@@ -28,6 +28,10 @@ MAX_ACTIVE_ORDERS = 5
 TRAIL_ACTIVE_PROFIT_U = 3.5       # 盈利超过3.5U激活跟踪
 TRAIL_CALLBACK_U = 1.5            # 回撤1.5U平仓
 
+# ---------- 延迟开仓参数 ----------
+DELAY_SECONDS = 900                # 15分钟 = 900秒
+PROFIT_THRESHOLD_PERCENT = 3.0     # 盈利需达到3%才开仓
+
 positions = {}
 active_a_orders = {}
 last_b_signal = {}
@@ -201,7 +205,6 @@ def place_order_ioc(symbol, side, price):
     if time.time() < api_pause_until:
         return None, "API熔断暂停"
 
-    # 直接使用信号价格，不进行任何偏移或滑点调整
     order_price = price
 
     try:
@@ -225,7 +228,6 @@ def place_order_ioc(symbol, side, price):
 
         order_price_str = exchange.price_to_precision(symbol, order_price)
 
-        # 计算数量：名义价值 = ORDER_USDT * LEVERAGE
         desired_notional = ORDER_USDT * LEVERAGE
         if desired_notional < min_notional:
             desired_notional = min_notional
@@ -453,7 +455,7 @@ def main():
         print(f"⚠ 加载市场失败: {e}")
 
     sync_positions_on_start()
-    send_tg("🤖 引擎已启动 | 杠杆5倍/30U | 跟踪止盈3.5/1.5U | 价格原价 | 延迟30秒开仓")
+    send_tg("🤖 引擎已启动 | 杠杆5倍/30U | 跟踪止盈3.5/1.5U | 价格原价 | 延迟15分钟且盈利≥3%开仓")
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True, bufsize=1)
     main.last_trail_check = 0
@@ -479,7 +481,7 @@ def main():
             vol_r = msg.get("vol_ratio", 0)
             dev = msg.get("dev", None)
             d_str = f" | 偏离度:{dev:.1f}" if dev else ""
-            send_tg(f"🔥 {sym} 异动 | 价:{price:.4f} | 涨跌:{change:+.2f}% | 量比:{vol_r:.1f}x{d_str}")
+            send_tg(f"🔥 {sym} 异动 | 价:{price:.8f} | 涨跌:{change:+.2f}% | 量比:{vol_r:.1f}x{d_str}")
             last_a_push[sym] = now
 
         elif t == "SIGNAL":
@@ -504,13 +506,14 @@ def main():
                 print(f"🛑 挂单已满，拦截 {sym}")
                 continue
 
-            # --- 定义延迟开仓函数（30秒后执行）---
+            # --- 定义延迟开仓函数（15分钟后执行，加入盈利检查）---
             def delayed_open(sym, side, price_derived, score, stop_loss, take_profit, msg_ts):
-                # 检查信号是否过期（超过35秒放弃）
-                if time.time() - msg_ts > 35:
+                # 1. 检查信号是否过期（超过16分钟放弃）
+                if time.time() - msg_ts > DELAY_SECONDS + 60:
                     print(f"⏰ 延迟开仓超时 {sym} {side}，信号已过期")
                     return
-                # 重新检查各项条件（因为30秒内可能发生变化）
+
+                # 2. 重新检查各项条件（15分钟内可能变化）
                 if sym in positions:
                     print(f"⏰ 延迟开仓被跳过 {sym}：已有持仓")
                     return
@@ -523,36 +526,61 @@ def main():
                 if len(active_a_orders) >= MAX_ACTIVE_ORDERS:
                     print(f"⏰ 延迟开仓被跳过 {sym}：挂单已满")
                     return
-                # 再次检查静默期（可选）
                 if is_quiet_period():
                     print(f"⏰ 延迟开仓被跳过 {sym}：静默期")
                     return
 
-                # 执行开仓（使用原始价格 price_derived）
+                # 3. 获取当前市价（使用最新成交价或盘口中值）
+                try:
+                    ticker = exchange.fetch_ticker(sym)
+                    current_price = ticker['last']
+                    if not current_price:
+                        print(f"⏰ 延迟开仓失败 {sym}：无法获取当前价格")
+                        return
+                except Exception as e:
+                    print(f"⏰ 延迟开仓失败 {sym}：获取价格异常 {e}")
+                    return
+
+                # 4. 计算理论盈利百分比
+                if side.upper() == 'LONG':
+                    profit_pct = (current_price - price_derived) / price_derived * 100
+                else:  # SHORT
+                    profit_pct = (price_derived - current_price) / price_derived * 100
+
+                # 5. 判断是否满足盈利阈值
+                if profit_pct < PROFIT_THRESHOLD_PERCENT:
+                    tg_msg = (f"⏸️ {side.upper()} {sym} 评分:{score:.1f} 延迟15分钟放弃\n"
+                              f"原价: {price_derived:.8f} 现价: {current_price:.8f}\n"
+                              f"理论盈利: {profit_pct:.2f}% < {PROFIT_THRESHOLD_PERCENT}%")
+                    send_tg(tg_msg)
+                    print(tg_msg)
+                    return
+
+                # 6. 执行开仓（使用原始价格 price_derived）
                 actual_price, order_info = place_order(sym, side, price_derived)
                 if actual_price and order_info:
-                    tg_msg = (f"🎯 {side.upper()} {sym} 评分:{score:.1f} (延迟30s)\n"
-                              f"✅ 成交: {actual_price:.6f}\n"
-                              f"🛑 止损: {stop_loss:.6f} | 🎯 止盈: {take_profit:.6f}")
+                    tg_msg = (f"🎯 {side.upper()} {sym} 评分:{score:.1f} (延迟15min)\n"
+                              f"✅ 成交: {actual_price:.8f}\n"
+                              f"原信号价: {price_derived:.8f}\n"
+                              f"🛑 止损: {stop_loss:.8f} | 🎯 止盈: {take_profit:.8f}")
                     send_tg(tg_msg)
                     update_positions_after_fill(sym, side, actual_price, order_info, stop_loss)
-                    # 更新最后信号时间，避免短时间内再次重复（已经由外部设置，这里不再重复设）
                 else:
                     reason = order_info or "未知"
-                    tg_msg = (f"⚠ {side.upper()} {sym} 评分:{score:.1f} (延迟30s)\n"
+                    tg_msg = (f"⚠ {side.upper()} {sym} 评分:{score:.1f} (延迟15min)\n"
                               f"📛 未成交: {reason}\n"
-                              f"🛑 止损: {stop_loss:.6f} | 🎯 止盈: {take_profit:.6f}")
+                              f"原价: {price_derived:.8f}")
                     send_tg(tg_msg)
 
-            # 启动30秒定时器
-            timer = threading.Timer(30.0, delayed_open,
+            # 启动15分钟定时器
+            timer = threading.Timer(DELAY_SECONDS, delayed_open,
                                     args=(sym, side, price_derived, score,
                                           stop_loss, take_profit, msg_ts))
             timer.daemon = True
             timer.start()
 
             # 发送提示，并记录最后一次信号时间（防止重复信号）
-            send_tg(f"⏳ {side.upper()} {sym} 评分:{score:.1f}，30秒后按原价 {price_derived:.6f} 开仓")
+            send_tg(f"⏳ {side.upper()} {sym} 评分:{score:.1f}，15分钟后检查盈利≥{PROFIT_THRESHOLD_PERCENT}% 才开仓\n原价: {price_derived:.8f}")
             last_b_signal[sym] = time.time()
 
     proc.wait()
