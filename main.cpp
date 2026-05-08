@@ -145,23 +145,20 @@ void process_json_msg(const json& msg) {
     if (it == contexts.end()) return;
 
     try {
-        // 处理 aggTrade 流（推荐）或 trade 流
         if (stream.find("@aggTrade") != std::string::npos || stream.find("@trade") != std::string::npos) {
             double price = 0.0, qty = 0.0;
             if (data.contains("p") && data.contains("q")) {
                 price = std::stod(data["p"].get<std::string>());
                 qty   = std::stod(data["q"].get<std::string>());
             } else {
-                // 兼容原始 @trade 格式
-                return; // 忽略无法解析的
+                return;
             }
             if (price > 0 && qty > 0) {
-                // 将成交数据传入 orderbook
                 json trade_json;
                 trade_json["p"] = data["p"];
                 trade_json["q"] = data["q"];
                 trade_json["T"] = data["T"];
-                trade_json["m"] = data["m"]; // 是否是买方主动
+                trade_json["m"] = data["m"];
                 it->second.orderbook.update_trade(trade_json);
                 double last_price = it->second.orderbook.last_price();
                 if (last_price > 0) {
@@ -204,7 +201,6 @@ void run_websocket(const std::vector<std::string>& symbols) {
             ws_stream.next_layer().handshake(ssl::stream_base::client);
             ws_stream.handshake("fstream.binance.com", "/stream");
 
-            // 订阅 aggTrade 流（更可靠）
             std::vector<std::string> streams;
             for (const auto& sym : symbols) {
                 std::string s = sym;
@@ -215,12 +211,14 @@ void run_websocket(const std::vector<std::string>& symbols) {
             ws_stream.write(net::buffer(sub_msg.dump()));
             spdlog::info("WebSocket 连接成功，已订阅 {} 个 aggTrade 流", streams.size());
 
-            // 设置控制回调处理 Ping 帧
+            // 处理 Ping 帧（同步回复）
             ws_stream.control_callback(
                 [&](beast::websocket::frame_type kind, beast::string_view payload) {
                     if (kind == beast::websocket::frame_type::ping) {
                         spdlog::debug("收到 Ping，回复 Pong");
-                        ws_stream.async_pong(payload, [](beast::error_code) {});
+                        beast::error_code ec;
+                        ws_stream.pong(payload, ec);
+                        if (ec) spdlog::warn("发送 Pong 失败: {}", ec.message());
                     }
                 });
 
@@ -238,7 +236,6 @@ void run_websocket(const std::vector<std::string>& symbols) {
     }
 }
 
-// 命名管道监听线程（接收Python反馈）
 void feedback_listener() {
     const char* fifo_path = "/tmp/quant_feedback";
     mkfifo(fifo_path, 0666);
