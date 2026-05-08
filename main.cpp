@@ -135,8 +135,7 @@ void process_json_msg(const json& msg) {
     std::string stream = msg["stream"];
     auto& data = msg["data"];
 
-    // 诊断：打印收到的消息流名称
-    spdlog::info("收到消息: stream={}", stream);
+    spdlog::info("收到消息: stream={}", stream);  // 诊断日志
 
     size_t pos = stream.find('@');
     if (pos == std::string::npos) return;
@@ -205,6 +204,7 @@ void run_websocket(const std::vector<std::string>& symbols) {
             ws_stream.next_layer().handshake(ssl::stream_base::client);
             ws_stream.handshake("fstream.binance.com", "/stream");
 
+            // 订阅 aggTrade 流
             std::vector<std::string> streams;
             for (const auto& sym : symbols) {
                 std::string s = sym;
@@ -215,13 +215,19 @@ void run_websocket(const std::vector<std::string>& symbols) {
             ws_stream.write(net::buffer(sub_msg.dump()));
             spdlog::info("WebSocket 连接成功，已订阅 {} 个 aggTrade 流", streams.size());
 
-            // 处理 Ping 帧（只记录，不回复）
+            // 必须回复 Pong，否则连接会被服务器关闭（这里使用同步 pong 并忽略错误）
             ws_stream.control_callback(
-                [](beast::websocket::frame_type kind, beast::string_view payload) {
+                [&](beast::websocket::frame_type kind, beast::string_view payload) {
                     if (kind == beast::websocket::frame_type::ping) {
-                        spdlog::debug("收到 Ping，未回复");
+                        spdlog::debug("收到 Ping，回复 Pong");
+                        beast::error_code ec;
+                        ws_stream.pong(payload, ec);
+                        if (ec) spdlog::warn("回复 Pong 失败: {}", ec.message());
                     }
                 });
+
+            // 等待一小段时间让订阅生效
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
             beast::flat_buffer buffer;
             while (keep_running) {
@@ -369,7 +375,7 @@ int main() {
     std::cout.setf(std::ios::unitbuf);
 
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
-    spdlog::set_level(spdlog::level::debug);  // 启用 debug 级别日志
+    spdlog::set_level(spdlog::level::debug);
     spdlog::info(">>> 极端反转引擎 [纯成交数据 + 在线学习] 启动...");
 
     auto symbols = fetch_top_symbols(100, 80000000.0);
