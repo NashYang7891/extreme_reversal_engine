@@ -163,6 +163,7 @@ void process_json_msg(const json& msg) {
                 double last_price = it->second.orderbook.last_price();
                 if (last_price > 0) {
                     it->second.indicators.update(last_price);
+                    spdlog::debug("更新指标价格: {}", last_price);
                     auto& ctx = it->second;
                     if (last_price > ctx.highest_since_reset) {
                         ctx.highest_since_reset = last_price;
