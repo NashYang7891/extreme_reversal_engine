@@ -219,24 +219,44 @@ def place_order_ioc(symbol, side, price):
         return None, "API熔断暂停"
 
     order_price = price
+    # 用于调试的变量
+    step_size = 0.001
+    min_notional = 5.0
+    step_size_str_debug = None
+    raw_amount = 0.0
+    amount_str = ""
+
     try:
         if not exchange.markets:
             exchange.load_markets()
 
         market = exchange.market(symbol)
-        min_notional = 5.0
-        if market['limits'] and market['limits']['cost'] and market['limits']['cost'].get('min'):
-            min_notional = market['limits']['cost']['min']
 
+        # 安全获取最小名义价值
+        min_notional = 5.0
+        if market.get('limits') and market['limits'].get('cost'):
+            min_val = market['limits']['cost'].get('min')
+            if min_val is not None:
+                try:
+                    min_notional = float(min_val)
+                except (TypeError, ValueError) as conv_e:
+                    print(f"⚠️ {symbol} min_notional 转换失败: {min_val}, 错误: {conv_e}, 使用默认5.0")
+
+        # 安全获取步长
         step_size = 0.001
-        if market['precision'] and market['precision']['amount']:
+        if market.get('precision') and market['precision'].get('amount'):
             step_size = market['precision']['amount']
         else:
             filters = market.get('info', {}).get('filters', [])
             lot_filter = next((f for f in filters if f.get('filterType') == 'LOT_SIZE'), {})
-            step_size_str = lot_filter.get('stepSize')
-            if step_size_str:
-                step_size = float(step_size_str)
+            step_size_str_debug = lot_filter.get('stepSize')
+            if step_size_str_debug is not None:
+                try:
+                    step_size = float(step_size_str_debug)
+                except (TypeError, ValueError) as conv_e:
+                    print(f"⚠️ {symbol} stepSize 转换失败: {step_size_str_debug}, 错误: {conv_e}, 使用默认0.001")
+            else:
+                print(f"⚠️ {symbol} stepSize 为 None，使用默认0.001")
 
         order_price_str = exchange.price_to_precision(symbol, order_price)
 
@@ -246,6 +266,7 @@ def place_order_ioc(symbol, side, price):
             print(f"⚠️ {symbol} 名义价值上调至 {min_notional} USDT")
 
         raw_amount = desired_notional / order_price
+        # 步长取整
         raw_amount = (raw_amount // step_size) * step_size
         amount_str = exchange.amount_to_precision(symbol, raw_amount)
 
@@ -287,7 +308,13 @@ def place_order_ioc(symbol, side, price):
         return None, f"无交易权限: {e}"
     except Exception as e:
         err_msg = str(e)[:200]
-        print(f"❌ 下单异常 {symbol}: {err_msg}")
+        # 详细调试信息
+        debug_info = (
+            f"symbol={symbol}, side={side}, price={price}, order_price={order_price}, "
+            f"step_size={step_size}, min_notional={min_notional}, step_size_str={step_size_str_debug}, "
+            f"raw_amount={raw_amount}, amount_str={amount_str}"
+        )
+        print(f"❌ 下单异常 {symbol}: {err_msg}\n调试信息: {debug_info}")
         return None, err_msg
 
 def place_order(symbol, side, price):
