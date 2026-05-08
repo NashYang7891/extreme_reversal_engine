@@ -16,10 +16,10 @@
 #include <cctype>
 #include <shared_mutex>
 #include <curl/curl.h>
-#include "orderbook.h"
+#include "orderbook.h"        // 必须放在最前面
 #include "indicators.h"
-#include "signal_detector.h"
-#include "ml_optimizer.h"
+#include "ml_optimizer.h"     // 紧接着
+#include "signal_detector.h"  // 最后
 
 using json = nlohmann::json;
 namespace beast = boost::beast;

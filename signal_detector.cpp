@@ -5,29 +5,7 @@
 
 SignalDetector::SignalDetector(MLOptimizer& ml, Indicators& ind) : ml_(ml), ind_(ind) {}
 
-double SignalDetector::objective(const OrderBook& ob, double price, const std::string& side) {
-    double atr = ind_.atr();
-    if (atr <= 0) return 0.0;
-    double dev = (ind_.ema20() - price) / atr;
-    double osc = ind_.composite_oscillator(ml_.get_w_rsi(), ml_.get_w_kdj(), ml_.get_w_cci());
-    double wall = ob.imbalance();
-    if (side == "LONG") return dev * 0.4 + (1.0 - osc) * 0.4 + wall * 0.2;
-    else return (-dev) * 0.4 + osc * 0.4 + (1.0 - wall) * 0.2;
-}
-
-double SignalDetector::solve_critical_price(const OrderBook& ob, const std::string& side) {
-    double lo = std::min(ind_.price() * 0.98, ob.best_bid());
-    double hi = std::max(ind_.price() * 1.02, ob.best_ask());
-    const double phi = 0.618;
-    for (int i = 0; i < 30; ++i) {
-        double c = hi - (hi - lo) * phi;
-        double d = lo + (hi - lo) * phi;
-        if (objective(ob, c, side) > objective(ob, d, side)) hi = d; else lo = c;
-    }
-    return (lo + hi) / 2.0;
-}
-
-// 连续 N 个加速度均为正/负的判定
+// ======================== 动量衰减检测（保持不变） ========================
 static bool consecutive_accel(const std::deque<double>& prices, int count, bool positive) {
     if (prices.size() < count + 3) return false;
     int cnt = 0;
@@ -70,54 +48,69 @@ bool SignalDetector::check_momentum_decay(const std::string& side) {
     }
 }
 
+// ======================== 主检测函数（完全基于成交数据） ========================
 Signal SignalDetector::check(const OrderBook& ob) {
     Signal sig;
     if (ind_.prices().size() < 60) return sig;
-    double atr = ind_.atr(); if (atr <= 0) return sig;
-    double ema20 = ind_.ema20(); double price = ind_.price();
+    double atr = ind_.atr(); 
+    if (atr <= 0) return sig;
+    double ema20 = ind_.ema20(); 
+    double price = ob.last_price();          // 关键修改：使用成交价，不再用 ind_.price()
     if (price <= 0) return sig;
 
+    // 计算偏离度 (基于当前成交价)
     double dev = (ema20 - price) / atr;
-    double osc = ind_.composite_oscillator(ml_.get_w_rsi(), ml_.get_w_kdj(), ml_.get_w_cci());
-    double wall_raw = ob.imbalance();
-    double wall = wall_raw;
-    if (wall_raw <= 0.001 || wall_raw >= 0.999) wall = 0.5;
 
-    // ---------- 重新平衡的参数 ----------
-    // 做多：深度超卖才出手
-    constexpr double LONG_DEV_THRESH  = 3.0;     // 偏离度 >= 3.0σ
+    // 复合振荡器（保留原有逻辑，不依赖订单簿）
+    double osc = ind_.composite_oscillator(ml_.get_w_rsi(), ml_.get_w_kdj(), ml_.get_w_cci());
+
+    // 买卖压力指标：使用累计主动成交额比例 (避免深度操纵)
+    double buy_vol = ob.buy_volume();
+    double sell_vol = ob.sell_volume();
+    double total_vol = buy_vol + sell_vol;
+    double wall = (total_vol > 1e-9) ? (buy_vol / total_vol) : 0.5;
+    // 防止极端值
+    if (wall <= 0.001 || wall >= 0.999) wall = 0.5;
+
+    // ---------- 可调整的参数 ----------
+    // 做多条件
+    constexpr double LONG_DEV_THRESH  = 3.0;     // dev >= 3.0σ
     constexpr double LONG_OSC_MAX     = 0.18;    // 振荡器 <= 0.18
-    constexpr double LONG_WALL_MIN    = 0.60;    // 买方深度 >= 0.60
+    constexpr double LONG_WALL_MIN    = 0.60;    // 买方成交额占比 >= 60%
     constexpr double LONG_RSI_MAX     = 30;      // RSI <= 30
 
-    // 做空：适度收紧，减少噪音
-    constexpr double SHORT_DEV_THRESH = 3.0;     // 偏离度 <= -3.0σ
+    // 做空条件
+    constexpr double SHORT_DEV_THRESH = 3.0;     // dev <= -3.0σ
     constexpr double SHORT_OSC_MIN    = 0.75;    // 振荡器 >= 0.75
-    constexpr double SHORT_WALL_MAX   = 0.5;     // 卖方深度 <= 0.5 (即买方占比低)
+    constexpr double SHORT_WALL_MAX   = 0.5;     // 买方成交额占比 <= 50% (即卖方主导)
     constexpr double SHORT_RSI_MIN    = 80;      // RSI >= 80
 
-    bool decay_long = check_momentum_decay("LONG");
+    bool decay_long  = check_momentum_decay("LONG");
     bool decay_short = check_momentum_decay("SHORT");
 
-    // 极端特殊待遇：偏离度 >5σ 仍可无视动能衰减
     constexpr double ULTRA_EXTREME_SIGMA = 5.0;
     bool is_ultra = (std::abs(dev) > ULTRA_EXTREME_SIGMA);
 
     // --- 做多信号 ---
     if (dev > LONG_DEV_THRESH && osc < LONG_OSC_MAX && wall > LONG_WALL_MIN &&
-        (decay_long || (is_ultra && dev > LONG_DEV_THRESH)) && ind_.rsi(14) < LONG_RSI_MAX) {
-        sig.valid = true; sig.side = "LONG";
-        sig.price = solve_critical_price(ob, "LONG");
-        sig.score = std::min(100.0, dev * 30.0 + (1.0 - osc) * 30.0 + wall * 40.0);
+        (decay_long || is_ultra) && ind_.rsi(14) < LONG_RSI_MAX) {
+        sig.valid = true;
+        sig.side = "LONG";
+        sig.price = price;   // 直接使用当前成交价，不再求解复杂临界价
+        // 评分可以基于偏离度、振荡器、压力指标综合
+        double score = std::min(100.0, dev * 30.0 + (1.0 - osc) * 30.0 + wall * 40.0);
+        sig.score = std::max(0.0, std::min(100.0, score));
         return sig;
     }
 
     // --- 做空信号 ---
     if (dev < -SHORT_DEV_THRESH && osc > SHORT_OSC_MIN && wall < SHORT_WALL_MAX &&
-        (decay_short || (is_ultra && dev < -SHORT_DEV_THRESH)) && ind_.rsi(14) > SHORT_RSI_MIN) {
-        sig.valid = true; sig.side = "SHORT";
-        sig.price = solve_critical_price(ob, "SHORT");
-        sig.score = std::min(100.0, (-dev) * 30.0 + osc * 30.0 + (1.0 - wall) * 40.0);
+        (decay_short || is_ultra) && ind_.rsi(14) > SHORT_RSI_MIN) {
+        sig.valid = true;
+        sig.side = "SHORT";
+        sig.price = price;
+        double score = std::min(100.0, (-dev) * 30.0 + osc * 30.0 + (1.0 - wall) * 40.0);
+        sig.score = std::max(0.0, std::min(100.0, score));
         return sig;
     }
 

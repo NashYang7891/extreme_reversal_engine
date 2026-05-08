@@ -1,43 +1,22 @@
-#ifndef ORDERBOOK_H
-#define ORDERBOOK_H
+#ifndef ML_OPTIMIZER_H
+#define ML_OPTIMIZER_H
 
-#include <deque>
-#include <nlohmann/json.hpp>
-#include <cstdint>
+#include <vector>
+#include "orderbook.h"   // 引用真正的 OrderBook 定义
 
-using json = nlohmann::json;
-
-class OrderBook {
+class MLOptimizer {
 public:
-    OrderBook() = default;
+    MLOptimizer(int history_length = 3);
+    ~MLOptimizer();
 
-    // 处理成交数据（trade）
-    void update_trade(const json& data);
-
-    // 获取最新成交价
-    double last_price() const { return last_price_; }
-
-    // 获取最近窗口内的成交量（USDT）
-    double recent_volume(int window_ms) const;
-
-    // 获取累计买卖量（仅 trade 统计）
-    double buy_volume() const { return cum_buy_; }
-    double sell_volume() const { return cum_sell_; }
-
-    // 清空旧数据
-    void prune();
+    double predict(const OrderBook& orderbook);
+    void update(const OrderBook& orderbook, double result);
+    double get_score() const;
 
 private:
-    struct Trade {
-        double price;
-        double volume;      // 以 USDT 计的名义价值
-        int64_t timestamp_ms;
-    };
-    std::deque<Trade> trades;
-    double last_price_ = 0.0;
-    double cum_buy_ = 0.0;
-    double cum_sell_ = 0.0;
-    static const size_t MAX_TRADE = 5000;
+    int history_len;
+    std::vector<double> recent_scores;
+    // 其他内部实现...
 };
 
 #endif
