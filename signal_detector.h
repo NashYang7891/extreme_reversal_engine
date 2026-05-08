@@ -7,7 +7,7 @@
 
 struct Signal {
     bool valid = false;
-    std::string side;   // "LONG" or "SHORT"
+    std::string side;
     double price = 0.0;
     double score = 0.0;
 };
@@ -15,15 +15,11 @@ struct Signal {
 class SignalDetector {
 public:
     SignalDetector(MLOptimizer& ml, Indicators& ind);
-
-    // 主检测函数
     Signal check(const OrderBook& ob);
 
 private:
     MLOptimizer& ml_;
     Indicators& ind_;
-
-    // 辅助函数：动量衰减检测（不依赖订单簿）
     bool check_momentum_decay(const std::string& side);
 };
 

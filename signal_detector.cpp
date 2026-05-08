@@ -48,17 +48,12 @@ Signal SignalDetector::check(const OrderBook& ob) {
     double atr = ind_.atr();
     if (atr <= 0) return sig;
     double ema20 = ind_.ema20();
-    double price = ob.last_price();
+    double price = ob.micro_price();   // 使用中间价
     if (price <= 0) return sig;
 
     double dev = (ema20 - price) / atr;
     double osc = ind_.composite_oscillator(ml_.get_w_rsi(), ml_.get_w_kdj(), ml_.get_w_cci());
-
-    double buy_vol = ob.buy_volume();
-    double sell_vol = ob.sell_volume();
-    double total_vol = buy_vol + sell_vol;
-    double wall = (total_vol > 1e-9) ? (buy_vol / total_vol) : 0.5;
-    wall = std::clamp(wall, 0.001, 0.999);
+    double wall = ob.imbalance();
 
     constexpr double LONG_DEV_THRESH = 3.0;
     constexpr double LONG_OSC_MAX = 0.18;
@@ -74,7 +69,7 @@ Signal SignalDetector::check(const OrderBook& ob) {
     bool decay_short = check_momentum_decay("SHORT");
     bool ultra = std::abs(dev) > ULTRA_EXTREME_SIGMA;
 
-    // 做多信号
+    // 做多
     if (dev > LONG_DEV_THRESH && osc < LONG_OSC_MAX && wall > LONG_WALL_MIN &&
         (decay_long || ultra) && ind_.rsi(14) < LONG_RSI_MAX) {
         sig.valid = true;
@@ -87,7 +82,7 @@ Signal SignalDetector::check(const OrderBook& ob) {
         return sig;
     }
 
-    // 做空信号
+    // 做空
     if (dev < -SHORT_DEV_THRESH && osc > SHORT_OSC_MIN && wall < SHORT_WALL_MAX &&
         (decay_short || ultra) && ind_.rsi(14) > SHORT_RSI_MIN) {
         sig.valid = true;
