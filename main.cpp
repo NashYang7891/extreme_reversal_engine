@@ -86,30 +86,45 @@ bool active_layer(Indicators& ind, double& out_change) {
 // 从管道读取成交数据并更新指标
 void trade_pipe_reader() {
     const char* pipe_path = "/tmp/trade_pipe";
+    spdlog::info("管道读取线程启动");
     while (keep_running) {
         int fd = open(pipe_path, O_RDONLY);
         if (fd == -1) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             continue;
         }
-        char buf[1024];
+        char buf[4096];
+        std::string leftover;
         while (keep_running) {
             int n = read(fd, buf, sizeof(buf)-1);
             if (n > 0) {
                 buf[n] = '\0';
-                try {
-                    json j = json::parse(buf);
-                    std::string sym = j.value("symbol", "");
-                    double price = j.value("price", 0.0);
-                    if (!sym.empty() && price > 0) {
-                        std::shared_lock lock(contexts_mutex);
-                        auto it = contexts.find(sym);
-                        if (it != contexts.end()) {
-                            it->second.indicators.update(price);
-                            spdlog::debug("更新 {} 价格: {}", sym, price);
+                std::string data = leftover + std::string(buf);
+                // 按行拆分（每条消息以换行符分隔）
+                size_t pos = 0;
+                while ((pos = data.find('\n')) != std::string::npos) {
+                    std::string line = data.substr(0, pos);
+                    data.erase(0, pos+1);
+                    try {
+                        json j = json::parse(line);
+                        if (j.contains("symbol") && j.contains("price")) {
+                            std::string sym = j["symbol"];
+                            double price = j["price"];
+                            std::shared_lock lock(contexts_mutex);
+                            auto it = contexts.find(sym);
+                            if (it != contexts.end()) {
+                                it->second.indicators.update(price);
+                                spdlog::debug("更新 {} 价格: {}", sym, price);
+                            }
                         }
+                    } catch (const std::exception& e) {
+                        spdlog::warn("管道 JSON 解析失败: {} , 原始: {}", e.what(), line);
                     }
-                } catch (...) {}
+                }
+                leftover = data;  // 剩余未完整的数据
+            } else if (n == 0) {
+                // 管道写端关闭，重新打开
+                break;
             }
         }
         close(fd);
