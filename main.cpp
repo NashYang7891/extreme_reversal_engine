@@ -36,13 +36,11 @@ static size_t WriteCallback(void *contents, size_t size, size_t nmemb, void *use
 }
 
 const std::vector<std::string> ULTIMATE_FALLBACK = {
-    "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","TRXUSDT",
-    "BNBUSDT","ZECUSDT","BIOUSDT","ORDIUSDT","TSTUSDT","BABYUSDT",
-    "FHEUSDT","BUSDT","AIGENSYNUSDT","AKTUSDT","PARTIUSDT",
-    "TAGUSDT","BSBUSDT","GENIUSUSDT"
+    "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","BNBUSDT"
 };
 
-std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 30000000.0) {
+// 修改：24h成交额 >= 8000万 USDT
+std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 80000000.0) {
     std::vector<std::pair<std::string, double>> tickers;
     CURL *curl = curl_easy_init();
     if (curl) {
@@ -82,7 +80,7 @@ std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 300
         spdlog::warn("实时合约不足 10 个，切换为兜底列表");
         return ULTIMATE_FALLBACK;
     }
-    spdlog::info("最终监控 {} 个合约, 前3: {}", result.size(),
+    spdlog::info("最终监控 {} 个合约 (24h成交额≥8000万U), 前3: {}", result.size(),
                  result.size()>=3 ? result[0]+","+result[1]+","+result[2] : "");
     return result;
 }
@@ -104,14 +102,15 @@ struct SymbolContext {
 std::map<std::string, SymbolContext> contexts;
 std::shared_mutex contexts_mutex;
 
+// 活跃层检测：基于成交量和价格变化（不再依赖订单簿）
 bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, double& out_vol_ratio) {
     if (ind.prices().size() < 60) return false;
 
     double change_3m = ind.price_change_pct(3*60);
     if (std::abs(change_3m) > 0.20) return false;
-    if (std::abs(change_3m) < 0.012) return false;
+    if (std::abs(change_3m) < 0.012) return false;  // 1.2% 最小波动
 
-    double recent_vol = ob.recent_volume(3*60*1000);
+    double recent_vol = ob.recent_volume(3*60*1000);   // 最近3分钟成交额 (USDT)
     double avg_vol = ind.get_volume_ema();
     if (avg_vol <= 1e-9) {
         ind.update_volume(recent_vol);
@@ -121,7 +120,7 @@ bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, doub
     }
 
     double vol_ratio = recent_vol / avg_vol;
-    if (vol_ratio < 1.5) return false;
+    if (vol_ratio < 1.5) return false;   // 量比不足1.5倍
 
     ind.update_volume(recent_vol);
     out_change = change_3m;
@@ -145,18 +144,19 @@ void process_json_msg(const json& msg) {
     if (it == contexts.end()) return;
 
     try {
-        if (stream.find("@depth") != std::string::npos) {
-            it->second.orderbook.update_depth(data);
-            double mp = it->second.orderbook.micro_price();
-            if (mp > 0) {
-                it->second.indicators.update(mp);
+        // 处理 trade 流
+        if (stream.find("@trade") != std::string::npos) {
+            it->second.orderbook.update_trade(data);
+            double last_price = it->second.orderbook.last_price();
+            if (last_price > 0) {
+                it->second.indicators.update(last_price);
                 auto& ctx = it->second;
-                if (mp > ctx.highest_since_reset) {
-                    ctx.highest_since_reset = mp;
+                if (last_price > ctx.highest_since_reset) {
+                    ctx.highest_since_reset = last_price;
                     ctx.consecutive_highs++;
                     ctx.consecutive_lows = 0;
-                } else if (mp < ctx.lowest_since_reset) {
-                    ctx.lowest_since_reset = mp;
+                } else if (last_price < ctx.lowest_since_reset) {
+                    ctx.lowest_since_reset = last_price;
                     ctx.consecutive_lows++;
                     ctx.consecutive_highs = 0;
                 } else {
@@ -188,11 +188,11 @@ void run_websocket(const std::vector<std::string>& symbols) {
             for (const auto& sym : symbols) {
                 std::string s = sym;
                 for (char& c : s) c = std::tolower(c);
-                streams.push_back(s + "@depth@500ms");
+                streams.push_back(s + "@trade");   // 只订阅成交流，不再订阅深度
             }
             json sub_msg = {{"method","SUBSCRIBE"}, {"params",streams}, {"id",1}};
             ws_stream.write(net::buffer(sub_msg.dump()));
-            spdlog::info("WebSocket 连接成功，已订阅 {} 个流", streams.size());
+            spdlog::info("WebSocket 连接成功，已订阅 {} 个 trade 流", streams.size());
 
             beast::flat_buffer buffer;
             while (keep_running) {
@@ -242,7 +242,7 @@ void run_detection() {
 
                     int64_t last_active = ctx.last_active_time.load();
                     if (last_active > 0 && (now_ms - last_active) < 15*60*1000) {
-                        auto sig = ctx.detector.check(ctx.orderbook);
+                        auto sig = ctx.detector.check(ctx.orderbook);  // 注意：detector 可能需要适配，但不依赖深度的话可以工作
                         if (sig.valid) {
                             if (sig.side == "LONG" && ctx.last_active_change.load() > -0.025)
                                 continue;
@@ -256,7 +256,7 @@ void run_detection() {
                             b_msg["type"] = "SIGNAL";
                             b_msg["symbol"] = sym;
                             b_msg["side"]   = sig.side;
-                            b_msg["price"]  = sig.price;
+                            b_msg["price"]  = sig.price;   // 这里 sig.price 来自 detector，可能基于成交价计算
                             b_msg["score"]  = sig.score;
                             b_msg["timestamp"] = std::time(nullptr);
                             b_msg["current_price"] = ctx.indicators.price();
@@ -265,17 +265,14 @@ void run_detection() {
                             double p   = sig.price;
 
                             if (sig.side == "LONG") {
-                                // 做多止盈正确计算：入场价 + 盈利空间
                                 double profit_dist = std::max(atr * 8.0, p * 0.025);
                                 b_msg["take_profit"] = p + profit_dist;
-                                // 止损距离
                                 double stop_dist = std::max(atr * 3.0, p * 0.015);
                                 if (stop_dist > p * 0.04) stop_dist = p * 0.04;
                                 b_msg["stop_loss"] = p - stop_dist;
-                                // 保护修正
                                 if (b_msg["take_profit"] <= p) b_msg["take_profit"] = p * 1.02;
                                 if (b_msg["stop_loss"] < p * 0.95) b_msg["stop_loss"] = p * 0.95;
-                            } else { // SHORT
+                            } else {
                                 double profit_dist = std::max(atr * 5.0, p * 0.03);
                                 b_msg["take_profit"] = p - profit_dist;
                                 double stop_dist_short = std::max(atr * 3.0, p * 0.015);
@@ -304,9 +301,9 @@ int main() {
     std::cout.setf(std::ios::unitbuf);
 
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
-    spdlog::info(">>> 极端反转引擎 [修正做多止盈] 启动...");
+    spdlog::info(">>> 极端反转引擎 [纯成交数据模式] 启动...");
 
-    auto symbols = fetch_top_symbols(100, 30000000.0);
+    auto symbols = fetch_top_symbols(100, 80000000.0);  // 成交额 ≥ 8000万U
     {
         std::unique_lock lock(contexts_mutex);
         for (const auto& sym : symbols)
@@ -316,7 +313,7 @@ int main() {
 
     std::thread ws_thread(run_websocket, symbols);
     std::thread detect_thread(run_detection);
-    spdlog::info("✅ 所有线程已启动");
+    spdlog::info("✅ 所有线程已启动 (仅成交数据)");
 
     while (keep_running) {
         std::this_thread::sleep_for(std::chrono::seconds(30));

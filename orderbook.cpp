@@ -1,100 +1,50 @@
 #include "orderbook.h"
-#include <numeric>
 #include <spdlog/spdlog.h>
+#include <numeric>
+#include <chrono>
 
-void OrderBook::update_depth(const json& data) {
+void OrderBook::update_trade(const json& data) {
     try {
-        const json* bids_json = nullptr;
-        const json* asks_json = nullptr;
+        // 币安 trade 流格式: {"e":"trade","E":时间戳,"s":"符号","p":"价格","q":"数量","T":成交时间,"m":买方是否是做市商, ...}
+        int64_t trade_time = data["T"].get<int64_t>();
+        double price = std::stod(data["p"].get<std::string>());
+        double qty = std::stod(data["q"].get<std::string>());      // 币数量
+        bool is_buyer_maker = data["m"].get<bool>();               // 如果为 true，表示买方是挂单方（即卖方主动吃单）
 
-        if (data.contains("b") && data.contains("a")) {
-            bids_json = &data["b"];
-            asks_json = &data["a"];
-        } else if (data.contains("bids") && data.contains("asks")) {
-            bids.clear();
-            asks.clear();
-            bids_json = &data["bids"];
-            asks_json = &data["asks"];
+        // 计算名义价值 (USDT)
+        double notional = price * qty;
+
+        // 判断主动方向：如果买方是 maker，则主动方是 seller（即卖单吃单，所以是空头主动）
+        // 更直观：is_buyer_maker == true 表示买单挂单，卖单成交 → 卖盘主动，计入 sell_volume
+        //         is_buyer_maker == false 表示卖单挂单，买单成交 → 买盘主动，计入 buy_volume
+        if (is_buyer_maker) {
+            cum_sell_ += notional;
         } else {
-            static int err_count = 0;
-            if (++err_count % 100 == 1)
-                spdlog::warn("无法识别的深度推送格式，已跳过");
-            return;
+            cum_buy_ += notional;
         }
 
-        if (bids_json) {
-            for (auto& item : *bids_json) {
-                try {
-                    double price = std::stod(item[0].get<std::string>());
-                    double qty   = std::stod(item[1].get<std::string>());
-                    if (qty > 0) bids[price] = qty;
-                    else bids.erase(price);
-                } catch (...) {}
-            }
-        }
-        if (asks_json) {
-            for (auto& item : *asks_json) {
-                try {
-                    double price = std::stod(item[0].get<std::string>());
-                    double qty   = std::stod(item[1].get<std::string>());
-                    if (qty > 0) asks[price] = qty;
-                    else asks.erase(price);
-                } catch (...) {}
-            }
-        }
+        trades.push_back({price, notional, trade_time});
+        last_price_ = price;
+        prune();
     } catch (const std::exception& e) {
         static int err_cnt = 0;
         if (++err_cnt % 100 == 1)
-            spdlog::warn("深度解析异常: {}，已丢弃本条数据", e.what());
+            spdlog::warn("成交数据解析异常: {}，已丢弃", e.what());
     }
-}
-
-void OrderBook::add_agg_trade(bool is_buy, double volume, int64_t trade_time_ms) {
-    if (trade_time_ms == 0) {
-        trade_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch()).count();
-    }
-    trades.push_back({volume, trade_time_ms});
-    if (is_buy) cum_buy += volume;
-    else cum_sell += volume;
-    prune();
 }
 
 void OrderBook::prune() {
     while (trades.size() > MAX_TRADE) {
-        trades.pop_front();
+        auto& oldest = trades.front();
+        if (oldest.timestamp_ms < trades.back().timestamp_ms - 3600000) { // 清理超过1小时的
+            if (oldest.volume > 0) {
+                // 这里不维护 cum_buy_/cum_sell_ 的精确减去，因为累计值用于快照，允许一定误差
+            }
+            trades.pop_front();
+        } else {
+            break;
+        }
     }
-}
-
-// ============================================================================
-// 核心修改：微价格改为直接使用盘口中间价 (best_bid + best_ask) / 2
-// 原加权逻辑因易被深度操纵且偏离实际市场价，已废弃。
-// ============================================================================
-double OrderBook::micro_price() const {
-    if (bids.empty() || asks.empty()) return 0.0;
-    double best_bid_ = bids.rbegin()->first;   // 最高买价
-    double best_ask_ = asks.begin()->first;    // 最低卖价
-    return (best_bid_ + best_ask_) / 2.0;
-}
-
-double OrderBook::imbalance() const {
-    double bv = buy_volume();
-    double sv = sell_volume();
-    double total = bv + sv;
-    if (total <= 1e-12) return 0.5;
-    return bv / total;
-}
-
-double OrderBook::best_bid() const { return bids.empty() ? 0.0 : bids.rbegin()->first; }
-double OrderBook::best_ask() const { return asks.empty() ? 0.0 : asks.begin()->first; }
-
-double OrderBook::buy_volume() const {
-    return std::accumulate(bids.begin(), bids.end(), 0.0,
-        [](double sum, const auto& p) { return sum + p.second; });
-}
-double OrderBook::sell_volume() const {
-    return std::accumulate(asks.begin(), asks.end(), 0.0,
-        [](double sum, const auto& p) { return sum + p.second; });
 }
 
 double OrderBook::recent_volume(int window_ms) const {

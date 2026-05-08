@@ -1,20 +1,43 @@
-#pragma once
-#include <cstddef>   // 加上这一行！
-#include <deque>
-#include <vector>
+#ifndef ORDERBOOK_H
+#define ORDERBOOK_H
 
-class MLOptimizer {
+#include <deque>
+#include <nlohmann/json.hpp>
+#include <cstdint>
+
+using json = nlohmann::json;
+
+class OrderBook {
 public:
-    MLOptimizer(int param_count = 3);
-    void record_outcome(double profit);
-    void optimize();
-    double get_w_rsi() const { return w_rsi_; }
-    double get_w_kdj() const { return w_kdj_; }
-    double get_w_cci() const { return w_cci_; }
+    OrderBook() = default;
+
+    // 处理成交数据（trade）
+    void update_trade(const json& data);
+
+    // 获取最新成交价
+    double last_price() const { return last_price_; }
+
+    // 获取最近窗口内的成交量（USDT）
+    double recent_volume(int window_ms) const;
+
+    // 获取累计买卖量（仅 trade 统计）
+    double buy_volume() const { return cum_buy_; }
+    double sell_volume() const { return cum_sell_; }
+
+    // 清空旧数据
+    void prune();
+
 private:
-    double w_rsi_ = 0.33, w_kdj_ = 0.33, w_cci_ = 0.34;
-    std::deque<double> profit_history_;
-    static constexpr size_t MAX_HIST = 50;
-    double learning_rate_ = 0.01;
-    void normalize();
+    struct Trade {
+        double price;
+        double volume;      // 以 USDT 计的名义价值
+        int64_t timestamp_ms;
+    };
+    std::deque<Trade> trades;
+    double last_price_ = 0.0;
+    double cum_buy_ = 0.0;
+    double cum_sell_ = 0.0;
+    static const size_t MAX_TRADE = 5000;
 };
+
+#endif
