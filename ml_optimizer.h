@@ -21,7 +21,7 @@ private:
     struct SignalRecord { std::string side; double result; };
     std::deque<SignalRecord> history_;
     mutable std::mutex mutex_;
-    std::deque<double> recent_scores;   // 添加这个成员
+    std::deque<double> recent_scores;   // 需要这个成员
 
     void optimize_weights();
     double compute_success_rate(const std::string& side, int lookback = 20) const;

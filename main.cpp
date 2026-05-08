@@ -90,7 +90,7 @@ std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 800
 struct SymbolContext {
     OrderBook orderbook;
     Indicators indicators;
-    MLOptimizer ml{100};          // 增加历史长度，更好学习
+    MLOptimizer ml{100};
     SignalDetector detector{ml, indicators};
     std::atomic<int64_t> last_active_time{0};
     std::atomic<int64_t> last_b_push_ms{0};
@@ -104,7 +104,6 @@ struct SymbolContext {
 std::map<std::string, SymbolContext> contexts;
 std::shared_mutex contexts_mutex;
 
-// 活跃层检测（基于成交量和价格变化）
 bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, double& out_vol_ratio) {
     if (ind.prices().size() < 60) return false;
 
@@ -146,28 +145,47 @@ void process_json_msg(const json& msg) {
     if (it == contexts.end()) return;
 
     try {
-        if (stream.find("@trade") != std::string::npos) {
-            it->second.orderbook.update_trade(data);
-            double last_price = it->second.orderbook.last_price();
-            if (last_price > 0) {
-                it->second.indicators.update(last_price);
-                auto& ctx = it->second;
-                if (last_price > ctx.highest_since_reset) {
-                    ctx.highest_since_reset = last_price;
-                    ctx.consecutive_highs++;
-                    ctx.consecutive_lows = 0;
-                } else if (last_price < ctx.lowest_since_reset) {
-                    ctx.lowest_since_reset = last_price;
-                    ctx.consecutive_lows++;
-                    ctx.consecutive_highs = 0;
-                } else {
-                    ctx.consecutive_highs = 0;
-                    ctx.consecutive_lows = 0;
+        // 处理 aggTrade 流（推荐）或 trade 流
+        if (stream.find("@aggTrade") != std::string::npos || stream.find("@trade") != std::string::npos) {
+            double price = 0.0, qty = 0.0;
+            if (data.contains("p") && data.contains("q")) {
+                price = std::stod(data["p"].get<std::string>());
+                qty   = std::stod(data["q"].get<std::string>());
+            } else {
+                // 兼容原始 @trade 格式
+                return; // 忽略无法解析的
+            }
+            if (price > 0 && qty > 0) {
+                // 将成交数据传入 orderbook
+                json trade_json;
+                trade_json["p"] = data["p"];
+                trade_json["q"] = data["q"];
+                trade_json["T"] = data["T"];
+                trade_json["m"] = data["m"]; // 是否是买方主动
+                it->second.orderbook.update_trade(trade_json);
+                double last_price = it->second.orderbook.last_price();
+                if (last_price > 0) {
+                    it->second.indicators.update(last_price);
+                    auto& ctx = it->second;
+                    if (last_price > ctx.highest_since_reset) {
+                        ctx.highest_since_reset = last_price;
+                        ctx.consecutive_highs++;
+                        ctx.consecutive_lows = 0;
+                    } else if (last_price < ctx.lowest_since_reset) {
+                        ctx.lowest_since_reset = last_price;
+                        ctx.consecutive_lows++;
+                        ctx.consecutive_highs = 0;
+                    } else {
+                        ctx.consecutive_highs = 0;
+                        ctx.consecutive_lows = 0;
+                    }
                 }
             }
         }
     } catch (const std::exception& e) {
-        spdlog::warn("数据处理异常 [{}]: {}", sym, e.what());
+        static int cnt = 0;
+        if (++cnt % 100 == 1)
+            spdlog::warn("数据处理异常 [{}]: {}", sym, e.what());
     }
 }
 
@@ -186,15 +204,25 @@ void run_websocket(const std::vector<std::string>& symbols) {
             ws_stream.next_layer().handshake(ssl::stream_base::client);
             ws_stream.handshake("fstream.binance.com", "/stream");
 
+            // 订阅 aggTrade 流（更可靠）
             std::vector<std::string> streams;
             for (const auto& sym : symbols) {
                 std::string s = sym;
                 for (char& c : s) c = std::tolower(c);
-                streams.push_back(s + "@trade");
+                streams.push_back(s + "@aggTrade");
             }
             json sub_msg = {{"method","SUBSCRIBE"}, {"params",streams}, {"id",1}};
             ws_stream.write(net::buffer(sub_msg.dump()));
-            spdlog::info("WebSocket 连接成功，已订阅 {} 个 trade 流", streams.size());
+            spdlog::info("WebSocket 连接成功，已订阅 {} 个 aggTrade 流", streams.size());
+
+            // 设置控制回调处理 Ping 帧
+            ws_stream.control_callback(
+                [&](beast::websocket::frame_type kind, beast::string_view payload) {
+                    if (kind == beast::websocket::frame_type::ping) {
+                        spdlog::debug("收到 Ping，回复 Pong");
+                        ws_stream.async_pong(payload, [](beast::error_code) {});
+                    }
+                });
 
             beast::flat_buffer buffer;
             while (keep_running) {
@@ -210,7 +238,7 @@ void run_websocket(const std::vector<std::string>& symbols) {
     }
 }
 
-// ---------- 命名管道监听线程（接收Python反馈） ----------
+// 命名管道监听线程（接收Python反馈）
 void feedback_listener() {
     const char* fifo_path = "/tmp/quant_feedback";
     mkfifo(fifo_path, 0666);
@@ -350,7 +378,7 @@ int main() {
 
     std::thread ws_thread(run_websocket, symbols);
     std::thread detect_thread(run_detection);
-    std::thread feedback_thread(feedback_listener);   // 启动反馈线程
+    std::thread feedback_thread(feedback_listener);
     spdlog::info("✅ 所有线程已启动 (仅成交数据 + 在线学习)");
 
     while (keep_running) {
