@@ -135,7 +135,7 @@ void process_json_msg(const json& msg) {
     std::string stream = msg["stream"];
     auto& data = msg["data"];
 
-    spdlog::info("收到消息: stream={}", stream);  // 诊断日志
+    spdlog::info("收到消息: stream={}", stream);
 
     size_t pos = stream.find('@');
     if (pos == std::string::npos) return;
@@ -204,7 +204,6 @@ void run_websocket(const std::vector<std::string>& symbols) {
             ws_stream.next_layer().handshake(ssl::stream_base::client);
             ws_stream.handshake("fstream.binance.com", "/stream");
 
-            // 订阅 aggTrade 流
             std::vector<std::string> streams;
             for (const auto& sym : symbols) {
                 std::string s = sym;
@@ -215,19 +214,13 @@ void run_websocket(const std::vector<std::string>& symbols) {
             ws_stream.write(net::buffer(sub_msg.dump()));
             spdlog::info("WebSocket 连接成功，已订阅 {} 个 aggTrade 流", streams.size());
 
-            // 必须回复 Pong，否则连接会被服务器关闭（这里使用同步 pong 并忽略错误）
+            // 不回复 Ping，依赖重连机制（避免编译错误）
             ws_stream.control_callback(
-                [&](beast::websocket::frame_type kind, beast::string_view payload) {
+                [](beast::websocket::frame_type kind, beast::string_view payload) {
                     if (kind == beast::websocket::frame_type::ping) {
-                        spdlog::debug("收到 Ping，回复 Pong");
-                        beast::error_code ec;
-                        ws_stream.pong(payload, ec);
-                        if (ec) spdlog::warn("回复 Pong 失败: {}", ec.message());
+                        spdlog::debug("收到 Ping，未回复（依赖自动重连）");
                     }
                 });
-
-            // 等待一小段时间让订阅生效
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
             beast::flat_buffer buffer;
             while (keep_running) {
@@ -288,7 +281,6 @@ void run_detection() {
             for (auto& [sym, ctx] : contexts) {
                 if (ctx.indicators.is_stale(60000)) continue;
                 try {
-                    // 诊断：打印价格序列长度
                     if (ctx.indicators.prices().size() < 60) {
                         spdlog::info("{} 价格序列长度: {}", sym, ctx.indicators.prices().size());
                     }
