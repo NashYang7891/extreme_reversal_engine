@@ -25,12 +25,12 @@ ORDER_USDT = 30.0
 MAX_ACTIVE_ORDERS = 5
 
 # ---------- 跟踪止盈参数（固定U数） ----------
-TRAIL_ACTIVE_PROFIT_U = 3.5       # 盈利超过3.5U激活跟踪
-TRAIL_CALLBACK_U = 1.5            # 回撤1.5U平仓
+TRAIL_ACTIVE_PROFIT_U = 3.5
+TRAIL_CALLBACK_U = 1.5
 
 # ---------- 延迟开仓参数 ----------
-DELAY_SECONDS = 900                # 15分钟 = 900秒
-PROFIT_THRESHOLD_PERCENT = 3.0     # 盈利需达到3%才开仓
+DELAY_SECONDS = 900                # 15分钟
+PROFIT_THRESHOLD_PERCENT = 3.0     # 盈利需达到3%
 
 positions = {}
 active_a_orders = {}
@@ -53,6 +53,7 @@ API_FAIL_THRESHOLD = 5
 api_pause_until = 0
 PAUSE_MINUTES = 10
 
+# ------------------------- 辅助函数 -------------------------
 def send_tg(msg):
     global LAST_TG_SEND
     now = time.time()
@@ -64,6 +65,18 @@ def send_tg(msg):
                       json={"chat_id": TG_CHAT, "text": msg, "parse_mode": "Markdown"}, timeout=8)
     except Exception as e:
         print(f"TG推送失败: {e}")
+
+def send_feedback_to_cpp(symbol, side, pnl_percent):
+    """通过命名管道向C++发送盈亏反馈（用于在线学习）"""
+    try:
+        fifo_path = "/tmp/quant_feedback"
+        if not os.path.exists(fifo_path):
+            os.mkfifo(fifo_path)
+        with open(fifo_path, 'w') as f:
+            msg = json.dumps({"symbol": symbol, "side": side, "pnl": pnl_percent})
+            f.write(msg + "\n")
+    except Exception as e:
+        print(f"反馈发送失败: {e}")
 
 def is_quiet_period():
     now = datetime.now(timezone.utc)
@@ -206,7 +219,6 @@ def place_order_ioc(symbol, side, price):
         return None, "API熔断暂停"
 
     order_price = price
-
     try:
         if not exchange.markets:
             exchange.load_markets()
@@ -371,6 +383,8 @@ def safe_close_position(symbol, side, reason=""):
             record_stop_loss(symbol)
         elif pnl_pct < 0 and reason.find("止损") >= 0:
             record_stop_loss(symbol)
+        # 平仓后也要反馈结果给C++学习
+        send_feedback_to_cpp(symbol, side, pnl_pct)
         if symbol in positions:
             del positions[symbol]
     except Exception as e:
@@ -399,6 +413,8 @@ def check_and_trail_positions():
                     last_pnl = 0
                 if last_pnl < 0:
                     record_stop_loss(sym)
+                # 反馈自动止损结果
+                send_feedback_to_cpp(sym, side, last_pnl)
             except:
                 pass
             del positions[sym]
@@ -441,6 +457,7 @@ def check_and_trail_positions():
                     send_tg(f"🛑 做空跟踪止盈平仓 {sym} @ {current_price:.6f} (回撤 {drawdown_u:.2f}U)")
                     safe_close_position(sym, 'SHORT', f"跟踪止盈回撤{drawdown_u:.2f}U")
 
+# ------------------------- 主函数 -------------------------
 def main():
     script_dir = os.path.dirname(os.path.abspath(__file__))
     engine_path = os.path.join(script_dir, "build", "engine")
@@ -455,7 +472,7 @@ def main():
         print(f"⚠ 加载市场失败: {e}")
 
     sync_positions_on_start()
-    send_tg("🤖 引擎已启动 | 杠杆5倍/30U | 跟踪止盈3.5/1.5U | 价格原价 | 延迟15分钟且盈利≥3%开仓")
+    send_tg("🤖 引擎已启动 | 杠杆5倍/30U | 跟踪止盈3.5/1.5U | 延迟15分钟+盈利≥3%开仓 | 在线学习反馈已启用")
 
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True, bufsize=1)
     main.last_trail_check = 0
@@ -506,14 +523,14 @@ def main():
                 print(f"🛑 挂单已满，拦截 {sym}")
                 continue
 
-            # --- 定义延迟开仓函数（15分钟后执行，加入盈利检查）---
+            # --- 定义延迟开仓函数（15分钟后执行）---
             def delayed_open(sym, side, price_derived, score, stop_loss, take_profit, msg_ts):
                 # 1. 检查信号是否过期（超过16分钟放弃）
                 if time.time() - msg_ts > DELAY_SECONDS + 60:
                     print(f"⏰ 延迟开仓超时 {sym} {side}，信号已过期")
                     return
 
-                # 2. 重新检查各项条件（15分钟内可能变化）
+                # 2. 重新检查条件（15分钟内可能变化）
                 if sym in positions:
                     print(f"⏰ 延迟开仓被跳过 {sym}：已有持仓")
                     return
@@ -530,7 +547,7 @@ def main():
                     print(f"⏰ 延迟开仓被跳过 {sym}：静默期")
                     return
 
-                # 3. 获取当前市价（使用最新成交价或盘口中值）
+                # 3. 获取当前市价
                 try:
                     ticker = exchange.fetch_ticker(sym)
                     current_price = ticker['last']
@@ -544,11 +561,13 @@ def main():
                 # 4. 计算理论盈利百分比
                 if side.upper() == 'LONG':
                     profit_pct = (current_price - price_derived) / price_derived * 100
-                else:  # SHORT
+                else:
                     profit_pct = (price_derived - current_price) / price_derived * 100
 
                 # 5. 判断是否满足盈利阈值
                 if profit_pct < PROFIT_THRESHOLD_PERCENT:
+                    # 放弃开仓 → 发送失败反馈给 C++ 学习
+                    send_feedback_to_cpp(sym, side, profit_pct)   # profit_pct 可能为负
                     tg_msg = (f"⏸️ {side.upper()} {sym} 评分:{score:.1f} 延迟15分钟放弃\n"
                               f"原价: {price_derived:.8f} 现价: {current_price:.8f}\n"
                               f"理论盈利: {profit_pct:.2f}% < {PROFIT_THRESHOLD_PERCENT}%")
@@ -556,7 +575,7 @@ def main():
                     print(tg_msg)
                     return
 
-                # 6. 执行开仓（使用原始价格 price_derived）
+                # 6. 满足条件，执行开仓（使用原始价格 price_derived）
                 actual_price, order_info = place_order(sym, side, price_derived)
                 if actual_price and order_info:
                     tg_msg = (f"🎯 {side.upper()} {sym} 评分:{score:.1f} (延迟15min)\n"
