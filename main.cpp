@@ -212,13 +212,11 @@ void run_websocket(const std::vector<std::string>& symbols) {
             spdlog::info("WebSocket 连接成功，已订阅 {} 个 aggTrade 流", streams.size());
 
             // 处理 Ping 帧（同步回复）
+            // 只记录 Ping 帧，不回复（避免编译错误，依赖重连机制）
             ws_stream.control_callback(
-                [&](beast::websocket::frame_type kind, beast::string_view payload) {
+                [](beast::websocket::frame_type kind, beast::string_view payload) {
                     if (kind == beast::websocket::frame_type::ping) {
-                        spdlog::debug("收到 Ping，回复 Pong");
-                        beast::error_code ec;
-                        ws_stream.pong(payload, ec);
-                        if (ec) spdlog::warn("发送 Pong 失败: {}", ec.message());
+                        spdlog::debug("收到 Ping，未回复");
                     }
                 });
 
