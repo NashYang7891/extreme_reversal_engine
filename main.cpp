@@ -135,6 +135,9 @@ void process_json_msg(const json& msg) {
     std::string stream = msg["stream"];
     auto& data = msg["data"];
 
+    // 诊断：打印收到的消息流名称
+    spdlog::info("收到消息: stream={}", stream);
+
     size_t pos = stream.find('@');
     if (pos == std::string::npos) return;
     std::string sym = stream.substr(0, pos);
@@ -212,8 +215,7 @@ void run_websocket(const std::vector<std::string>& symbols) {
             ws_stream.write(net::buffer(sub_msg.dump()));
             spdlog::info("WebSocket 连接成功，已订阅 {} 个 aggTrade 流", streams.size());
 
-            // 处理 Ping 帧（同步回复）
-            // 只记录 Ping 帧，不回复（避免编译错误，依赖重连机制）
+            // 处理 Ping 帧（只记录，不回复）
             ws_stream.control_callback(
                 [](beast::websocket::frame_type kind, beast::string_view payload) {
                     if (kind == beast::websocket::frame_type::ping) {
@@ -280,6 +282,11 @@ void run_detection() {
             for (auto& [sym, ctx] : contexts) {
                 if (ctx.indicators.is_stale(60000)) continue;
                 try {
+                    // 诊断：打印价格序列长度
+                    if (ctx.indicators.prices().size() < 60) {
+                        spdlog::info("{} 价格序列长度: {}", sym, ctx.indicators.prices().size());
+                    }
+
                     double change_pct = 0.0, vol_ratio = 0.0;
                     if (active_layer(ctx.orderbook, ctx.indicators, change_pct, vol_ratio)) {
                         ctx.last_active_time = now_ms;
@@ -362,6 +369,7 @@ int main() {
     std::cout.setf(std::ios::unitbuf);
 
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
+    spdlog::set_level(spdlog::level::debug);  // 启用 debug 级别日志
     spdlog::info(">>> 极端反转引擎 [纯成交数据 + 在线学习] 启动...");
 
     auto symbols = fetch_top_symbols(100, 80000000.0);
