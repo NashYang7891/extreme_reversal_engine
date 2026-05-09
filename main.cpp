@@ -361,7 +361,7 @@ void run_detection() {
                         auto sig = ctx.detector.check(ctx.orderbook);
                         if (sig.valid) {
                             // ---------- 成交指标过滤（阈值可调） ----------
-                            bool metrics_ok = false;
+                            bool metrics_ok = true;
                             if (sig.side == "LONG") {
                                 // 做多：主动买笔数 > 20 且 大单占比 > 0.05（放宽至5%）
                                 if (ctx.active_buy_count > 20 && ctx.large_buy_ratio > 0.05) {
