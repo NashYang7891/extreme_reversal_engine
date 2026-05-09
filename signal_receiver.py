@@ -24,13 +24,11 @@ LEVERAGE = 5
 ORDER_USDT = 30.0
 MAX_ACTIVE_ORDERS = 5
 
-# ---------- 跟踪止盈参数（固定U数） ----------
 TRAIL_ACTIVE_PROFIT_U = 3.5
 TRAIL_CALLBACK_U = 1.5
 
-# ---------- 延迟开仓参数 ----------
-DELAY_SECONDS = 900                # 15分钟
-PROFIT_THRESHOLD_PERCENT = 3.0     # 盈利需达到3%
+DELAY_SECONDS = 900
+PROFIT_THRESHOLD_PERCENT = 3.0
 
 positions = {}
 active_a_orders = {}
@@ -67,14 +65,17 @@ def send_tg(msg):
         print(f"TG推送失败: {e}")
 
 def send_feedback_to_cpp(symbol, side, pnl_percent):
-    """通过命名管道向C++发送盈亏反馈（用于在线学习）"""
+    """非阻塞写入反馈管道，避免因C++未读取而阻塞"""
     try:
         fifo_path = "/tmp/quant_feedback"
         if not os.path.exists(fifo_path):
             os.mkfifo(fifo_path)
-        with open(fifo_path, 'w') as f:
-            msg = json.dumps({"symbol": symbol, "side": side, "pnl": pnl_percent})
-            f.write(msg + "\n")
+        fd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
+        msg = json.dumps({"symbol": symbol, "side": side, "pnl": pnl_percent}) + "\n"
+        os.write(fd, msg.encode())
+        os.close(fd)
+    except BlockingIOError:
+        pass  # 管道满，丢弃反馈
     except Exception as e:
         print(f"反馈发送失败: {e}")
 
@@ -203,8 +204,15 @@ def _force_clear_all(symbol):
         print(f"⚠ 清空 {symbol} 挂单失败: {e}")
         return False
 
-# ---------- IOC 下单（价格完全按照信号，不做任何调整） ----------
+# ---------- IOC 下单（超级健壮） ----------
 def place_order_ioc(symbol, side, price):
+    if price is None:
+        return None, "价格为 None"
+    try:
+        order_price = float(price)
+    except (TypeError, ValueError) as e:
+        return None, f"价格无效: {price} -> {e}"
+
     side = side.lower()
     if side == "long": side = "buy"
     elif side == "short": side = "sell"
@@ -218,47 +226,39 @@ def place_order_ioc(symbol, side, price):
     if time.time() < api_pause_until:
         return None, "API熔断暂停"
 
-    order_price = price
-    # 用于调试的变量
-    step_size = 0.001
-    min_notional = 5.0
-    step_size_str_debug = None
-    raw_amount = 0.0
-    amount_str = ""
-
     try:
         if not exchange.markets:
             exchange.load_markets()
-
         market = exchange.market(symbol)
 
-        # 安全获取最小名义价值
         min_notional = 5.0
-        if market.get('limits') and market['limits'].get('cost'):
-            min_val = market['limits']['cost'].get('min')
-            if min_val is not None:
-                try:
-                    min_notional = float(min_val)
-                except (TypeError, ValueError) as conv_e:
-                    print(f"⚠️ {symbol} min_notional 转换失败: {min_val}, 错误: {conv_e}, 使用默认5.0")
+        try:
+            limits = market.get('limits')
+            if limits and 'cost' in limits:
+                cost_limits = limits['cost']
+                if cost_limits and cost_limits.get('min') is not None:
+                    min_notional = float(cost_limits['min'])
+        except Exception:
+            pass
 
-        # 安全获取步长
         step_size = 0.001
-        if market.get('precision') and market['precision'].get('amount'):
-            step_size = market['precision']['amount']
-        else:
-            filters = market.get('info', {}).get('filters', [])
-            lot_filter = next((f for f in filters if f.get('filterType') == 'LOT_SIZE'), {})
-            step_size_str_debug = lot_filter.get('stepSize')
-            if step_size_str_debug is not None:
-                try:
-                    step_size = float(step_size_str_debug)
-                except (TypeError, ValueError) as conv_e:
-                    print(f"⚠️ {symbol} stepSize 转换失败: {step_size_str_debug}, 错误: {conv_e}, 使用默认0.001")
+        try:
+            if market.get('precision') and market['precision'].get('amount') is not None:
+                step_size = market['precision']['amount']
             else:
-                print(f"⚠️ {symbol} stepSize 为 None，使用默认0.001")
+                filters = market.get('info', {}).get('filters', [])
+                for f in filters:
+                    if f.get('filterType') == 'LOT_SIZE':
+                        step_str = f.get('stepSize')
+                        if step_str is not None:
+                            step_size = float(step_str)
+                            break
+        except Exception:
+            pass
 
         order_price_str = exchange.price_to_precision(symbol, order_price)
+        if order_price_str is None:
+            return None, "price_to_precision 返回 None"
 
         desired_notional = ORDER_USDT * LEVERAGE
         if desired_notional < min_notional:
@@ -266,13 +266,15 @@ def place_order_ioc(symbol, side, price):
             print(f"⚠️ {symbol} 名义价值上调至 {min_notional} USDT")
 
         raw_amount = desired_notional / order_price
-        # 步长取整
-        raw_amount = (raw_amount // step_size) * step_size
+        if step_size > 0:
+            raw_amount = (raw_amount // step_size) * step_size
         amount_str = exchange.amount_to_precision(symbol, raw_amount)
+        if amount_str is None:
+            return None, "amount_to_precision 返回 None"
 
         final_notional = float(amount_str) * order_price
         if final_notional < min_notional - 1e-9:
-            return None, f"调整后名义价值 {final_notional:.2f} 仍低于最小限制 {min_notional}"
+            return None, f"名义价值 {final_notional:.2f} 低于最小限制 {min_notional}"
 
         exchange.set_leverage(LEVERAGE, symbol)
         exchange.set_margin_mode('isolated', symbol)
@@ -308,13 +310,7 @@ def place_order_ioc(symbol, side, price):
         return None, f"无交易权限: {e}"
     except Exception as e:
         err_msg = str(e)[:200]
-        # 详细调试信息
-        debug_info = (
-            f"symbol={symbol}, side={side}, price={price}, order_price={order_price}, "
-            f"step_size={step_size}, min_notional={min_notional}, step_size_str={step_size_str_debug}, "
-            f"raw_amount={raw_amount}, amount_str={amount_str}"
-        )
-        print(f"❌ 下单异常 {symbol}: {err_msg}\n调试信息: {debug_info}")
+        print(f"❌ 下单异常 {symbol}: {err_msg}")
         return None, err_msg
 
 def place_order(symbol, side, price):
@@ -410,7 +406,6 @@ def safe_close_position(symbol, side, reason=""):
             record_stop_loss(symbol)
         elif pnl_pct < 0 and reason.find("止损") >= 0:
             record_stop_loss(symbol)
-        # 平仓后也要反馈结果给C++学习
         send_feedback_to_cpp(symbol, side, pnl_pct)
         if symbol in positions:
             del positions[symbol]
@@ -440,7 +435,6 @@ def check_and_trail_positions():
                     last_pnl = 0
                 if last_pnl < 0:
                     record_stop_loss(sym)
-                # 反馈自动止损结果
                 send_feedback_to_cpp(sym, side, last_pnl)
             except:
                 pass
@@ -508,10 +502,12 @@ def main():
         line = line.strip()
         if not line: continue
         if "ML:" in line or "成功率" in line:
-           # 发送学习结果到 TG
-           send_tg(f"🧠 {line.strip()}")
-        try: msg = json.loads(line)
-        except: print("C++:", line); continue
+            send_tg(f"🧠 {line.strip()}")
+        try:
+            msg = json.loads(line)
+        except:
+            print("C++:", line)
+            continue
 
         now = time.time()
         if now - main.last_trail_check > 30:
@@ -535,11 +531,18 @@ def main():
             msg_ts = msg.get("timestamp", 0)
             side = msg.get("side", "")
             price_derived = msg.get("price", 0)
+            if price_derived is None:
+                print(f"⚠️ {sym} 信号价格 field 为 None，跳过")
+                continue
+            try:
+                price_derived = float(price_derived)
+            except (TypeError, ValueError):
+                print(f"⚠️ {sym} 信号价格无效: {price_derived}，跳过")
+                continue
             score = msg.get("score", 0)
             stop_loss = msg.get("stop_loss", 0)
             take_profit = msg.get("take_profit", 0)
 
-            # 基本过滤条件（立即检查，避免无效定时器）
             if sym in last_b_signal and time.time() - last_b_signal[sym] < 600:
                 continue
             if is_quiet_period():
@@ -553,82 +556,77 @@ def main():
                 print(f"🛑 挂单已满，拦截 {sym}")
                 continue
 
-            # --- 定义延迟开仓函数（15分钟后执行）---
+            # 延迟开仓函数（外层增加异常捕获）
             def delayed_open(sym, side, price_derived, score, stop_loss, take_profit, msg_ts):
-                # 1. 检查信号是否过期（超过16分钟放弃）
-                if time.time() - msg_ts > DELAY_SECONDS + 60:
-                    print(f"⏰ 延迟开仓超时 {sym} {side}，信号已过期")
-                    return
-
-                # 2. 重新检查条件（15分钟内可能变化）
-                if sym in positions:
-                    print(f"⏰ 延迟开仓被跳过 {sym}：已有持仓")
-                    return
-                if is_blacklisted(sym):
-                    print(f"⏰ 延迟开仓被跳过 {sym}：死亡开关")
-                    return
-                if is_against_trend(sym, side):
-                    print(f"⏰ 延迟开仓被跳过 {sym}：逆趋势")
-                    return
-                if len(active_a_orders) >= MAX_ACTIVE_ORDERS:
-                    print(f"⏰ 延迟开仓被跳过 {sym}：挂单已满")
-                    return
-                if is_quiet_period():
-                    print(f"⏰ 延迟开仓被跳过 {sym}：静默期")
-                    return
-
-                # 3. 获取当前市价
                 try:
-                    ticker = exchange.fetch_ticker(sym)
-                    current_price = ticker['last']
-                    if not current_price:
-                        print(f"⏰ 延迟开仓失败 {sym}：无法获取当前价格")
+                    if time.time() - msg_ts > DELAY_SECONDS + 60:
+                        print(f"⏰ 延迟开仓超时 {sym} {side}，信号已过期")
                         return
+                    if sym in positions:
+                        print(f"⏰ 延迟开仓被跳过 {sym}：已有持仓")
+                        return
+                    if is_blacklisted(sym):
+                        print(f"⏰ 延迟开仓被跳过 {sym}：死亡开关")
+                        return
+                    if is_against_trend(sym, side):
+                        print(f"⏰ 延迟开仓被跳过 {sym}：逆趋势")
+                        return
+                    if len(active_a_orders) >= MAX_ACTIVE_ORDERS:
+                        print(f"⏰ 延迟开仓被跳过 {sym}：挂单已满")
+                        return
+                    if is_quiet_period():
+                        print(f"⏰ 延迟开仓被跳过 {sym}：静默期")
+                        return
+
+                    try:
+                        ticker = exchange.fetch_ticker(sym)
+                        current_price = ticker['last']
+                        if not current_price:
+                            print(f"⏰ 延迟开仓失败 {sym}：无法获取当前价格")
+                            return
+                    except Exception as e:
+                        print(f"⏰ 延迟开仓失败 {sym}：获取价格异常 {e}")
+                        return
+
+                    if side.upper() == 'LONG':
+                        profit_pct = (current_price - price_derived) / price_derived * 100
+                    else:
+                        profit_pct = (price_derived - current_price) / price_derived * 100
+
+                    if profit_pct < PROFIT_THRESHOLD_PERCENT:
+                        send_feedback_to_cpp(sym, side, profit_pct)
+                        tg_msg = (f"⏸️ {side.upper()} {sym} 评分:{score:.1f} 延迟15分钟放弃\n"
+                                  f"原价: {price_derived:.8f} 现价: {current_price:.8f}\n"
+                                  f"理论盈利: {profit_pct:.2f}% < {PROFIT_THRESHOLD_PERCENT}%")
+                        send_tg(tg_msg)
+                        print(tg_msg)
+                        return
+
+                    actual_price, order_info = place_order(sym, side, price_derived)
+                    if actual_price and order_info:
+                        tg_msg = (f"🎯 {side.upper()} {sym} 评分:{score:.1f} (延迟15min)\n"
+                                  f"✅ 成交: {actual_price:.8f}\n"
+                                  f"原信号价: {price_derived:.8f}\n"
+                                  f"🛑 止损: {stop_loss:.8f} | 🎯 止盈: {take_profit:.8f}")
+                        send_tg(tg_msg)
+                        update_positions_after_fill(sym, side, actual_price, order_info, stop_loss)
+                    else:
+                        reason = order_info or "未知"
+                        tg_msg = (f"⚠ {side.upper()} {sym} 评分:{score:.1f} (延迟15min)\n"
+                                  f"📛 未成交: {reason}\n"
+                                  f"原价: {price_derived:.8f}")
+                        send_tg(tg_msg)
                 except Exception as e:
-                    print(f"⏰ 延迟开仓失败 {sym}：获取价格异常 {e}")
-                    return
+                    err_msg = f"delayed_open 异常: {sym} {side} {e}"
+                    print(err_msg)
+                    send_tg(f"⚠️ {err_msg}")
 
-                # 4. 计算理论盈利百分比
-                if side.upper() == 'LONG':
-                    profit_pct = (current_price - price_derived) / price_derived * 100
-                else:
-                    profit_pct = (price_derived - current_price) / price_derived * 100
-
-                # 5. 判断是否满足盈利阈值
-                if profit_pct < PROFIT_THRESHOLD_PERCENT:
-                    # 放弃开仓 → 发送失败反馈给 C++ 学习
-                    send_feedback_to_cpp(sym, side, profit_pct)   # profit_pct 可能为负
-                    tg_msg = (f"⏸️ {side.upper()} {sym} 评分:{score:.1f} 延迟15分钟放弃\n"
-                              f"原价: {price_derived:.8f} 现价: {current_price:.8f}\n"
-                              f"理论盈利: {profit_pct:.2f}% < {PROFIT_THRESHOLD_PERCENT}%")
-                    send_tg(tg_msg)
-                    print(tg_msg)
-                    return
-
-                # 6. 满足条件，执行开仓（使用原始价格 price_derived）
-                actual_price, order_info = place_order(sym, side, price_derived)
-                if actual_price and order_info:
-                    tg_msg = (f"🎯 {side.upper()} {sym} 评分:{score:.1f} (延迟15min)\n"
-                              f"✅ 成交: {actual_price:.8f}\n"
-                              f"原信号价: {price_derived:.8f}\n"
-                              f"🛑 止损: {stop_loss:.8f} | 🎯 止盈: {take_profit:.8f}")
-                    send_tg(tg_msg)
-                    update_positions_after_fill(sym, side, actual_price, order_info, stop_loss)
-                else:
-                    reason = order_info or "未知"
-                    tg_msg = (f"⚠ {side.upper()} {sym} 评分:{score:.1f} (延迟15min)\n"
-                              f"📛 未成交: {reason}\n"
-                              f"原价: {price_derived:.8f}")
-                    send_tg(tg_msg)
-
-            # 启动15分钟定时器
             timer = threading.Timer(DELAY_SECONDS, delayed_open,
                                     args=(sym, side, price_derived, score,
                                           stop_loss, take_profit, msg_ts))
             timer.daemon = True
             timer.start()
 
-            # 发送提示，并记录最后一次信号时间（防止重复信号）
             send_tg(f"⏳ {side.upper()} {sym} 评分:{score:.1f}，15分钟后检查盈利≥{PROFIT_THRESHOLD_PERCENT}% 才开仓\n原价: {price_derived:.8f}")
             last_b_signal[sym] = time.time()
 
