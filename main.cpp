@@ -99,6 +99,11 @@ struct SymbolContext {
     double lowest_since_reset = std::numeric_limits<double>::max();
     int consecutive_highs = 0;
     int consecutive_lows = 0;
+    // 来自 trade_metrics 的指标
+    std::atomic<int> active_buy_count{0};
+    std::atomic<double> large_buy_ratio{0.0};
+    std::atomic<double> active_buy_ratio{0.0};
+    std::atomic<int64_t> last_metrics_time{0};
 };
 
 std::map<std::string, SymbolContext> contexts;
@@ -262,6 +267,49 @@ void feedback_listener() {
     }
 }
 
+void trade_metrics_reader() {
+    const char* pipe_path = "/tmp/trade_metrics_pipe";
+    while (keep_running) {
+        int fd = open(pipe_path, O_RDONLY);
+        if (fd == -1) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            continue;
+        }
+        char buf[4096];
+        while (keep_running) {
+            int n = read(fd, buf, sizeof(buf)-1);
+            if (n > 0) {
+                buf[n] = '\0';
+                std::string data(buf);
+                size_t pos = 0;
+                while ((pos = data.find('\n')) != std::string::npos) {
+                    std::string line = data.substr(0, pos);
+                    data.erase(0, pos+1);
+                    try {
+                        json j = json::parse(line);
+                        std::string sym = j["symbol"];
+                        int act_buy = j["active_buy_count"];
+                        double large_ratio = j["large_buy_ratio"];
+                        double buy_ratio = j["active_buy_ratio"];
+                        std::shared_lock lock(contexts_mutex);
+                        auto it = contexts.find(sym);
+                        if (it != contexts.end()) {
+                            it->second.active_buy_count = act_buy;
+                            it->second.large_buy_ratio = large_ratio;
+                            it->second.active_buy_ratio = buy_ratio;
+                            it->second.last_metrics_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch()).count();
+                        }
+                    } catch (...) {}
+                }
+            } else if (n == 0) {
+                break;
+            }
+        }
+        close(fd);
+    }
+}
+
 void run_detection() {
     while (keep_running) {
         auto start = std::chrono::steady_clock::now();
@@ -296,7 +344,10 @@ void run_detection() {
 
                     int64_t last_active = ctx.last_active_time.load();
                     if (last_active > 0 && (now_ms - last_active) < 15*60*1000) {
-                        auto sig = ctx.detector.check(ctx.orderbook);
+                        int act_buy = ctx.active_buy_count.load();
+                        double large_ratio = ctx.large_buy_ratio.load();
+                        double buy_ratio = ctx.active_buy_ratio.load();
+                        auto sig = ctx.detector.check(ctx.orderbook, act_buy, large_ratio, buy_ratio);
                         if (sig.valid) {
                             if (sig.side == "LONG" && ctx.last_active_change.load() > -0.025)
                                 continue;
@@ -356,7 +407,7 @@ int main() {
 
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
     spdlog::set_level(spdlog::level::info);
-    spdlog::info(">>> 极端反转引擎 [深度流+中间价+在线学习] 启动...");
+    spdlog::info(">>> 极端反转引擎 [深度流+中间价+在线学习+成交指标] 启动...");
 
     auto symbols = fetch_top_symbols(100, 80000000.0);
     {
@@ -369,7 +420,8 @@ int main() {
     std::thread ws_thread(run_websocket, symbols);
     std::thread detect_thread(run_detection);
     std::thread feedback_thread(feedback_listener);
-    spdlog::info("✅ 所有线程已启动 (深度流 + 在线学习)");
+    std::thread metrics_thread(trade_metrics_reader);
+    spdlog::info("✅ 所有线程已启动 (深度流 + 在线学习 + 成交指标)");
 
     while (keep_running) {
         std::this_thread::sleep_for(std::chrono::seconds(30));
@@ -379,5 +431,6 @@ int main() {
     if (ws_thread.joinable()) ws_thread.join();
     if (detect_thread.joinable()) detect_thread.join();
     if (feedback_thread.joinable()) feedback_thread.join();
+    if (metrics_thread.joinable()) metrics_thread.join();
     return 0;
 }

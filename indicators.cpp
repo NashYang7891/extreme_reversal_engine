@@ -11,7 +11,12 @@ void Indicators::update(double price) {
     prices_.push_back(price);
     if (prices_.size() > max_size_) prices_.pop_front();
     update_ema();
-
+    // 计算 ATR 并存储历史
+    if (prices_.size() > 14) {
+        double atr_val = atr(14);
+        atr_history_.push_back(atr_val);
+        if (atr_history_.size() > 200) atr_history_.pop_front();
+    }
     auto now = std::chrono::system_clock::now().time_since_epoch();
     last_update_ms = std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
 }
@@ -27,9 +32,17 @@ double Indicators::atr(int period) const {
     if (prices_.size() < static_cast<size_t>(period + 1)) return 0.0;
     double sum = 0.0;
     size_t start = prices_.size() - period;
-    for (size_t i = start; i < prices_.size(); ++i) {
+    for (size_t i = start; i < prices_.size(); ++i)
         sum += std::abs(prices_[i] - prices_[i-1]);
-    }
+    return sum / period;
+}
+
+double Indicators::atr_ma(int period) const {
+    if (atr_history_.size() < static_cast<size_t>(period)) return atr(14); // 回退
+    double sum = 0.0;
+    auto it = atr_history_.rbegin();
+    for (int i = 0; i < period && it != atr_history_.rend(); ++i, ++it)
+        sum += *it;
     return sum / period;
 }
 
@@ -42,14 +55,12 @@ double Indicators::rsi(int period) const {
         if (diff > 0) gain += diff;
         else if (diff < 0) loss -= diff;
     }
-    double avg_gain = gain / period;
-    double avg_loss = loss / period;
+    double avg_gain = gain / period, avg_loss = loss / period;
     if (avg_loss == 0.0) return 100.0;
     double rs = avg_gain / avg_loss;
     return 100.0 - (100.0 / (1.0 + rs));
 }
 
-// 纯计算 KDJ 的 J 值（不保存状态，避免 const 问题）
 double Indicators::kdj_j(int period) const {
     if (prices_.size() < static_cast<size_t>(period)) return 50.0;
     auto start = prices_.end() - period;
@@ -57,10 +68,7 @@ double Indicators::kdj_j(int period) const {
     double high = *std::max_element(start, prices_.end());
     if (high == low) return 50.0;
     double rsv = (prices_.back() - low) / (high - low) * 100.0;
-    // 由于不保存状态，这里简单用 rsv 代替 J 值（实际 J=3K-2D，但 K/D 需要历史）
-    // 为了简化且不引入状态，直接返回 rsv（与 K 值类似）—— 这已足够用于振荡器
-    double k = rsv;      // 近似，忽略平滑
-    double d = k;        // 近似
+    double k = rsv, d = rsv;
     return 3.0 * k - 2.0 * d;
 }
 
@@ -77,24 +85,20 @@ double Indicators::cci(int period) const {
 }
 
 double Indicators::composite_oscillator(double w_rsi, double w_kdj, double w_cci) const {
-    double r = rsi(14) / 100.0;          // RSI 归一化 0~1
-    double k = kdj_j(9) / 100.0;         // KDJ J 值归一化
-    double c = (cci(20) + 200.0) / 400.0; // CCI 通常 -200~200 映射到 0~1
-    // 边界裁剪
-    r = std::clamp(r, 0.0, 1.0);
-    k = std::clamp(k, 0.0, 1.0);
-    c = std::clamp(c, 0.0, 1.0);
+    double r = std::clamp(rsi(14) / 100.0, 0.0, 1.0);
+    double k = std::clamp(kdj_j(9) / 100.0, 0.0, 1.0);
+    double c = std::clamp((cci(20) + 200.0) / 400.0, 0.0, 1.0);
     return w_rsi * r + w_kdj * k + w_cci * c;
 }
 
 double Indicators::price_change_pct(int window_sec, int offset_sec) const {
-    if (prices_.size() < static_cast<size_t>(window_sec + offset_sec + 1)) return 0.0;
-    size_t cur_idx = prices_.size() - 1 - offset_sec;
-    size_t prev_idx = cur_idx - window_sec;
-    if (prev_idx >= prices_.size()) return 0.0;
-    double prev = prices_[prev_idx];
-    if (prev == 0.0) return 0.0;
-    return (prices_[cur_idx] - prev) / prev;
+    size_t total = prices_.size();
+    if (total < static_cast<size_t>(window_sec + offset_sec + 1)) return 0.0;
+    size_t cur = total - 1 - offset_sec;
+    size_t prev = cur - window_sec;
+    double prev_price = prices_[prev];
+    if (prev_price == 0.0) return 0.0;
+    return (prices_[cur] - prev_price) / prev_price;
 }
 
 void Indicators::update_volume(double volume) {

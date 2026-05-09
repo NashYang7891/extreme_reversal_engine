@@ -15,7 +15,7 @@ struct Signal {
 class SignalDetector {
 public:
     SignalDetector(MLOptimizer& ml, Indicators& ind);
-    Signal check(const OrderBook& ob);
+    Signal check(const OrderBook& ob, int active_buy_count = 0, double large_buy_ratio = 0.0, double active_buy_ratio = 0.0);
 
 private:
     MLOptimizer& ml_;

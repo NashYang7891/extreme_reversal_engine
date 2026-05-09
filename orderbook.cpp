@@ -6,13 +6,11 @@ void OrderBook::update_depth(const json& data) {
     try {
         const json* bids_json = nullptr;
         const json* asks_json = nullptr;
-
         if (data.contains("b") && data.contains("a")) {
             bids_json = &data["b"];
             asks_json = &data["a"];
         } else if (data.contains("bids") && data.contains("asks")) {
-            bids.clear();
-            asks.clear();
+            bids.clear(); asks.clear();
             bids_json = &data["bids"];
             asks_json = &data["asks"];
         } else {
@@ -21,7 +19,6 @@ void OrderBook::update_depth(const json& data) {
                 spdlog::warn("无法识别的深度推送格式，已跳过");
             return;
         }
-
         if (bids_json) {
             for (auto& item : *bids_json) {
                 try {
@@ -83,8 +80,7 @@ double OrderBook::recent_volume(int window_ms) const {
     for (auto it = trades.rbegin(); it != trades.rend(); ++it) {
         if (now_ms - it->timestamp_ms <= window_ms)
             sum += it->volume;
-        else
-            break;
+        else break;
     }
     return sum;
 }

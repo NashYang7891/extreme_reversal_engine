@@ -22,7 +22,6 @@ private:
     std::deque<SignalRecord> history_;
     mutable std::mutex mutex_;
     std::deque<double> recent_scores;
-
     void optimize_weights();
     double compute_success_rate(const std::string& side, int lookback = 20) const;
 };

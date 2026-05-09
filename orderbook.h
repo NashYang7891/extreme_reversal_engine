@@ -11,9 +11,8 @@ using json = nlohmann::json;
 class OrderBook {
 public:
     OrderBook() = default;
-
     void update_depth(const json& data);
-    double micro_price() const;               // 返回中间价 (best_bid+best_ask)/2
+    double micro_price() const;               // (best_bid+best_ask)/2
     double imbalance() const;
     double best_bid() const;
     double best_ask() const;

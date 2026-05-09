@@ -29,13 +29,14 @@ void MLOptimizer::update_result(const std::string& side, double pnl_percent) {
     recent_scores.push_back(score);
     if (recent_scores.size() > 100) recent_scores.pop_front();
 
-    spdlog::info("ML: {} 结果 {:.2f}%, 新权重 R={:.3f} K={:.3f} C={:.3f}",
-                 side, pnl_percent, w_rsi_, w_kdj_, w_cci_);
+    double rate = compute_success_rate(side, 20);
+    spdlog::info("ML: {} 结果 {:.2f}%, 新权重 R={:.3f} K={:.3f} C={:.3f}, 成功率={:.1f}%",
+                 side, pnl_percent, w_rsi_, w_kdj_, w_cci_, rate*100);
 }
 
 double MLOptimizer::get_success_rate_adjustment(const std::string& side) const {
     double rate = compute_success_rate(side, 20);
-    double adj = 0.5 + rate; // 成功率50% → adj=1.0
+    double adj = 0.5 + rate;
     return std::clamp(adj, 0.5, 1.5);
 }
 
@@ -64,7 +65,6 @@ void MLOptimizer::optimize_weights() {
     }
     if (n == 0) return;
     avg_pnl /= n;
-
     if (avg_pnl < -0.5) {
         w_rsi_ *= 0.98; w_kdj_ *= 1.01; w_cci_ *= 1.01;
     } else if (avg_pnl > 1.0) {
@@ -72,7 +72,6 @@ void MLOptimizer::optimize_weights() {
     } else {
         w_rsi_ *= 0.995; w_kdj_ *= 1.002; w_cci_ *= 1.003;
     }
-
     double sum = w_rsi_ + w_kdj_ + w_cci_;
     if (sum > 0) {
         w_rsi_ /= sum; w_kdj_ /= sum; w_cci_ /= sum;

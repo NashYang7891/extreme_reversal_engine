@@ -507,6 +507,9 @@ def main():
     for line in proc.stdout:
         line = line.strip()
         if not line: continue
+        if "ML:" in line or "成功率" in line:
+           # 发送学习结果到 TG
+           send_tg(f"🧠 {line.strip()}")
         try: msg = json.loads(line)
         except: print("C++:", line); continue
 
