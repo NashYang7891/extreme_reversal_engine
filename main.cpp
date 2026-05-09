@@ -43,7 +43,6 @@ const std::vector<std::string> ULTIMATE_FALLBACK = {
 };
 
 std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 80000000.0) {
-    // 与之前相同，保持不变
     std::vector<std::pair<std::string, double>> tickers;
     CURL *curl = curl_easy_init();
     if (curl) {
@@ -101,7 +100,7 @@ struct SymbolContext {
     int consecutive_highs = 0;
     int consecutive_lows = 0;
 
-    // 新增：成交指标字段
+    // 成交指标
     std::atomic<int> active_buy_count{0};
     std::atomic<int> active_sell_count{0};
     std::atomic<double> large_buy_ratio{0.0};
@@ -113,7 +112,6 @@ std::map<std::string, SymbolContext> contexts;
 std::shared_mutex contexts_mutex;
 
 bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, double& out_vol_ratio) {
-    // 与之前相同，保持不变
     if (ind.prices().size() < 60) return false;
 
     double change_3m = ind.price_change_pct(3*60);
@@ -139,7 +137,6 @@ bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, doub
 }
 
 void process_json_msg(const json& msg) {
-    // 深度数据处理，与之前相同
     if (!msg.contains("stream") || !msg.contains("data")) return;
 
     std::string stream = msg["stream"];
@@ -183,7 +180,6 @@ void process_json_msg(const json& msg) {
 }
 
 void run_websocket(const std::vector<std::string>& symbols) {
-    // 与之前完全相同，保持深度流
     while (keep_running) {
         try {
             net::io_context ioc;
@@ -239,7 +235,7 @@ void run_websocket(const std::vector<std::string>& symbols) {
     }
 }
 
-// 新增：读取成交指标管道的线程
+// 读取成交指标管道
 void trade_metrics_reader() {
     const char* pipe_path = "/tmp/trade_metrics_pipe";
     while (keep_running) {
@@ -277,7 +273,8 @@ void trade_metrics_reader() {
                                 it->second.large_buy_ratio = large_ratio;
                                 it->second.active_buy_ratio = buy_ratio;
                                 it->second.last_metrics_time = ts;
-                                spdlog::debug("成交指标 {}: 主动买={}, 大单占比={:.2f}", sym, active_buy, large_ratio);
+                                spdlog::debug("成交指标 {}: 主动买={}, 大单比={:.2f}, 主动买比={:.2f}",
+                                              sym, active_buy, large_ratio, buy_ratio);
                             }
                         }
                     } catch (const std::exception& e) {
@@ -294,7 +291,6 @@ void trade_metrics_reader() {
 }
 
 void feedback_listener() {
-    // 与之前相同
     const char* fifo_path = "/tmp/quant_feedback";
     mkfifo(fifo_path, 0666);
     while (keep_running) {
@@ -339,22 +335,6 @@ void run_detection() {
             for (auto& [sym, ctx] : contexts) {
                 if (ctx.indicators.is_stale(60000)) continue;
                 try {
-                    // 可选：使用成交指标增强活跃层检测
-                    // 例如，如果主动买入笔数激增，可立即发送 A_ACTIVE
-                    if (ctx.active_buy_count > 30 && ctx.large_buy_ratio > 0.1) {
-                        // 发送一个特殊的 A_ACTIVE 消息
-                        json a_msg;
-                        a_msg["type"] = "A_ACTIVE";
-                        a_msg["symbol"] = sym;
-                        a_msg["current_price"] = ctx.indicators.price();
-                        a_msg["price"] = ctx.indicators.price();
-                        a_msg["change_pct"] = 0.0;
-                        a_msg["vol_ratio"] = 1.0;
-                        a_msg["timestamp"] = std::time(nullptr);
-                        a_msg["reason"] = "起爆点: 高频主动买入";
-                        std::cout << a_msg.dump() << std::endl;
-                    }
-
                     double change_pct = 0.0, vol_ratio = 0.0;
                     if (active_layer(ctx.orderbook, ctx.indicators, change_pct, vol_ratio)) {
                         ctx.last_active_time = now_ms;
@@ -380,6 +360,31 @@ void run_detection() {
                     if (last_active > 0 && (now_ms - last_active) < 15*60*1000) {
                         auto sig = ctx.detector.check(ctx.orderbook);
                         if (sig.valid) {
+                            // ---------- 成交指标过滤（阈值可调） ----------
+                            bool metrics_ok = false;
+                            if (sig.side == "LONG") {
+                                // 做多：主动买笔数 > 20 且 大单占比 > 0.05（放宽至5%）
+                                if (ctx.active_buy_count > 20 && ctx.large_buy_ratio > 0.05) {
+                                    metrics_ok = true;
+                                } else {
+                                    spdlog::info("[SIGNAL_REJECTED] {} LONG Filtered: BuyCount={}, LargeRatio={:.3f}",
+                                                 sym, ctx.active_buy_count.load(), ctx.large_buy_ratio.load());
+                                }
+                            } else { // SHORT
+                                // 做空：主动买入笔数 < 25 且 主动买入占比 < 0.55（放宽至55%）
+                                if (ctx.active_buy_count < 25 && ctx.active_buy_ratio < 0.55) {
+                                    metrics_ok = true;
+                                } else {
+                                    spdlog::info("[SIGNAL_REJECTED] {} SHORT Filtered: BuyCount={}, ActiveRatio={:.3f}",
+                                                 sym, ctx.active_buy_count.load(), ctx.active_buy_ratio.load());
+                                }
+                            }
+
+                            if (!metrics_ok) {
+                                // 不满足指标，丢弃信号，不推送
+                                continue;
+                            }
+                            // ---------- 原有信号方向检查 ----------
                             if (sig.side == "LONG" && ctx.last_active_change.load() > -0.025)
                                 continue;
                             if (sig.side == "SHORT" && ctx.last_active_change.load() < 0.012)
@@ -437,7 +442,7 @@ int main() {
     std::cout.setf(std::ios::unitbuf);
 
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
-    spdlog::set_level(spdlog::level::info);
+    spdlog::set_level(spdlog::level::info);  // 可改为 debug 查看指标值
     spdlog::info(">>> 极端反转引擎 [深度流+中间价+在线学习+成交指标] 启动...");
 
     auto symbols = fetch_top_symbols(100, 80000000.0);
@@ -451,7 +456,7 @@ int main() {
     std::thread ws_thread(run_websocket, symbols);
     std::thread detect_thread(run_detection);
     std::thread feedback_thread(feedback_listener);
-    std::thread metrics_thread(trade_metrics_reader);  // 新增
+    std::thread metrics_thread(trade_metrics_reader);
     spdlog::info("✅ 所有线程已启动 (深度流 + 在线学习 + 成交指标)");
 
     while (keep_running) {
