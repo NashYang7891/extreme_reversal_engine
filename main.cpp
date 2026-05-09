@@ -43,6 +43,7 @@ const std::vector<std::string> ULTIMATE_FALLBACK = {
 };
 
 std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 80000000.0) {
+    // 与之前相同，保持不变
     std::vector<std::pair<std::string, double>> tickers;
     CURL *curl = curl_easy_init();
     if (curl) {
@@ -99,8 +100,10 @@ struct SymbolContext {
     double lowest_since_reset = std::numeric_limits<double>::max();
     int consecutive_highs = 0;
     int consecutive_lows = 0;
-    // 来自 trade_metrics 的指标
+
+    // 新增：成交指标字段
     std::atomic<int> active_buy_count{0};
+    std::atomic<int> active_sell_count{0};
     std::atomic<double> large_buy_ratio{0.0};
     std::atomic<double> active_buy_ratio{0.0};
     std::atomic<int64_t> last_metrics_time{0};
@@ -110,6 +113,7 @@ std::map<std::string, SymbolContext> contexts;
 std::shared_mutex contexts_mutex;
 
 bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, double& out_vol_ratio) {
+    // 与之前相同，保持不变
     if (ind.prices().size() < 60) return false;
 
     double change_3m = ind.price_change_pct(3*60);
@@ -135,6 +139,7 @@ bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, doub
 }
 
 void process_json_msg(const json& msg) {
+    // 深度数据处理，与之前相同
     if (!msg.contains("stream") || !msg.contains("data")) return;
 
     std::string stream = msg["stream"];
@@ -178,6 +183,7 @@ void process_json_msg(const json& msg) {
 }
 
 void run_websocket(const std::vector<std::string>& symbols) {
+    // 与之前完全相同，保持深度流
     while (keep_running) {
         try {
             net::io_context ioc;
@@ -233,7 +239,62 @@ void run_websocket(const std::vector<std::string>& symbols) {
     }
 }
 
+// 新增：读取成交指标管道的线程
+void trade_metrics_reader() {
+    const char* pipe_path = "/tmp/trade_metrics_pipe";
+    while (keep_running) {
+        int fd = open(pipe_path, O_RDONLY);
+        if (fd == -1) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            continue;
+        }
+        char buf[4096];
+        std::string leftover;
+        while (keep_running) {
+            int n = read(fd, buf, sizeof(buf)-1);
+            if (n > 0) {
+                buf[n] = '\0';
+                std::string data = leftover + std::string(buf);
+                size_t pos = 0;
+                while ((pos = data.find('\n')) != std::string::npos) {
+                    std::string line = data.substr(0, pos);
+                    data.erase(0, pos+1);
+                    try {
+                        json j = json::parse(line);
+                        if (j.contains("symbol")) {
+                            std::string sym = j["symbol"];
+                            int active_buy = j.value("active_buy_count", 0);
+                            int active_sell = j.value("active_sell_count", 0);
+                            double large_ratio = j.value("large_buy_ratio", 0.0);
+                            double buy_ratio = j.value("active_buy_ratio", 0.0);
+                            int64_t ts = j.value("timestamp", 0LL);
+
+                            std::shared_lock lock(contexts_mutex);
+                            auto it = contexts.find(sym);
+                            if (it != contexts.end()) {
+                                it->second.active_buy_count = active_buy;
+                                it->second.active_sell_count = active_sell;
+                                it->second.large_buy_ratio = large_ratio;
+                                it->second.active_buy_ratio = buy_ratio;
+                                it->second.last_metrics_time = ts;
+                                spdlog::debug("成交指标 {}: 主动买={}, 大单占比={:.2f}", sym, active_buy, large_ratio);
+                            }
+                        }
+                    } catch (const std::exception& e) {
+                        spdlog::warn("成交指标解析失败: {}", e.what());
+                    }
+                }
+                leftover = data;
+            } else if (n == 0) {
+                break;
+            }
+        }
+        close(fd);
+    }
+}
+
 void feedback_listener() {
+    // 与之前相同
     const char* fifo_path = "/tmp/quant_feedback";
     mkfifo(fifo_path, 0666);
     while (keep_running) {
@@ -267,49 +328,6 @@ void feedback_listener() {
     }
 }
 
-void trade_metrics_reader() {
-    const char* pipe_path = "/tmp/trade_metrics_pipe";
-    while (keep_running) {
-        int fd = open(pipe_path, O_RDONLY);
-        if (fd == -1) {
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            continue;
-        }
-        char buf[4096];
-        while (keep_running) {
-            int n = read(fd, buf, sizeof(buf)-1);
-            if (n > 0) {
-                buf[n] = '\0';
-                std::string data(buf);
-                size_t pos = 0;
-                while ((pos = data.find('\n')) != std::string::npos) {
-                    std::string line = data.substr(0, pos);
-                    data.erase(0, pos+1);
-                    try {
-                        json j = json::parse(line);
-                        std::string sym = j["symbol"];
-                        int act_buy = j["active_buy_count"];
-                        double large_ratio = j["large_buy_ratio"];
-                        double buy_ratio = j["active_buy_ratio"];
-                        std::shared_lock lock(contexts_mutex);
-                        auto it = contexts.find(sym);
-                        if (it != contexts.end()) {
-                            it->second.active_buy_count = act_buy;
-                            it->second.large_buy_ratio = large_ratio;
-                            it->second.active_buy_ratio = buy_ratio;
-                            it->second.last_metrics_time = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                std::chrono::system_clock::now().time_since_epoch()).count();
-                        }
-                    } catch (...) {}
-                }
-            } else if (n == 0) {
-                break;
-            }
-        }
-        close(fd);
-    }
-}
-
 void run_detection() {
     while (keep_running) {
         auto start = std::chrono::steady_clock::now();
@@ -321,6 +339,22 @@ void run_detection() {
             for (auto& [sym, ctx] : contexts) {
                 if (ctx.indicators.is_stale(60000)) continue;
                 try {
+                    // 可选：使用成交指标增强活跃层检测
+                    // 例如，如果主动买入笔数激增，可立即发送 A_ACTIVE
+                    if (ctx.active_buy_count > 30 && ctx.large_buy_ratio > 0.1) {
+                        // 发送一个特殊的 A_ACTIVE 消息
+                        json a_msg;
+                        a_msg["type"] = "A_ACTIVE";
+                        a_msg["symbol"] = sym;
+                        a_msg["current_price"] = ctx.indicators.price();
+                        a_msg["price"] = ctx.indicators.price();
+                        a_msg["change_pct"] = 0.0;
+                        a_msg["vol_ratio"] = 1.0;
+                        a_msg["timestamp"] = std::time(nullptr);
+                        a_msg["reason"] = "起爆点: 高频主动买入";
+                        std::cout << a_msg.dump() << std::endl;
+                    }
+
                     double change_pct = 0.0, vol_ratio = 0.0;
                     if (active_layer(ctx.orderbook, ctx.indicators, change_pct, vol_ratio)) {
                         ctx.last_active_time = now_ms;
@@ -344,10 +378,7 @@ void run_detection() {
 
                     int64_t last_active = ctx.last_active_time.load();
                     if (last_active > 0 && (now_ms - last_active) < 15*60*1000) {
-                        int act_buy = ctx.active_buy_count.load();
-                        double large_ratio = ctx.large_buy_ratio.load();
-                        double buy_ratio = ctx.active_buy_ratio.load();
-                        auto sig = ctx.detector.check(ctx.orderbook, act_buy, large_ratio, buy_ratio);
+                        auto sig = ctx.detector.check(ctx.orderbook);
                         if (sig.valid) {
                             if (sig.side == "LONG" && ctx.last_active_change.load() > -0.025)
                                 continue;
@@ -420,7 +451,7 @@ int main() {
     std::thread ws_thread(run_websocket, symbols);
     std::thread detect_thread(run_detection);
     std::thread feedback_thread(feedback_listener);
-    std::thread metrics_thread(trade_metrics_reader);
+    std::thread metrics_thread(trade_metrics_reader);  // 新增
     spdlog::info("✅ 所有线程已启动 (深度流 + 在线学习 + 成交指标)");
 
     while (keep_running) {
