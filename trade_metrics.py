@@ -74,7 +74,6 @@ def main():
     pipe_path = "/tmp/trade_metrics_pipe"
     if not os.path.exists(pipe_path):
         os.mkfifo(pipe_path)
-    # 非阻塞打开管道
     pipe_fd = os.open(pipe_path, os.O_WRONLY | os.O_NONBLOCK)
 
     while True:
