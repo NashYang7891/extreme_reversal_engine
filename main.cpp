@@ -1,23 +1,36 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
-#include <iostream>
-#include <thread>
+
+#include <algorithm>
 #include <atomic>
-#include <map>
-#include <vector>
-#include <string>
+#include <cerrno>
 #include <chrono>
-#include <shared_mutex>
-#include <sys/stat.h>
+#include <cmath>
+#include <cstring>
+#include <ctime>
+#include <deque>
 #include <fcntl.h>
+#include <iostream>
+#include <limits>
+#include <map>
+#include <mutex>
+#include <shared_mutex>
+#include <string>
+#include <sys/stat.h>
+#include <thread>
+#include <tuple>
 #include <unistd.h>
+#include <utility>
+#include <vector>
+
 #include <curl/curl.h>
+
 #include "indicators.h"
 
 using json = nlohmann::json;
+
 std::atomic<bool> keep_running{true};
 
-// ---------- K线结构 ----------
 struct KLine {
     double open;
     double high;
@@ -28,25 +41,30 @@ struct KLine {
 
 class KLineManager {
 public:
-    KLineManager(int interval_sec) : interval_ms_(interval_sec * 1000) { resetCurrent(); }
+    explicit KLineManager(int interval_sec) : interval_ms_(interval_sec * 1000) { resetCurrent(); }
+
     void update(double price, int64_t now_ms) {
         if (current_.timestamp == 0) {
             current_.timestamp = (now_ms / interval_ms_) * interval_ms_;
             current_.open = current_.high = current_.low = current_.close = price;
-        } else {
-            int64_t kline_start = (now_ms / interval_ms_) * interval_ms_;
-            if (kline_start > current_.timestamp) {
-                completeKLine();
-                current_.timestamp = kline_start;
-                current_.open = current_.high = current_.low = current_.close = price;
-            } else {
-                current_.high = std::max(current_.high, price);
-                current_.low = std::min(current_.low, price);
-                current_.close = price;
-            }
+            return;
         }
+
+        int64_t kline_start = (now_ms / interval_ms_) * interval_ms_;
+        if (kline_start > current_.timestamp) {
+            completeKLine();
+            current_.timestamp = kline_start;
+            current_.open = current_.high = current_.low = current_.close = price;
+            return;
+        }
+
+        current_.high = std::max(current_.high, price);
+        current_.low = std::min(current_.low, price);
+        current_.close = price;
     }
+
     const std::deque<KLine>& getClosedKLines() const { return closed_lines_; }
+
 private:
     void completeKLine() {
         if (current_.timestamp != 0) {
@@ -55,306 +73,407 @@ private:
         }
         resetCurrent();
     }
-    void resetCurrent() { current_ = KLine{0,0,0,0,0}; }
+
+    void resetCurrent() { current_ = KLine{0, 0, 0, 0, 0}; }
+
     const int interval_ms_;
     KLine current_;
     std::deque<KLine> closed_lines_;
 };
 
-// ---------- 突破检测器 ----------
 class BreakoutDetector {
 public:
     static bool checkLong(const std::deque<KLine>& klines) {
         if (klines.size() < 5) return false;
+
         const KLine& curr = klines.back();
-        double max_close = 0;
-        for (size_t i = klines.size() - 5; i < klines.size() - 1; ++i)
+        double max_close = 0.0;
+        for (size_t i = klines.size() - 5; i < klines.size() - 1; ++i) {
             max_close = std::max(max_close, klines[i].close);
+        }
+
         bool cond1 = curr.close > max_close;
-        bool cond2 = (klines[klines.size()-3].close > klines[klines.size()-3].open) &&
-                     (klines[klines.size()-4].close > klines[klines.size()-4].open) &&
-                     (klines[klines.size()-5].close > klines[klines.size()-5].open);
+        bool cond2 = (klines[klines.size() - 3].close > klines[klines.size() - 3].open) &&
+                     (klines[klines.size() - 4].close > klines[klines.size() - 4].open) &&
+                     (klines[klines.size() - 5].close > klines[klines.size() - 5].open);
         return cond1 && cond2;
     }
+
     static bool checkShort(const std::deque<KLine>& klines) {
         if (klines.size() < 5) return false;
+
         const KLine& curr = klines.back();
         double min_close = std::numeric_limits<double>::max();
-        for (size_t i = klines.size() - 5; i < klines.size() - 1; ++i)
+        for (size_t i = klines.size() - 5; i < klines.size() - 1; ++i) {
             min_close = std::min(min_close, klines[i].close);
+        }
+
         bool cond1 = curr.close < min_close;
-        bool cond2 = (klines[klines.size()-3].close < klines[klines.size()-3].open) &&
-                     (klines[klines.size()-4].close < klines[klines.size()-4].open) &&
-                     (klines[klines.size()-5].close < klines[klines.size()-5].open);
+        bool cond2 = (klines[klines.size() - 3].close < klines[klines.size() - 3].open) &&
+                     (klines[klines.size() - 4].close < klines[klines.size() - 4].open) &&
+                     (klines[klines.size() - 5].close < klines[klines.size() - 5].open);
         return cond1 && cond2;
     }
 };
 
-// ---------- 上下文 ----------
 struct SymbolContext {
     Indicators indicators;
-    KLineManager kline_mgr{300};   // 5分钟K线
+    KLineManager kline_mgr{300};
     int64_t last_breakout_kline_ts{0};
-    // 活跃层相关
-    double last_a_price = 0.0;
-    int64_t last_a_time_ms = 0;
-    // 成交指标字段（可选）
+    double last_a_price{0.0};
+    int64_t last_a_time_ms{0};
     std::atomic<int> active_buy_count{0};
     std::atomic<double> large_buy_ratio{0.0};
     std::atomic<double> active_buy_ratio{0.0};
 };
+
 std::map<std::string, SymbolContext> contexts;
 std::shared_mutex contexts_mutex;
 
-// ---------- 价格管道读取线程（真实成交数据）----------
+bool open_read_fifo(const char* pipe_path, int& fd) {
+    mkfifo(pipe_path, 0666);
+    fd = open(pipe_path, O_RDONLY);
+    if (fd == -1) {
+        spdlog::warn("FIFO open failed [{}]: {}", pipe_path, std::strerror(errno));
+        sleep(1);
+        return false;
+    }
+    spdlog::info("FIFO reader connected [{}]", pipe_path);
+    return true;
+}
+
+bool read_fifo_chunk(int fd, const char* pipe_path, char* buf, size_t buf_size, ssize_t& n) {
+    n = read(fd, buf, buf_size - 1);
+    if (n > 0) {
+        buf[n] = '\0';
+        return true;
+    }
+
+    if (n == 0) {
+        spdlog::warn("FIFO writer disconnected [{}], reopening", pipe_path);
+        return false;
+    }
+
+    if (errno == EINTR) {
+        return true;
+    }
+
+    spdlog::warn("FIFO read failed [{}]: {}", pipe_path, std::strerror(errno));
+    return false;
+}
+
+double json_to_double(const json& value, double fallback = 0.0) {
+    try {
+        if (value.is_number()) return value.get<double>();
+        if (value.is_string()) return std::stod(value.get<std::string>());
+    } catch (const std::exception&) {
+    }
+    return fallback;
+}
+
 void price_pipe_reader() {
     const char* pipe_path = "/tmp/price_pipe";
     while (keep_running) {
-        int fd = open(pipe_path, O_RDONLY);
-        if (fd == -1) { sleep(1); continue; }
+        int fd = -1;
+        if (!open_read_fifo(pipe_path, fd)) continue;
+
         char buf[4096];
         std::string leftover;
         while (keep_running) {
-            int n = read(fd, buf, sizeof(buf)-1);
-            if (n > 0) {
-                buf[n] = '\0';
-                std::string data = leftover + std::string(buf);
-                size_t pos = 0;
-                while ((pos = data.find('\n')) != std::string::npos) {
-                    std::string line = data.substr(0, pos);
-                    data.erase(0, pos+1);
-                    try {
-                        json j = json::parse(line);
-                        std::string sym = j["symbol"];
-                        double price = j["price"];
-                        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            std::chrono::system_clock::now().time_since_epoch()).count();
-                        std::shared_lock lock(contexts_mutex);
-                        auto it = contexts.find(sym);
-                        if (it != contexts.end()) {
-                            it->second.indicators.update(price);
-                            it->second.kline_mgr.update(price, now_ms);
-                            // 活跃层检测：每收到一个价格就更新，但避免过于频繁；我们改用定时检查，这里只存储价格
-                            // 为了简单，我们在 run_detection 中检查价格变化百分比
-                        }
-                    } catch (...) {}
+            ssize_t n = 0;
+            if (!read_fifo_chunk(fd, pipe_path, buf, sizeof(buf), n)) break;
+            if (n <= 0) continue;
+
+            std::string data = leftover + std::string(buf, static_cast<size_t>(n));
+            size_t pos = 0;
+            while ((pos = data.find('\n')) != std::string::npos) {
+                std::string line = data.substr(0, pos);
+                data.erase(0, pos + 1);
+                if (line.empty()) continue;
+
+                try {
+                    json j = json::parse(line);
+                    if (!j.contains("symbol") || !j.contains("price")) continue;
+
+                    std::string sym = j.value("symbol", "");
+                    double price = json_to_double(j["price"]);
+                    if (sym.empty() || price <= 0.0) continue;
+
+                    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      std::chrono::system_clock::now().time_since_epoch())
+                                      .count();
+
+                    std::unique_lock<std::shared_mutex> lock(contexts_mutex);
+                    auto it = contexts.find(sym);
+                    if (it != contexts.end()) {
+                        it->second.indicators.update(price);
+                        it->second.kline_mgr.update(price, now_ms);
+                    }
+                } catch (const std::exception& e) {
+                    spdlog::warn("price_pipe bad message: {}", e.what());
                 }
-                leftover = data;
-            } else if (n == 0) break;
+            }
+
+            leftover = data;
+            if (leftover.size() > 8192) leftover.clear();
         }
+
         close(fd);
+        sleep(1);
     }
 }
 
-// ---------- 成交指标管道读取（可选）----------
 void trade_metrics_reader() {
     const char* pipe_path = "/tmp/trade_metrics_pipe";
     while (keep_running) {
-        int fd = open(pipe_path, O_RDONLY);
-        if (fd == -1) { sleep(1); continue; }
+        int fd = -1;
+        if (!open_read_fifo(pipe_path, fd)) continue;
+
         char buf[4096];
         std::string leftover;
         while (keep_running) {
-            int n = read(fd, buf, sizeof(buf)-1);
-            if (n > 0) {
-                buf[n] = '\0';
-                std::string data = leftover + std::string(buf);
-                size_t pos = 0;
-                while ((pos = data.find('\n')) != std::string::npos) {
-                    std::string line = data.substr(0, pos);
-                    data.erase(0, pos+1);
-                    try {
-                        json j = json::parse(line);
-                        if (j.contains("symbol")) {
-                            std::string sym = j["symbol"];
-                            int active_buy = j.value("active_buy_count", 0);
-                            double large_ratio = j.value("large_buy_ratio", 0.0);
-                            double buy_ratio = j.value("active_buy_ratio", 0.0);
-                            std::shared_lock lock(contexts_mutex);
-                            auto it = contexts.find(sym);
-                            if (it != contexts.end()) {
-                                it->second.active_buy_count = active_buy;
-                                it->second.large_buy_ratio = large_ratio;
-                                it->second.active_buy_ratio = buy_ratio;
-                            }
-                        }
-                    } catch (...) {}
+            ssize_t n = 0;
+            if (!read_fifo_chunk(fd, pipe_path, buf, sizeof(buf), n)) break;
+            if (n <= 0) continue;
+
+            std::string data = leftover + std::string(buf, static_cast<size_t>(n));
+            size_t pos = 0;
+            while ((pos = data.find('\n')) != std::string::npos) {
+                std::string line = data.substr(0, pos);
+                data.erase(0, pos + 1);
+                if (line.empty()) continue;
+
+                try {
+                    json j = json::parse(line);
+                    std::string sym = j.value("symbol", "");
+                    if (sym.empty()) continue;
+
+                    int active_buy = j.value("active_buy_count", 0);
+                    double large_ratio = j.value("large_buy_ratio", 0.0);
+                    double buy_ratio = j.value("active_buy_ratio", 0.0);
+
+                    std::unique_lock<std::shared_mutex> lock(contexts_mutex);
+                    auto it = contexts.find(sym);
+                    if (it != contexts.end()) {
+                        it->second.active_buy_count = active_buy;
+                        it->second.large_buy_ratio = large_ratio;
+                        it->second.active_buy_ratio = buy_ratio;
+                    }
+                } catch (const std::exception& e) {
+                    spdlog::warn("trade_metrics bad message: {}", e.what());
                 }
-                leftover = data;
-            } else if (n == 0) break;
+            }
+
+            leftover = data;
+            if (leftover.size() > 8192) leftover.clear();
         }
+
         close(fd);
+        sleep(1);
     }
 }
 
-// ---------- 反馈管道（预留）----------
 void feedback_listener() {
     const char* fifo_path = "/tmp/quant_feedback";
-    mkfifo(fifo_path, 0666);
     while (keep_running) {
-        int fd = open(fifo_path, O_RDONLY);
-        if (fd == -1) { sleep(1); continue; }
+        int fd = -1;
+        if (!open_read_fifo(fifo_path, fd)) continue;
+
         char buf[1024];
-        int n = read(fd, buf, sizeof(buf)-1);
-        if (n > 0) {
-            buf[n] = '\0';
-            try {
-                json j = json::parse(buf);
-                std::string sym = j.value("symbol", "");
-                std::string side = j.value("side", "");
-                double pnl = j.value("pnl", 0.0);
-                spdlog::info("反馈收到: {} {} 盈亏={:.2f}%", sym, side, pnl);
-                // 可扩展在线学习
-            } catch (...) {}
+        std::string leftover;
+        while (keep_running) {
+            ssize_t n = 0;
+            if (!read_fifo_chunk(fd, fifo_path, buf, sizeof(buf), n)) break;
+            if (n <= 0) continue;
+
+            std::string data = leftover + std::string(buf, static_cast<size_t>(n));
+            size_t pos = 0;
+            while ((pos = data.find('\n')) != std::string::npos) {
+                std::string line = data.substr(0, pos);
+                data.erase(0, pos + 1);
+                if (line.empty()) continue;
+
+                try {
+                    json j = json::parse(line);
+                    std::string sym = j.value("symbol", "");
+                    std::string side = j.value("side", "");
+                    double pnl = j.value("pnl", 0.0);
+                    spdlog::info("feedback received: {} {} pnl={:.2f}%", sym, side, pnl);
+                } catch (const std::exception& e) {
+                    spdlog::warn("feedback bad message: {}", e.what());
+                }
+            }
+
+            leftover = data;
+            if (leftover.size() > 8192) leftover.clear();
         }
+
         close(fd);
+        sleep(1);
     }
 }
 
-// ---------- 活跃层检测 ----------
 void check_active_layer(SymbolContext& ctx, const std::string& sym, int64_t now_ms) {
-    // 需要至少20个价格点才能计算变化
     if (ctx.indicators.prices().size() < 20) return;
+
     double cur_price = ctx.indicators.price();
-    // 计算3分钟价格变化百分比（使用3分钟前的价格）
-    double change_3m = ctx.indicators.price_change_pct(3*60);
-    if (std::abs(change_3m) < 0.005) return;   // 小于0.5%不发送
-    if (std::abs(change_3m) > 0.20) return;    // 大于20%可能是数据异常
-    // 发送 A_ACTIVE 消息（限制频率：每30秒最多一次）
+    double change_3m = ctx.indicators.price_change_pct(3 * 60);
+    if (std::abs(change_3m) < 0.005) return;
+    if (std::abs(change_3m) > 0.20) return;
     if (now_ms - ctx.last_a_time_ms < 30000) return;
+
     ctx.last_a_time_ms = now_ms;
+
     json a_msg;
     a_msg["type"] = "A_ACTIVE";
     a_msg["symbol"] = sym;
     a_msg["price"] = cur_price;
     a_msg["change_pct"] = change_3m * 100.0;
-    a_msg["vol_ratio"] = 1.0;  // 没有量比数据，可忽略
+    a_msg["vol_ratio"] = 1.0;
     a_msg["timestamp"] = std::time(nullptr);
-    // 可选偏离度（基于EMA20）
+
     double atr = ctx.indicators.atr();
     double ema20 = ctx.indicators.ema20();
     if (atr > 1e-9) {
         double dev = (ema20 - cur_price) / atr;
         if (std::abs(dev) < 50.0) a_msg["dev"] = dev;
     }
+
     std::cout << a_msg.dump() << std::endl;
 }
 
-// ---------- 信号检测循环（A层 + B层）----------
 void run_detection() {
     while (keep_running) {
         auto start = std::chrono::steady_clock::now();
-        {
-            std::shared_lock lock(contexts_mutex);
-            auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now().time_since_epoch()).count();
+        auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::system_clock::now().time_since_epoch())
+                          .count();
 
+        {
+            std::unique_lock<std::shared_mutex> lock(contexts_mutex);
             for (auto& [sym, ctx] : contexts) {
                 try {
-                    // 1. 活跃层检测
                     check_active_layer(ctx, sym, now_ms);
 
-                    // 2. K线突破信号检测
                     const auto& klines = ctx.kline_mgr.getClosedKLines();
-                    if (klines.size() >= 5) {
-                        int64_t curr_ts = klines.back().timestamp;
-                        if (curr_ts != ctx.last_breakout_kline_ts) {
-                            bool long_sig = BreakoutDetector::checkLong(klines);
-                            bool short_sig = BreakoutDetector::checkShort(klines);
-                            if (long_sig || short_sig) {
-                                ctx.last_breakout_kline_ts = curr_ts;
-                                json b_msg;
-                                b_msg["type"] = "SIGNAL";
-                                b_msg["symbol"] = sym;
-                                b_msg["side"] = long_sig ? "LONG" : "SHORT";
-                                b_msg["price"] = klines.back().close;
-                                b_msg["score"] = 100.0;
-                                b_msg["timestamp"] = std::time(nullptr);
-                                b_msg["current_price"] = ctx.indicators.price();
-                                b_msg["source"] = "BREAKOUT";
-                                double p = b_msg["price"];
-                                if (long_sig) {
-                                    b_msg["take_profit"] = p * 1.02;
-                                    b_msg["stop_loss"] = p * 0.98;
-                                } else {
-                                    b_msg["take_profit"] = p * 0.98;
-                                    b_msg["stop_loss"] = p * 1.02;
-                                }
-                                std::cout << b_msg.dump() << std::endl;
-                            }
-                        }
+                    if (klines.size() < 5) continue;
+
+                    int64_t curr_ts = klines.back().timestamp;
+                    if (curr_ts == ctx.last_breakout_kline_ts) continue;
+
+                    bool long_sig = BreakoutDetector::checkLong(klines);
+                    bool short_sig = BreakoutDetector::checkShort(klines);
+                    if (!long_sig && !short_sig) continue;
+
+                    ctx.last_breakout_kline_ts = curr_ts;
+
+                    json b_msg;
+                    b_msg["type"] = "SIGNAL";
+                    b_msg["symbol"] = sym;
+                    b_msg["side"] = long_sig ? "LONG" : "SHORT";
+                    b_msg["price"] = klines.back().close;
+                    b_msg["score"] = 100.0;
+                    b_msg["timestamp"] = std::time(nullptr);
+                    b_msg["current_price"] = ctx.indicators.price();
+                    b_msg["source"] = "BREAKOUT";
+
+                    double p = b_msg["price"];
+                    if (long_sig) {
+                        b_msg["take_profit"] = p * 1.02;
+                        b_msg["stop_loss"] = p * 0.98;
+                    } else {
+                        b_msg["take_profit"] = p * 0.98;
+                        b_msg["stop_loss"] = p * 1.02;
                     }
+
+                    std::cout << b_msg.dump() << std::endl;
                 } catch (const std::exception& e) {
-                    spdlog::warn("检测异常 [{}]: {}", sym, e.what());
+                    spdlog::warn("detection error [{}]: {}", sym, e.what());
                 }
             }
         }
+
         auto elapsed = std::chrono::steady_clock::now() - start;
-        if (elapsed < std::chrono::milliseconds(10))
+        if (elapsed < std::chrono::milliseconds(10)) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10) - elapsed);
+        }
     }
 }
 
-// ---------- 获取监控币种 ----------
 std::vector<std::string> fetch_top_symbols(double min_vol = 80000000.0) {
-    CURL *curl = curl_easy_init();
+    CURL* curl = curl_easy_init();
     std::vector<std::string> result;
+
     if (curl) {
         std::string response;
         curl_easy_setopt(curl, CURLOPT_URL, "https://fapi.binance.com/fapi/v1/ticker/24hr");
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
-            [](void* contents, size_t size, size_t nmemb, std::string* s) -> size_t {
+        curl_easy_setopt(
+            curl,
+            CURLOPT_WRITEFUNCTION,
+            [](void* contents, size_t size, size_t nmemb, std::string* output) -> size_t {
                 size_t total = size * nmemb;
-                s->append((char*)contents, total);
+                output->append(static_cast<char*>(contents), total);
                 return total;
             });
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+
         CURLcode res = curl_easy_perform(curl);
         if (res == CURLE_OK) {
             try {
                 auto data = json::parse(response);
-                for (auto& item : data) {
-                    std::string sym = item["symbol"];
-                    if (sym.size()>4 && sym.compare(sym.size()-4,4,"USDT")==0 && sym.find('_')==std::string::npos) {
-                        double vol = std::stod(item["quoteVolume"].get<std::string>());
-                        if (vol >= min_vol) result.push_back(sym);
-                    }
+                for (const auto& item : data) {
+                    std::string sym = item.value("symbol", "");
+                    if (sym.size() <= 4) continue;
+                    if (sym.compare(sym.size() - 4, 4, "USDT") != 0) continue;
+                    if (sym.find('_') != std::string::npos) continue;
+
+                    double vol = item.contains("quoteVolume") ? json_to_double(item["quoteVolume"]) : 0.0;
+                    if (vol >= min_vol) result.push_back(sym);
                 }
-            } catch(...) {}
+            } catch (const std::exception& e) {
+                spdlog::warn("fetch symbols parse failed: {}", e.what());
+            }
+        } else {
+            spdlog::warn("fetch symbols request failed: {}", curl_easy_strerror(res));
         }
+
         curl_easy_cleanup(curl);
     }
+
     if (result.empty()) {
-        result = {"BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","BNBUSDT"};
+        result = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "BNBUSDT"};
     }
-    spdlog::info("监控币种数量: {}", result.size());
+
+    spdlog::info("monitoring symbols: {}", result.size());
     return result;
 }
 
 int main() {
-    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stdout, nullptr, _IONBF, 0);
     std::cout.setf(std::ios::unitbuf);
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
     spdlog::set_level(spdlog::level::info);
-    spdlog::info(">>> 趋势突破引擎 [真实成交数据 + A层异动 + K线突破信号] 启动...");
+    spdlog::info(">>> Trend breakout engine starting [real trades + A-layer + K-line breakout]");
 
     auto symbols = fetch_top_symbols(80000000.0);
     {
-        std::unique_lock lock(contexts_mutex);
-        for (const auto& sym : symbols)
+        std::unique_lock<std::shared_mutex> lock(contexts_mutex);
+        for (const auto& sym : symbols) {
             contexts.emplace(std::piecewise_construct, std::forward_as_tuple(sym), std::forward_as_tuple());
+        }
     }
-    spdlog::info("引擎启动，监控 {} 个合约", symbols.size());
+    spdlog::info("engine initialized, symbols={}", symbols.size());
 
     std::thread price_thread(price_pipe_reader);
     std::thread metrics_thread(trade_metrics_reader);
     std::thread feedback_thread(feedback_listener);
     std::thread detect_thread(run_detection);
-    spdlog::info("✅ 所有线程已启动 (价格管道 + 成交指标(可选) + 反馈(可选) + 突破信号 + A层异动)");
+    spdlog::info("all threads started");
 
     while (keep_running) {
         std::this_thread::sleep_for(std::chrono::seconds(30));
-        spdlog::info("💓 保活心跳, 监控 {} 个合约", contexts.size());
+        std::shared_lock<std::shared_mutex> lock(contexts_mutex);
+        spdlog::info("heartbeat, symbols={}", contexts.size());
     }
 
     if (price_thread.joinable()) price_thread.join();
