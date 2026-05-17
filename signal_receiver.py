@@ -12,6 +12,8 @@ API_KEY = os.getenv("BINANCE_API_KEY")
 SECRET_KEY = os.getenv("BINANCE_SECRET_KEY")
 TG_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHAT = "5372217316"
+MIN_24H_VOLUME = 80000000
+SYMBOLS_PATH = Path(os.getenv("SYMBOLS_PATH", "/tmp/extreme_reversal_symbols.json"))
 
 exchange = ccxt.binance({
     'apiKey': API_KEY,
@@ -51,6 +53,47 @@ api_fail_count = 0
 API_FAIL_THRESHOLD = 5
 api_pause_until = 0
 PAUSE_MINUTES = 10
+
+def refresh_runtime_symbols():
+    url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+
+        symbols = []
+        seen = set()
+        for item in data:
+            sym = item.get("symbol", "")
+            if not sym.endswith("USDT") or "_" in sym or "USDC" in sym:
+                continue
+            try:
+                quote_volume = float(item.get("quoteVolume", 0))
+            except (TypeError, ValueError):
+                continue
+            if quote_volume >= MIN_24H_VOLUME and sym not in seen:
+                symbols.append(sym)
+                seen.add(sym)
+
+        if not symbols:
+            raise RuntimeError("no symbols matched 24h quote volume filter")
+
+        tmp_path = SYMBOLS_PATH.with_suffix(".tmp")
+        tmp_path.write_text(json.dumps(symbols), encoding="utf-8")
+        os.replace(tmp_path, SYMBOLS_PATH)
+        print(f"[symbols] selected {len(symbols)} futures symbols quoteVolume>={MIN_24H_VOLUME}")
+        return symbols
+    except Exception as e:
+        print(f"[symbols] refresh failed: {e}")
+        if SYMBOLS_PATH.exists():
+            try:
+                symbols = json.loads(SYMBOLS_PATH.read_text(encoding="utf-8"))
+                if symbols:
+                    print(f"[symbols] using existing {SYMBOLS_PATH}: {len(symbols)} symbols")
+                    return symbols
+            except Exception as load_error:
+                print(f"[symbols] failed to load existing symbols: {load_error}")
+        raise
 
 # ------------------------- 辅助函数 -------------------------
 def send_tg(msg):
@@ -501,6 +544,7 @@ def main():
     except Exception as e:
         print(f"⚠ 加载市场失败: {e}")
 
+    refresh_runtime_symbols()
     sync_positions_on_start()
     send_tg("🤖 引擎已启动 | 杠杆5倍/30U | 跟踪止盈3.5/1.5U | 延迟15分钟+盈利≥3%开仓 | 在线学习反馈已启用")
 

@@ -12,12 +12,7 @@ import websocket
 # 配置
 MIN_24H_VOLUME = 80000000
 PIPE_PATH = "/tmp/price_pipe"
-FIXED_SYMBOLS = (
-    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
-    "ADAUSDT", "AVAXUSDT", "LINKUSDT", "LTCUSDT", "BCHUSDT", "TRXUSDT",
-    "DOTUSDT", "UNIUSDT", "NEARUSDT", "APTUSDT", "ARBUSDT", "OPUSDT",
-    "FILUSDT", "ETCUSDT", "SUIUSDT", "WIFUSDT", "PEPEUSDT", "1000SHIBUSDT",
-)
+SYMBOLS_PATH = os.getenv("SYMBOLS_PATH", "/tmp/extreme_reversal_symbols.json")
 
 # FIFO 重连参数
 PIPE_OPEN_RETRY_SEC = 1.0
@@ -129,9 +124,24 @@ def write_price(symbol, price):
 
 
 def fetch_symbols():
-    print(f"[ws] using fixed symbol list aligned with engine: {len(FIXED_SYMBOLS)}", flush=True)
-    return list(FIXED_SYMBOLS)
+    try:
+        with open(SYMBOLS_PATH, "r", encoding="utf-8") as f:
+            symbols = json.load(f)
+        symbols = [str(s) for s in symbols if str(s).endswith("USDT")]
+        if symbols:
+            print(f"[ws] loaded symbols from {SYMBOLS_PATH}: {len(symbols)}", flush=True)
+            return symbols
+    except Exception as e:
+        print(f"[ws] load symbols file failed: {e}", flush=True)
 
+    symbols = fetch_symbols_from_binance()
+    if symbols:
+        tmp_path = SYMBOLS_PATH + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(symbols, f)
+        os.replace(tmp_path, SYMBOLS_PATH)
+        print(f"[ws] wrote symbols file {SYMBOLS_PATH}: {len(symbols)}", flush=True)
+    return symbols
 
 def fetch_symbols_from_binance():
     url = "https://fapi.binance.com/fapi/v1/ticker/24hr"

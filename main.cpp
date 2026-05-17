@@ -14,6 +14,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <fstream>
 #include <shared_mutex>
 #include <string>
 #include <sys/stat.h>
@@ -413,12 +414,34 @@ void run_detection() {
 
 std::vector<std::string> fetch_top_symbols(double min_vol = 80000000.0) {
     (void)min_vol;
-    std::vector<std::string> result = {
-        "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
-        "ADAUSDT", "AVAXUSDT", "LINKUSDT", "LTCUSDT", "BCHUSDT", "TRXUSDT",
-        "DOTUSDT", "UNIUSDT", "NEARUSDT", "APTUSDT", "ARBUSDT", "OPUSDT",
-        "FILUSDT", "ETCUSDT", "SUIUSDT", "WIFUSDT", "PEPEUSDT", "1000SHIBUSDT"
-    };
+    const char* symbols_path = std::getenv("SYMBOLS_PATH");
+    if (symbols_path == nullptr || std::strlen(symbols_path) == 0) {
+        symbols_path = "/tmp/extreme_reversal_symbols.json";
+    }
+
+    std::vector<std::string> result;
+    try {
+        std::ifstream input(symbols_path);
+        if (input.good()) {
+            json data = json::parse(input);
+            for (const auto& item : data) {
+                if (item.is_string()) {
+                    std::string sym = item.get<std::string>();
+                    if (!sym.empty()) result.push_back(sym);
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("failed to load symbols file [{}]: {}", symbols_path, e.what());
+    }
+
+    if (result.empty()) {
+        result = {"BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT"};
+        spdlog::warn("using fallback symbols: {}", result.size());
+    } else {
+        spdlog::info("loaded symbols from {}: {}", symbols_path, result.size());
+    }
+
     spdlog::info("monitoring symbols: {}", result.size());
     return result;
 }
