@@ -11,7 +11,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <curl/curl.h>          // 必须添加这一行
+#include <curl/curl.h>
 #include "indicators.h"
 
 using json = nlohmann::json;
@@ -93,9 +93,12 @@ public:
 // ---------- 上下文 ----------
 struct SymbolContext {
     Indicators indicators;
-    KLineManager kline_mgr{300};   // 改为5分钟（300秒）
+    KLineManager kline_mgr{300};   // 5分钟K线
     int64_t last_breakout_kline_ts{0};
-    // 成交指标字段（从 trade_metrics_pipe 读取）
+    // 活跃层相关
+    double last_a_price = 0.0;
+    int64_t last_a_time_ms = 0;
+    // 成交指标字段（可选）
     std::atomic<int> active_buy_count{0};
     std::atomic<double> large_buy_ratio{0.0};
     std::atomic<double> active_buy_ratio{0.0};
@@ -131,6 +134,8 @@ void price_pipe_reader() {
                         if (it != contexts.end()) {
                             it->second.indicators.update(price);
                             it->second.kline_mgr.update(price, now_ms);
+                            // 活跃层检测：每收到一个价格就更新，但避免过于频繁；我们改用定时检查，这里只存储价格
+                            // 为了简单，我们在 run_detection 中检查价格变化百分比
                         }
                     } catch (...) {}
                 }
@@ -141,7 +146,7 @@ void price_pipe_reader() {
     }
 }
 
-// ---------- 成交指标管道读取 ----------
+// ---------- 成交指标管道读取（可选）----------
 void trade_metrics_reader() {
     const char* pipe_path = "/tmp/trade_metrics_pipe";
     while (keep_running) {
@@ -182,7 +187,7 @@ void trade_metrics_reader() {
     }
 }
 
-// ---------- 反馈管道（预留在线学习）----------
+// ---------- 反馈管道（预留）----------
 void feedback_listener() {
     const char* fifo_path = "/tmp/quant_feedback";
     mkfifo(fifo_path, 0666);
@@ -199,21 +204,57 @@ void feedback_listener() {
                 std::string side = j.value("side", "");
                 double pnl = j.value("pnl", 0.0);
                 spdlog::info("反馈收到: {} {} 盈亏={:.2f}%", sym, side, pnl);
-                // 可在此处扩展在线学习逻辑
+                // 可扩展在线学习
             } catch (...) {}
         }
         close(fd);
     }
 }
 
-// ---------- 信号检测循环 ----------
+// ---------- 活跃层检测 ----------
+void check_active_layer(SymbolContext& ctx, const std::string& sym, int64_t now_ms) {
+    // 需要至少20个价格点才能计算变化
+    if (ctx.indicators.prices().size() < 20) return;
+    double cur_price = ctx.indicators.price();
+    // 计算3分钟价格变化百分比（使用3分钟前的价格）
+    double change_3m = ctx.indicators.price_change_pct(3*60);
+    if (std::abs(change_3m) < 0.005) return;   // 小于0.5%不发送
+    if (std::abs(change_3m) > 0.20) return;    // 大于20%可能是数据异常
+    // 发送 A_ACTIVE 消息（限制频率：每30秒最多一次）
+    if (now_ms - ctx.last_a_time_ms < 30000) return;
+    ctx.last_a_time_ms = now_ms;
+    json a_msg;
+    a_msg["type"] = "A_ACTIVE";
+    a_msg["symbol"] = sym;
+    a_msg["price"] = cur_price;
+    a_msg["change_pct"] = change_3m * 100.0;
+    a_msg["vol_ratio"] = 1.0;  // 没有量比数据，可忽略
+    a_msg["timestamp"] = std::time(nullptr);
+    // 可选偏离度（基于EMA20）
+    double atr = ctx.indicators.atr();
+    double ema20 = ctx.indicators.ema20();
+    if (atr > 1e-9) {
+        double dev = (ema20 - cur_price) / atr;
+        if (std::abs(dev) < 50.0) a_msg["dev"] = dev;
+    }
+    std::cout << a_msg.dump() << std::endl;
+}
+
+// ---------- 信号检测循环（A层 + B层）----------
 void run_detection() {
     while (keep_running) {
         auto start = std::chrono::steady_clock::now();
         {
             std::shared_lock lock(contexts_mutex);
+            auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count();
+
             for (auto& [sym, ctx] : contexts) {
                 try {
+                    // 1. 活跃层检测
+                    check_active_layer(ctx, sym, now_ms);
+
+                    // 2. K线突破信号检测
                     const auto& klines = ctx.kline_mgr.getClosedKLines();
                     if (klines.size() >= 5) {
                         int64_t curr_ts = klines.back().timestamp;
@@ -231,7 +272,6 @@ void run_detection() {
                                 b_msg["timestamp"] = std::time(nullptr);
                                 b_msg["current_price"] = ctx.indicators.price();
                                 b_msg["source"] = "BREAKOUT";
-                                // 简单止损止盈（可调整）
                                 double p = b_msg["price"];
                                 if (long_sig) {
                                     b_msg["take_profit"] = p * 1.02;
@@ -250,12 +290,12 @@ void run_detection() {
             }
         }
         auto elapsed = std::chrono::steady_clock::now() - start;
-        if (elapsed < std::chrono::milliseconds(5))
-            std::this_thread::sleep_for(std::chrono::milliseconds(5) - elapsed);
+        if (elapsed < std::chrono::milliseconds(10))
+            std::this_thread::sleep_for(std::chrono::milliseconds(10) - elapsed);
     }
 }
 
-// ---------- 获取监控币种（使用 curl）----------
+// ---------- 获取监控币种 ----------
 std::vector<std::string> fetch_top_symbols(double min_vol = 80000000.0) {
     CURL *curl = curl_easy_init();
     std::vector<std::string> result;
@@ -284,7 +324,6 @@ std::vector<std::string> fetch_top_symbols(double min_vol = 80000000.0) {
         }
         curl_easy_cleanup(curl);
     }
-    // 如果获取失败（结果为空），返回一个兜底列表
     if (result.empty()) {
         result = {"BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","BNBUSDT"};
     }
@@ -292,13 +331,12 @@ std::vector<std::string> fetch_top_symbols(double min_vol = 80000000.0) {
     return result;
 }
 
-// ---------- 主函数 ----------
 int main() {
     setvbuf(stdout, NULL, _IONBF, 0);
     std::cout.setf(std::ios::unitbuf);
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
     spdlog::set_level(spdlog::level::info);
-    spdlog::info(">>> 趋势突破引擎 [真实成交数据 + K线突破信号] 启动...");
+    spdlog::info(">>> 趋势突破引擎 [真实成交数据 + A层异动 + K线突破信号] 启动...");
 
     auto symbols = fetch_top_symbols(80000000.0);
     {
@@ -312,7 +350,7 @@ int main() {
     std::thread metrics_thread(trade_metrics_reader);
     std::thread feedback_thread(feedback_listener);
     std::thread detect_thread(run_detection);
-    spdlog::info("✅ 所有线程已启动 (价格管道 + 成交指标 + 反馈 + 突破信号)");
+    spdlog::info("✅ 所有线程已启动 (价格管道 + 成交指标(可选) + 反馈(可选) + 突破信号 + A层异动)");
 
     while (keep_running) {
         std::this_thread::sleep_for(std::chrono::seconds(30));
