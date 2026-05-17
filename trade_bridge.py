@@ -6,6 +6,7 @@ import errno
 import threading
 import websocket
 import requests
+import stat
 
 # 配置
 MIN_24H_VOLUME = 80000000
@@ -18,9 +19,12 @@ def init_pipe():
     global pipe_fd
     if not os.path.exists(PIPE_PATH):
         os.mkfifo(PIPE_PATH)
-    # 非阻塞只写打开
+    else:
+        # 如果存在但不是管道，删除重建
+        if not os.path.islink(PIPE_PATH) and not stat.S_ISFIFO(os.stat(PIPE_PATH).st_mode):
+            os.remove(PIPE_PATH)
+            os.mkfifo(PIPE_PATH)
     pipe_fd = os.open(PIPE_PATH, os.O_WRONLY | os.O_NONBLOCK)
-    print(f"管道已打开 (非阻塞): {PIPE_PATH}", flush=True)
 
 def write_price(symbol, price):
     global pipe_fd
