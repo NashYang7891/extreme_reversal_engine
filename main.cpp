@@ -42,51 +42,92 @@ const std::vector<std::string> ULTIMATE_FALLBACK = {
     "BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","BNBUSDT"
 };
 
-std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 80000000.0) {
-    std::vector<std::pair<std::string, double>> tickers;
-    CURL *curl = curl_easy_init();
-    if (curl) {
-        std::string response;
-        curl_easy_setopt(curl, CURLOPT_URL, "https://fapi.binance.com/fapi/v1/ticker/24hr");
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-        CURLcode res = curl_easy_perform(curl);
-        if (res == CURLE_OK) {
-            try {
-                auto data = json::parse(response);
-                for (auto& item : data) {
-                    std::string sym = item["symbol"];
-                    if (sym.size()>4 && sym.compare(sym.size()-4,4,"USDT")==0 &&
-                        sym.find('_')==std::string::npos && sym!="USDCUSDT") {
-                        double vol = std::stod(item["quoteVolume"].get<std::string>());
-                        if (vol >= min_vol) tickers.emplace_back(sym, vol);
-                    }
-                }
-            } catch (...) { spdlog::error("解析 ticker 失败，使用兜底列表"); }
+// ---------- K线管理类 ----------
+struct KLine {
+    double open;
+    double high;
+    double low;
+    double close;
+    int64_t timestamp;   // K线开始时间（毫秒）
+};
+
+class KLineManager {
+public:
+    KLineManager(int interval_sec) : interval_ms_(interval_sec * 1000) {
+        resetCurrent();
+    }
+
+    void update(double price, int64_t now_ms) {
+        if (current_.timestamp == 0) {
+            current_.timestamp = (now_ms / interval_ms_) * interval_ms_;
+            current_.open = current_.high = current_.low = current_.close = price;
         } else {
-            spdlog::error("获取 ticker 失败: {}，使用兜底列表", curl_easy_strerror(res));
+            int64_t kline_start = (now_ms / interval_ms_) * interval_ms_;
+            if (kline_start > current_.timestamp) {
+                completeKLine();
+                current_.timestamp = kline_start;
+                current_.open = current_.high = current_.low = current_.close = price;
+            } else {
+                current_.high = std::max(current_.high, price);
+                current_.low = std::min(current_.low, price);
+                current_.close = price;
+            }
         }
-        curl_easy_cleanup(curl);
-    } else {
-        spdlog::error("curl 初始化失败，使用兜底列表");
     }
 
-    std::sort(tickers.begin(), tickers.end(),
-              [](const auto& a, const auto& b) { return a.second > b.second; });
+    const std::deque<KLine>& getClosedKLines() const { return closed_lines_; }
 
-    std::vector<std::string> result;
-    for (size_t i = 0; i < tickers.size() && i < (size_t)top_n; ++i)
-        result.push_back(tickers[i].first);
+    void flush() { if (current_.timestamp != 0) completeKLine(); }
 
-    if (result.size() < 10) {
-        spdlog::warn("实时合约不足 10 个，切换为兜底列表");
-        return ULTIMATE_FALLBACK;
+private:
+    void completeKLine() {
+        if (current_.timestamp != 0) {
+            closed_lines_.push_back(current_);
+            while (closed_lines_.size() > 200) closed_lines_.pop_front();
+        }
+        resetCurrent();
     }
-    spdlog::info("最终监控 {} 个合约 (24h成交额≥8000万U), 前3: {}", result.size(),
-                 result.size()>=3 ? result[0]+","+result[1]+","+result[2] : "");
-    return result;
-}
 
+    void resetCurrent() {
+        current_ = KLine{0,0,0,0,0};
+    }
+
+    const int interval_ms_;
+    KLine current_;
+    std::deque<KLine> closed_lines_;
+};
+
+// ---------- 趋势突破检测器 ----------
+class BreakoutDetector {
+public:
+    static bool checkLong(const std::deque<KLine>& klines) {
+        if (klines.size() < 5) return false;
+        const KLine& curr = klines.back();
+        double max_close = 0;
+        for (size_t i = klines.size() - 5; i < klines.size() - 1; ++i)
+            max_close = std::max(max_close, klines[i].close);
+        bool cond1 = curr.close > max_close;
+        bool cond2 = (klines[klines.size()-3].close > klines[klines.size()-3].open) &&
+                     (klines[klines.size()-4].close > klines[klines.size()-4].open) &&
+                     (klines[klines.size()-5].close > klines[klines.size()-5].open);
+        return cond1 && cond2;
+    }
+
+    static bool checkShort(const std::deque<KLine>& klines) {
+        if (klines.size() < 5) return false;
+        const KLine& curr = klines.back();
+        double min_close = std::numeric_limits<double>::max();
+        for (size_t i = klines.size() - 5; i < klines.size() - 1; ++i)
+            min_close = std::min(min_close, klines[i].close);
+        bool cond1 = curr.close < min_close;
+        bool cond2 = (klines[klines.size()-3].close < klines[klines.size()-3].open) &&
+                     (klines[klines.size()-4].close < klines[klines.size()-4].open) &&
+                     (klines[klines.size()-5].close < klines[klines.size()-5].open);
+        return cond1 && cond2;
+    }
+};
+
+// ---------- 原有结构体 ----------
 struct SymbolContext {
     OrderBook orderbook;
     Indicators indicators;
@@ -106,18 +147,21 @@ struct SymbolContext {
     std::atomic<double> large_buy_ratio{0.0};
     std::atomic<double> active_buy_ratio{0.0};
     std::atomic<int64_t> last_metrics_time{0};
+
+    // K线管理（15分钟周期，可改为300秒即5分钟）
+    KLineManager kline_mgr{900};
+    int64_t last_breakout_kline_ts{0};
 };
 
 std::map<std::string, SymbolContext> contexts;
 std::shared_mutex contexts_mutex;
 
+// ---------- 活跃层检测 ----------
 bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, double& out_vol_ratio) {
     if (ind.prices().size() < 60) return false;
-
     double change_3m = ind.price_change_pct(3*60);
     if (std::abs(change_3m) > 0.20) return false;
     if (std::abs(change_3m) < 0.012) return false;
-
     double recent_vol = ob.recent_volume(3*60*1000);
     double avg_vol = ind.get_volume_ema();
     if (avg_vol <= 1e-9) {
@@ -126,22 +170,19 @@ bool active_layer(const OrderBook& ob, Indicators& ind, double& out_change, doub
         out_vol_ratio = 1.0;
         return true;
     }
-
     double vol_ratio = recent_vol / avg_vol;
     if (vol_ratio < 1.5) return false;
-
     ind.update_volume(recent_vol);
     out_change = change_3m;
     out_vol_ratio = vol_ratio;
     return true;
 }
 
+// ---------- 深度消息处理 ----------
 void process_json_msg(const json& msg) {
     if (!msg.contains("stream") || !msg.contains("data")) return;
-
     std::string stream = msg["stream"];
     auto& data = msg["data"];
-
     size_t pos = stream.find('@');
     if (pos == std::string::npos) return;
     std::string sym = stream.substr(0, pos);
@@ -156,7 +197,10 @@ void process_json_msg(const json& msg) {
             it->second.orderbook.update_depth(data);
             double mp = it->second.orderbook.micro_price();
             if (mp > 0) {
+                auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count();
                 it->second.indicators.update(mp);
+                it->second.kline_mgr.update(mp, now_ms);   // 更新K线
                 auto& ctx = it->second;
                 if (mp > ctx.highest_since_reset) {
                     ctx.highest_since_reset = mp;
@@ -179,6 +223,7 @@ void process_json_msg(const json& msg) {
     }
 }
 
+// ---------- WebSocket 线程 ----------
 void run_websocket(const std::vector<std::string>& symbols) {
     while (keep_running) {
         try {
@@ -186,14 +231,11 @@ void run_websocket(const std::vector<std::string>& symbols) {
             ssl::context ctx{ssl::context::tlsv12_client};
             ctx.set_verify_mode(ssl::verify_peer);
             ctx.set_default_verify_paths();
-
             ws::stream<beast::ssl_stream<tcp::socket>> ws_stream(ioc, ctx);
             tcp::resolver resolver(ioc);
             auto const results = resolver.resolve("fstream.binance.com", "443");
             net::connect(ws_stream.next_layer().next_layer(), results.begin(), results.end());
-
             SSL_set_tlsext_host_name(ws_stream.next_layer().native_handle(), "fstream.binance.com");
-
             ws_stream.next_layer().handshake(ssl::stream_base::client);
             ws_stream.handshake("fstream.binance.com", "/stream");
 
@@ -235,7 +277,7 @@ void run_websocket(const std::vector<std::string>& symbols) {
     }
 }
 
-// 读取成交指标管道
+// ---------- 成交指标读取线程 ----------
 void trade_metrics_reader() {
     const char* pipe_path = "/tmp/trade_metrics_pipe";
     while (keep_running) {
@@ -264,7 +306,6 @@ void trade_metrics_reader() {
                             double large_ratio = j.value("large_buy_ratio", 0.0);
                             double buy_ratio = j.value("active_buy_ratio", 0.0);
                             int64_t ts = j.value("timestamp", 0LL);
-
                             std::shared_lock lock(contexts_mutex);
                             auto it = contexts.find(sym);
                             if (it != contexts.end()) {
@@ -277,19 +318,16 @@ void trade_metrics_reader() {
                                               sym, active_buy, large_ratio, buy_ratio);
                             }
                         }
-                    } catch (const std::exception& e) {
-                        spdlog::warn("成交指标解析失败: {}", e.what());
-                    }
+                    } catch (...) {}
                 }
                 leftover = data;
-            } else if (n == 0) {
-                break;
-            }
+            } else if (n == 0) break;
         }
         close(fd);
     }
 }
 
+// ---------- 反馈监听线程 ----------
 void feedback_listener() {
     const char* fifo_path = "/tmp/quant_feedback";
     mkfifo(fifo_path, 0666);
@@ -324,6 +362,7 @@ void feedback_listener() {
     }
 }
 
+// ---------- 主检测循环（含反转信号 + 突破信号）----------
 void run_detection() {
     while (keep_running) {
         auto start = std::chrono::steady_clock::now();
@@ -335,11 +374,11 @@ void run_detection() {
             for (auto& [sym, ctx] : contexts) {
                 if (ctx.indicators.is_stale(60000)) continue;
                 try {
+                    // ----- 原有活跃层检测 -----
                     double change_pct = 0.0, vol_ratio = 0.0;
                     if (active_layer(ctx.orderbook, ctx.indicators, change_pct, vol_ratio)) {
                         ctx.last_active_time = now_ms;
                         ctx.last_active_change = change_pct;
-
                         json a_msg;
                         a_msg["type"] = "A_ACTIVE";
                         a_msg["symbol"] = sym;
@@ -356,40 +395,17 @@ void run_detection() {
                         std::cout << a_msg.dump() << std::endl;
                     }
 
+                    // ----- 反转信号检测 -----
                     int64_t last_active = ctx.last_active_time.load();
                     if (last_active > 0 && (now_ms - last_active) < 15*60*1000) {
                         auto sig = ctx.detector.check(ctx.orderbook);
                         if (sig.valid) {
-                            // ---------- 成交指标过滤（阈值可调） ----------
-                            bool metrics_ok = true;
-                            if (sig.side == "LONG") {
-                                // 做多：主动买笔数 > 20 且 大单占比 > 0.05（放宽至5%）
-                                if (ctx.active_buy_count > 20 && ctx.large_buy_ratio > 0.05) {
-                                    metrics_ok = true;
-                                } else {
-                                    spdlog::info("[SIGNAL_REJECTED] {} LONG Filtered: BuyCount={}, LargeRatio={:.3f}",
-                                                 sym, ctx.active_buy_count.load(), ctx.large_buy_ratio.load());
-                                }
-                            } else { // SHORT
-                                // 做空：主动买入笔数 < 25 且 主动买入占比 < 0.55（放宽至55%）
-                                if (ctx.active_buy_count < 25 && ctx.active_buy_ratio < 0.55) {
-                                    metrics_ok = true;
-                                } else {
-                                    spdlog::info("[SIGNAL_REJECTED] {} SHORT Filtered: BuyCount={}, ActiveRatio={:.3f}",
-                                                 sym, ctx.active_buy_count.load(), ctx.active_buy_ratio.load());
-                                }
-                            }
+                            // 可选成交指标过滤（这里暂时注释，因为指标可能为空）
+                            // bool metrics_ok = true; // 如需启用，请自行取消注释并完善条件
+                            // if (!metrics_ok) continue;
 
-                            if (!metrics_ok) {
-                                // 不满足指标，丢弃信号，不推送
-                                continue;
-                            }
-                            // ---------- 原有信号方向检查 ----------
-                            if (sig.side == "LONG" && ctx.last_active_change.load() > -0.025)
-                                continue;
-                            if (sig.side == "SHORT" && ctx.last_active_change.load() < 0.012)
-                                continue;
-
+                            if (sig.side == "LONG" && ctx.last_active_change.load() > -0.025) continue;
+                            if (sig.side == "SHORT" && ctx.last_active_change.load() < 0.012) continue;
                             if (now_ms - ctx.last_b_push_ms.load() < 10000) continue;
                             ctx.last_b_push_ms = now_ms;
 
@@ -401,29 +417,60 @@ void run_detection() {
                             b_msg["score"]  = sig.score;
                             b_msg["timestamp"] = std::time(nullptr);
                             b_msg["current_price"] = ctx.indicators.price();
+                            b_msg["source"] = "REVERSAL";
 
                             double atr = ctx.indicators.atr();
                             double p   = sig.price;
-
                             if (sig.side == "LONG") {
-                                double profit_dist = std::max(atr * 8.0, p * 0.025);
-                                b_msg["take_profit"] = p + profit_dist;
+                                b_msg["take_profit"] = p + std::max(atr * 8.0, p * 0.025);
                                 double stop_dist = std::max(atr * 3.0, p * 0.015);
                                 if (stop_dist > p * 0.04) stop_dist = p * 0.04;
                                 b_msg["stop_loss"] = p - stop_dist;
                                 if (b_msg["take_profit"] <= p) b_msg["take_profit"] = p * 1.02;
                                 if (b_msg["stop_loss"] < p * 0.95) b_msg["stop_loss"] = p * 0.95;
                             } else {
-                                double profit_dist = std::max(atr * 5.0, p * 0.03);
-                                b_msg["take_profit"] = p - profit_dist;
+                                b_msg["take_profit"] = p - std::max(atr * 5.0, p * 0.03);
                                 double stop_dist_short = std::max(atr * 3.0, p * 0.015);
                                 if (stop_dist_short > p * 0.04) stop_dist_short = p * 0.04;
                                 b_msg["stop_loss"] = p + stop_dist_short;
                                 if (b_msg["stop_loss"] > p * 1.08) b_msg["stop_loss"] = p * 1.08;
-                                if (b_msg["take_profit"] >= p) b_msg["take_profit"] = p - profit_dist;
+                                if (b_msg["take_profit"] >= p) b_msg["take_profit"] = p - std::max(atr * 5.0, p * 0.03);
                             }
                             std::cout << b_msg.dump() << std::endl;
                             ctx.last_active_time = 0;
+                        }
+                    }
+
+                    // ----- 趋势突破信号检测（基于K线）-----
+                    const auto& klines = ctx.kline_mgr.getClosedKLines();
+                    if (klines.size() >= 5) {
+                        int64_t curr_kline_ts = klines.back().timestamp;
+                        if (curr_kline_ts != ctx.last_breakout_kline_ts) {
+                            bool long_sig = BreakoutDetector::checkLong(klines);
+                            bool short_sig = BreakoutDetector::checkShort(klines);
+                            if (long_sig || short_sig) {
+                                ctx.last_breakout_kline_ts = curr_kline_ts;
+                                json b_msg;
+                                b_msg["type"] = "SIGNAL";
+                                b_msg["symbol"] = sym;
+                                b_msg["side"] = long_sig ? "LONG" : "SHORT";
+                                b_msg["price"] = klines.back().close;
+                                b_msg["score"] = 100.0;
+                                b_msg["timestamp"] = std::time(nullptr);
+                                b_msg["current_price"] = ctx.indicators.price();
+                                b_msg["source"] = "BREAKOUT";
+
+                                double atr = ctx.indicators.atr();
+                                double p = b_msg["price"];
+                                if (long_sig) {
+                                    b_msg["take_profit"] = p + std::max(atr * 6.0, p * 0.02);
+                                    b_msg["stop_loss"] = p - std::max(atr * 3.0, p * 0.015);
+                                } else {
+                                    b_msg["take_profit"] = p - std::max(atr * 6.0, p * 0.02);
+                                    b_msg["stop_loss"] = p + std::max(atr * 3.0, p * 0.015);
+                                }
+                                std::cout << b_msg.dump() << std::endl;
+                            }
                         }
                     }
                 } catch (const std::exception& e) {
@@ -437,13 +484,56 @@ void run_detection() {
     }
 }
 
+// ---------- 获取监控币种 ----------
+std::vector<std::string> fetch_top_symbols(int top_n = 100, double min_vol = 80000000.0) {
+    std::vector<std::pair<std::string, double>> tickers;
+    CURL *curl = curl_easy_init();
+    if (curl) {
+        std::string response;
+        curl_easy_setopt(curl, CURLOPT_URL, "https://fapi.binance.com/fapi/v1/ticker/24hr");
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, WriteCallback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
+        CURLcode res = curl_easy_perform(curl);
+        if (res == CURLE_OK) {
+            try {
+                auto data = json::parse(response);
+                for (auto& item : data) {
+                    std::string sym = item["symbol"];
+                    if (sym.size()>4 && sym.compare(sym.size()-4,4,"USDT")==0 &&
+                        sym.find('_')==std::string::npos && sym!="USDCUSDT") {
+                        double vol = std::stod(item["quoteVolume"].get<std::string>());
+                        if (vol >= min_vol) tickers.emplace_back(sym, vol);
+                    }
+                }
+            } catch (...) { spdlog::error("解析 ticker 失败，使用兜底列表"); }
+        } else {
+            spdlog::error("获取 ticker 失败: {}，使用兜底列表", curl_easy_strerror(res));
+        }
+        curl_easy_cleanup(curl);
+    } else {
+        spdlog::error("curl 初始化失败，使用兜底列表");
+    }
+    std::sort(tickers.begin(), tickers.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    std::vector<std::string> result;
+    for (size_t i = 0; i < tickers.size() && i < (size_t)top_n; ++i)
+        result.push_back(tickers[i].first);
+    if (result.size() < 10) {
+        spdlog::warn("实时合约不足 10 个，切换为兜底列表");
+        return ULTIMATE_FALLBACK;
+    }
+    spdlog::info("最终监控 {} 个合约 (24h成交额≥8000万U), 前3: {}", result.size(),
+                 result.size()>=3 ? result[0]+","+result[1]+","+result[2] : "");
+    return result;
+}
+
+// ---------- 主函数 ----------
 int main() {
     setvbuf(stdout, NULL, _IONBF, 0);
     std::cout.setf(std::ios::unitbuf);
-
     spdlog::set_pattern("[%Y-%m-%d %H:%M:%S.%e] [%l] %v");
-    spdlog::set_level(spdlog::level::info);  // 可改为 debug 查看指标值
-    spdlog::info(">>> 极端反转引擎 [深度流+中间价+在线学习+成交指标] 启动...");
+    spdlog::set_level(spdlog::level::info);
+    spdlog::info(">>> 极端反转引擎 [深度流+中间价+在线学习+成交指标+趋势突破] 启动...");
 
     auto symbols = fetch_top_symbols(100, 80000000.0);
     {
@@ -457,7 +547,7 @@ int main() {
     std::thread detect_thread(run_detection);
     std::thread feedback_thread(feedback_listener);
     std::thread metrics_thread(trade_metrics_reader);
-    spdlog::info("✅ 所有线程已启动 (深度流 + 在线学习 + 成交指标)");
+    spdlog::info("✅ 所有线程已启动 (深度流 + 在线学习 + 成交指标 + 趋势突破)");
 
     while (keep_running) {
         std::this_thread::sleep_for(std::chrono::seconds(30));
