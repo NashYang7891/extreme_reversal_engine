@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import subprocess, json, time, os, sys, threading, requests
+import subprocess, json, time, os, sys, threading, requests, traceback
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
@@ -504,7 +504,8 @@ def main():
     sync_positions_on_start()
     send_tg("🤖 引擎已启动 | 杠杆5倍/30U | 跟踪止盈3.5/1.5U | 延迟15分钟+盈利≥3%开仓 | 在线学习反馈已启用")
 
-    proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, text=True, bufsize=1)
+    proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    print(f"[diag] engine pid={proc.pid} started: {engine_path}")
     main.last_trail_check = 0
 
     for line in proc.stdout:
@@ -514,7 +515,7 @@ def main():
             send_tg(f"🧠 {line.strip()}")
         try:
             msg = json.loads(line)
-        except:
+        except Exception:
             print("C++:", line)
             continue
 
@@ -628,6 +629,7 @@ def main():
                 except Exception as e:
                     err_msg = f"delayed_open 异常: {sym} {side} {e}"
                     print(err_msg)
+                    print(traceback.format_exc())
                     send_tg(f"⚠️ {err_msg}")
 
             timer = threading.Timer(DELAY_SECONDS, delayed_open,
@@ -639,7 +641,14 @@ def main():
             send_tg(f"⏳ {side.upper()} {sym} 评分:{score:.1f}，15分钟后检查盈利≥{PROFIT_THRESHOLD_PERCENT}% 才开仓\n原价: {price_derived:.8f}")
             last_b_signal[sym] = time.time()
 
-    proc.wait()
+    return_code = proc.wait()
+    print(f"[diag] engine process exited, returncode={return_code}")
+    print("[diag] main loop reached end, signal_receiver.py will exit")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"[fatal] unhandled exception in main: {e}")
+        print(traceback.format_exc())
+        raise
