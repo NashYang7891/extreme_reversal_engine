@@ -28,6 +28,12 @@
 using json = nlohmann::json;
 
 std::atomic<bool> keep_running{true};
+std::atomic<uint64_t> price_updates_received{0};
+std::atomic<uint64_t> price_updates_applied{0};
+std::atomic<uint64_t> price_updates_unknown_symbol{0};
+std::atomic<uint64_t> price_bad_messages{0};
+std::atomic<uint64_t> a_active_signals{0};
+std::atomic<uint64_t> breakout_signals{0};
 
 struct KLine {
     double open;
@@ -196,6 +202,7 @@ void price_pipe_reader() {
                     std::string sym = j.value("symbol", "");
                     double price = json_to_double(j["price"]);
                     if (sym.empty() || price <= 0.0) continue;
+                    price_updates_received.fetch_add(1, std::memory_order_relaxed);
 
                     auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                       std::chrono::system_clock::now().time_since_epoch())
@@ -206,8 +213,12 @@ void price_pipe_reader() {
                     if (it != contexts.end()) {
                         it->second.indicators.update(price);
                         it->second.kline_mgr.update(price, now_ms);
+                        price_updates_applied.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        price_updates_unknown_symbol.fetch_add(1, std::memory_order_relaxed);
                     }
                 } catch (const std::exception& e) {
+                    price_bad_messages.fetch_add(1, std::memory_order_relaxed);
                     spdlog::warn("price_pipe bad message: {}", e.what());
                 }
             }
@@ -337,6 +348,7 @@ void check_active_layer(SymbolContext& ctx, const std::string& sym, int64_t now_
         if (std::abs(dev) < 50.0) a_msg["dev"] = dev;
     }
 
+    a_active_signals.fetch_add(1, std::memory_order_relaxed);
     std::cout << a_msg.dump() << std::endl;
 }
 
@@ -385,6 +397,7 @@ void run_detection() {
                     }
 
                     std::cout << b_msg.dump() << std::endl;
+                    breakout_signals.fetch_add(1, std::memory_order_relaxed);
                 } catch (const std::exception& e) {
                     spdlog::warn("detection error [{}]: {}", sym, e.what());
                 }
@@ -435,7 +448,15 @@ int main() {
     while (keep_running) {
         std::this_thread::sleep_for(std::chrono::seconds(30));
         std::shared_lock<std::shared_mutex> lock(contexts_mutex);
-        spdlog::info("heartbeat, symbols={}", contexts.size());
+        spdlog::info(
+            "heartbeat, symbols={}, price_received={}, price_applied={}, unknown_symbol={}, bad_price_msg={}, a_active={}, breakout={}",
+            contexts.size(),
+            price_updates_received.load(std::memory_order_relaxed),
+            price_updates_applied.load(std::memory_order_relaxed),
+            price_updates_unknown_symbol.load(std::memory_order_relaxed),
+            price_bad_messages.load(std::memory_order_relaxed),
+            a_active_signals.load(std::memory_order_relaxed),
+            breakout_signals.load(std::memory_order_relaxed));
     }
 
     if (price_thread.joinable()) price_thread.join();

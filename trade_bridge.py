@@ -19,6 +19,11 @@ PIPE_REOPEN_LOCK = threading.Lock()
 PIPE_WAIT_LOG_EVERY = 10
 
 pipe_fd = None
+stats_lock = threading.Lock()
+stats_started_at = time.time()
+last_stats_log = stats_started_at
+ws_messages = 0
+pipe_writes = 0
 
 
 def ensure_fifo_exists():
@@ -86,12 +91,15 @@ def reopen_pipe():
 
 
 def write_price(symbol, price):
+    global pipe_writes
     payload = json.dumps({"symbol": symbol, "price": price}) + "\n"
 
     while True:
         ensure_pipe_connected()
         try:
             os.write(pipe_fd, payload.encode())
+            with stats_lock:
+                pipe_writes += 1
             return
         except BrokenPipeError:
             print("[pipe] broken pipe detected, reconnecting...", flush=True)
@@ -130,14 +138,33 @@ def fetch_symbols():
         return []
 
 
+def log_stats(force=False):
+    global last_stats_log
+    now = time.time()
+    if not force and now - last_stats_log < 30:
+        return
+    with stats_lock:
+        elapsed = max(now - stats_started_at, 1.0)
+        print(
+            f"[stats] ws_messages={ws_messages} pipe_writes={pipe_writes} "
+            f"uptime_sec={elapsed:.0f}",
+            flush=True,
+        )
+        last_stats_log = now
+
+
 def on_message(ws, message):
+    global ws_messages
     try:
         msg = json.loads(message)
         trade = msg.get("data", msg)
         if "p" in trade and "s" in trade:
             symbol = trade["s"]
             price = float(trade["p"])
+            with stats_lock:
+                ws_messages += 1
             write_price(symbol, price)
+            log_stats()
     except Exception as e:
         print(f"[ws] handle message error: {e}", flush=True)
 
