@@ -23,8 +23,6 @@
 #include <utility>
 #include <vector>
 
-#include <curl/curl.h>
-
 #include "indicators.h"
 
 using json = nlohmann::json;
@@ -401,49 +399,13 @@ void run_detection() {
 }
 
 std::vector<std::string> fetch_top_symbols(double min_vol = 80000000.0) {
-    CURL* curl = curl_easy_init();
-    std::vector<std::string> result;
-
-    if (curl) {
-        std::string response;
-        curl_easy_setopt(curl, CURLOPT_URL, "https://fapi.binance.com/fapi/v1/ticker/24hr");
-        curl_easy_setopt(
-            curl,
-            CURLOPT_WRITEFUNCTION,
-            [](void* contents, size_t size, size_t nmemb, std::string* output) -> size_t {
-                size_t total = size * nmemb;
-                output->append(static_cast<char*>(contents), total);
-                return total;
-            });
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-
-        CURLcode res = curl_easy_perform(curl);
-        if (res == CURLE_OK) {
-            try {
-                auto data = json::parse(response);
-                for (const auto& item : data) {
-                    std::string sym = item.value("symbol", "");
-                    if (sym.size() <= 4) continue;
-                    if (sym.compare(sym.size() - 4, 4, "USDT") != 0) continue;
-                    if (sym.find('_') != std::string::npos) continue;
-
-                    double vol = item.contains("quoteVolume") ? json_to_double(item["quoteVolume"]) : 0.0;
-                    if (vol >= min_vol) result.push_back(sym);
-                }
-            } catch (const std::exception& e) {
-                spdlog::warn("fetch symbols parse failed: {}", e.what());
-            }
-        } else {
-            spdlog::warn("fetch symbols request failed: {}", curl_easy_strerror(res));
-        }
-
-        curl_easy_cleanup(curl);
-    }
-
-    if (result.empty()) {
-        result = {"BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "BNBUSDT"};
-    }
-
+    (void)min_vol;
+    std::vector<std::string> result = {
+        "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
+        "ADAUSDT", "AVAXUSDT", "LINKUSDT", "LTCUSDT", "BCHUSDT", "TRXUSDT",
+        "DOTUSDT", "UNIUSDT", "NEARUSDT", "APTUSDT", "ARBUSDT", "OPUSDT",
+        "FILUSDT", "ETCUSDT", "SUIUSDT", "WIFUSDT", "PEPEUSDT", "1000SHIBUSDT"
+    };
     spdlog::info("monitoring symbols: {}", result.size());
     return result;
 }

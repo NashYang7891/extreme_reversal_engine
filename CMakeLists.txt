@@ -7,7 +7,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(Boost REQUIRED COMPONENTS system)
 find_package(nlohmann_json REQUIRED)
 find_package(spdlog REQUIRED)
-find_package(CURL REQUIRED)
 find_package(OpenSSL REQUIRED)
 
 add_executable(engine
@@ -23,7 +22,6 @@ target_link_libraries(engine
     Boost::system
     nlohmann_json::nlohmann_json
     spdlog::spdlog
-    CURL::libcurl
     OpenSSL::SSL
     OpenSSL::Crypto
     pthread
