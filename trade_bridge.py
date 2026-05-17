@@ -17,11 +17,14 @@ PIPE_PATH = "/tmp/price_pipe"
 PIPE_OPEN_RETRY_SEC = 1.0
 PIPE_REOPEN_LOCK = threading.Lock()
 PIPE_WAIT_LOG_EVERY = 10
+WS_NO_MESSAGE_TIMEOUT_SEC = 20
+STREAM_MODES = ("aggTrade", "trade", "markPrice")
 
 pipe_fd = None
 stats_lock = threading.Lock()
 stats_started_at = time.time()
 last_stats_log = stats_started_at
+last_ws_message_at = stats_started_at
 ws_messages = 0
 pipe_writes = 0
 non_trade_messages = 0
@@ -148,15 +151,17 @@ def log_stats(force=False):
         elapsed = max(now - stats_started_at, 1.0)
         print(
             f"[stats] ws_messages={ws_messages} pipe_writes={pipe_writes} "
-            f"non_trade_messages={non_trade_messages} uptime_sec={elapsed:.0f}",
+            f"non_trade_messages={non_trade_messages} "
+            f"idle_sec={now - last_ws_message_at:.0f} uptime_sec={elapsed:.0f}",
             flush=True,
         )
         last_stats_log = now
 
 
 def on_message(ws, message):
-    global ws_messages, non_trade_messages
+    global ws_messages, non_trade_messages, last_ws_message_at
     try:
+        last_ws_message_at = time.time()
         msg = json.loads(message)
         trade = msg.get("data", msg)
         if "p" in trade and "s" in trade:
@@ -182,12 +187,31 @@ def on_error(ws, error):
 
 def on_close(ws, close_status_code, close_msg):
     print(f"[ws] closed code={close_status_code} msg={close_msg}, reconnect in 5s...", flush=True)
-    time.sleep(5)
-    connect_and_run()
 
 
-def on_open(ws, stream_count):
-    print(f"[ws] connected combined streams: {stream_count}", flush=True)
+def on_open(ws, stream_count, mode):
+    global last_ws_message_at
+    last_ws_message_at = time.time()
+    print(f"[ws] connected combined streams: {stream_count} mode={mode}", flush=True)
+
+
+def stream_name(symbol, mode):
+    if mode == "markPrice":
+        return f"{symbol.lower()}@markPrice@1s"
+    return f"{symbol.lower()}@{mode}"
+
+
+def no_message_watchdog(ws, mode):
+    while True:
+        time.sleep(5)
+        idle = time.time() - last_ws_message_at
+        if idle >= WS_NO_MESSAGE_TIMEOUT_SEC:
+            print(f"[ws] no messages for {idle:.0f}s on mode={mode}, switching stream mode", flush=True)
+            try:
+                ws.close()
+            except Exception as e:
+                print(f"[ws] watchdog close failed: {e}", flush=True)
+            return
 
 
 def connect_and_run():
@@ -195,20 +219,24 @@ def connect_and_run():
     if not symbols:
         print("[ws] no symbols fetched, retry in 10s", flush=True)
         time.sleep(10)
-        connect_and_run()
-        return
+        return False
 
-    streams = [f"{s.lower()}@aggTrade" for s in symbols[:200]]
-    print(f"[ws] monitoring {len(streams)} symbols, start bridging trades", flush=True)
-    ws_url = "wss://fstream.binance.com/stream?streams=" + "/".join(streams)
-    ws = websocket.WebSocketApp(
-        ws_url,
-        on_open=lambda ws: on_open(ws, len(streams)),
-        on_message=on_message,
-        on_error=on_error,
-        on_close=on_close,
-    )
-    ws.run_forever(ping_interval=30, ping_timeout=10)
+    for mode in STREAM_MODES:
+        streams = [stream_name(symbol, mode) for symbol in symbols[:200]]
+        print(f"[ws] monitoring {len(streams)} symbols, start bridging trades mode={mode}", flush=True)
+        ws_url = "wss://fstream.binance.com/stream?streams=" + "/".join(streams)
+        ws = websocket.WebSocketApp(
+            ws_url,
+            on_open=lambda ws, mode=mode: on_open(ws, len(streams), mode),
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
+        )
+        threading.Thread(target=no_message_watchdog, args=(ws, mode), daemon=True).start()
+        ws.run_forever(ping_interval=30, ping_timeout=10)
+        time.sleep(5)
+
+    return True
 
 
 def stats_heartbeat():
@@ -218,6 +246,10 @@ def stats_heartbeat():
 
 
 if __name__ == "__main__":
+    if os.getenv("WS_TRACE", "").lower() in ("1", "true", "yes"):
+        websocket.enableTrace(True)
     ensure_pipe_connected()
     threading.Thread(target=stats_heartbeat, daemon=True).start()
-    connect_and_run()
+    while True:
+        connect_and_run()
+        time.sleep(5)
