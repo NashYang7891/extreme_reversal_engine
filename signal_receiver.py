@@ -14,6 +14,7 @@ TG_TOKEN = os.getenv("TG_BOT_TOKEN")
 TG_CHAT = "5372217316"
 MIN_24H_VOLUME = 80000000
 SYMBOLS_PATH = Path(os.getenv("SYMBOLS_PATH", "/tmp/extreme_reversal_symbols.json"))
+ENGINE_SIGNAL_PIPE = os.getenv("ENGINE_SIGNAL_PIPE", "/tmp/engine_signals")
 
 exchange = ccxt.binance({
     'apiKey': API_KEY,
@@ -109,19 +110,37 @@ def send_tg(msg):
         print(f"TG推送失败: {e}")
 
 def send_feedback_to_cpp(symbol, side, pnl_percent):
-    """非阻塞写入反馈管道，避免因C++未读取而阻塞"""
+    return
+
+def forward_process_output(proc):
+    if proc.stdout is None:
+        return
+    for line in proc.stdout:
+        print(f"C++: {line.rstrip()}")
+
+def iter_engine_signal_lines(proc):
+    fd = os.open(ENGINE_SIGNAL_PIPE, os.O_RDONLY | os.O_NONBLOCK)
+    buffer = ""
     try:
-        fifo_path = "/tmp/quant_feedback"
-        if not os.path.exists(fifo_path):
-            os.mkfifo(fifo_path)
-        fd = os.open(fifo_path, os.O_WRONLY | os.O_NONBLOCK)
-        msg = json.dumps({"symbol": symbol, "side": side, "pnl": pnl_percent}) + "\n"
-        os.write(fd, msg.encode())
+        while proc.poll() is None:
+            try:
+                chunk = os.read(fd, 65536)
+            except BlockingIOError:
+                yield None
+                time.sleep(0.2)
+                continue
+
+            if not chunk:
+                yield None
+                time.sleep(0.2)
+                continue
+
+            buffer += chunk.decode("utf-8", errors="replace")
+            while "\n" in buffer:
+                line, buffer = buffer.split("\n", 1)
+                yield line
+    finally:
         os.close(fd)
-    except BlockingIOError:
-        pass  # 管道满，丢弃反馈
-    except Exception as e:
-        print(f"反馈发送失败: {e}")
 
 def is_quiet_period():
     now = datetime.now(timezone.utc)
@@ -548,25 +567,33 @@ def main():
     sync_positions_on_start()
     send_tg("🤖 引擎已启动 | 杠杆5倍/30U | 跟踪止盈3.5/1.5U | 延迟15分钟+盈利≥3%开仓 | 在线学习反馈已启用")
 
+    if os.path.exists(ENGINE_SIGNAL_PIPE):
+        os.remove(ENGINE_SIGNAL_PIPE)
+    os.mkfifo(ENGINE_SIGNAL_PIPE)
+
     proc = subprocess.Popen([engine_path], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     print(f"[diag] engine pid={proc.pid} started: {engine_path}")
+    threading.Thread(target=forward_process_output, args=(proc,), daemon=True).start()
     main.last_trail_check = 0
 
-    for line in proc.stdout:
+    print(f"[diag] reading engine signals from {ENGINE_SIGNAL_PIPE}")
+
+    for line in iter_engine_signal_lines(proc):
+        now = time.time()
+        if now - main.last_trail_check > 30:
+            check_and_trail_positions()
+            main.last_trail_check = now
+        if line is None:
+            continue
         line = line.strip()
         if not line: continue
         if "ML:" in line or "成功率" in line:
             send_tg(f"🧠 {line.strip()}")
         try:
             msg = json.loads(line)
-        except Exception:
-            print("C++:", line)
+        except Exception as e:
+            print(f"[signals] invalid json: {e} line={line[:200]}")
             continue
-
-        now = time.time()
-        if now - main.last_trail_check > 30:
-            check_and_trail_positions()
-            main.last_trail_check = now
 
         t = msg.get("type", "")
         sym = msg.get("symbol", "")

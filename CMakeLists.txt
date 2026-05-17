@@ -11,10 +11,7 @@ find_package(OpenSSL REQUIRED)
 
 add_executable(engine
     main.cpp
-    orderbook.cpp
     indicators.cpp
-    signal_detector.cpp
-    ml_optimizer.cpp
 )
 
 target_link_libraries(engine

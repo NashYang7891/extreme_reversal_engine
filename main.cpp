@@ -3,11 +3,21 @@
 
 #include <algorithm>
 #include <atomic>
+#include <boost/asio/connect.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio/ssl.hpp>
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <boost/beast/ssl.hpp>
+#include <boost/beast/websocket.hpp>
+#include <boost/beast/websocket/ssl.hpp>
 #include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <cctype>
 #include <deque>
 #include <fcntl.h>
 #include <iostream>
@@ -16,6 +26,7 @@
 #include <mutex>
 #include <fstream>
 #include <shared_mutex>
+#include <sstream>
 #include <string>
 #include <sys/stat.h>
 #include <thread>
@@ -24,15 +35,25 @@
 #include <utility>
 #include <vector>
 
+#include <openssl/err.h>
+
 #include "indicators.h"
 
 using json = nlohmann::json;
+namespace beast = boost::beast;
+namespace websocket = beast::websocket;
+namespace net = boost::asio;
+namespace ssl = net::ssl;
+using tcp = net::ip::tcp;
 
 std::atomic<bool> keep_running{true};
 std::atomic<uint64_t> price_updates_received{0};
 std::atomic<uint64_t> price_updates_applied{0};
 std::atomic<uint64_t> price_updates_unknown_symbol{0};
 std::atomic<uint64_t> price_bad_messages{0};
+std::atomic<uint64_t> ws_messages_received{0};
+std::atomic<uint64_t> signal_messages_written{0};
+std::atomic<uint64_t> signal_write_failures{0};
 std::atomic<uint64_t> a_active_signals{0};
 std::atomic<uint64_t> breakout_signals{0};
 
@@ -134,37 +155,27 @@ struct SymbolContext {
 
 std::map<std::string, SymbolContext> contexts;
 std::shared_mutex contexts_mutex;
+std::mutex signal_pipe_mutex;
+int signal_pipe_fd = -1;
 
-bool open_read_fifo(const char* pipe_path, int& fd) {
+bool open_write_fifo(const char* pipe_path, int& fd) {
     mkfifo(pipe_path, 0666);
-    fd = open(pipe_path, O_RDONLY);
+    fd = open(pipe_path, O_WRONLY | O_NONBLOCK);
     if (fd == -1) {
-        spdlog::warn("FIFO open failed [{}]: {}", pipe_path, std::strerror(errno));
-        sleep(1);
+        if (errno != ENXIO && errno != ENOENT) {
+            spdlog::warn("signal FIFO open failed [{}]: {}", pipe_path, std::strerror(errno));
+        }
         return false;
     }
-    spdlog::info("FIFO reader connected [{}]", pipe_path);
+    spdlog::info("signal FIFO writer connected [{}]", pipe_path);
     return true;
 }
 
-bool read_fifo_chunk(int fd, const char* pipe_path, char* buf, size_t buf_size, ssize_t& n) {
-    n = read(fd, buf, buf_size - 1);
-    if (n > 0) {
-        buf[n] = '\0';
-        return true;
+void close_signal_pipe() {
+    if (signal_pipe_fd != -1) {
+        close(signal_pipe_fd);
+        signal_pipe_fd = -1;
     }
-
-    if (n == 0) {
-        spdlog::warn("FIFO writer disconnected [{}], reopening", pipe_path);
-        return false;
-    }
-
-    if (errno == EINTR) {
-        return true;
-    }
-
-    spdlog::warn("FIFO read failed [{}]: {}", pipe_path, std::strerror(errno));
-    return false;
 }
 
 double json_to_double(const json& value, double fallback = 0.0) {
@@ -176,150 +187,131 @@ double json_to_double(const json& value, double fallback = 0.0) {
     return fallback;
 }
 
-void price_pipe_reader() {
-    const char* pipe_path = "/tmp/price_pipe";
-    while (keep_running) {
-        int fd = -1;
-        if (!open_read_fifo(pipe_path, fd)) continue;
+bool write_signal_message(const json& message) {
+    const char* pipe_path = "/tmp/engine_signals";
+    std::string payload = message.dump() + "\n";
+    std::lock_guard<std::mutex> lock(signal_pipe_mutex);
 
-        char buf[4096];
-        std::string leftover;
-        while (keep_running) {
-            ssize_t n = 0;
-            if (!read_fifo_chunk(fd, pipe_path, buf, sizeof(buf), n)) break;
-            if (n <= 0) continue;
+    if (signal_pipe_fd == -1 && !open_write_fifo(pipe_path, signal_pipe_fd)) {
+        signal_write_failures.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
 
-            std::string data = leftover + std::string(buf, static_cast<size_t>(n));
-            size_t pos = 0;
-            while ((pos = data.find('\n')) != std::string::npos) {
-                std::string line = data.substr(0, pos);
-                data.erase(0, pos + 1);
-                if (line.empty()) continue;
+    ssize_t written = write(signal_pipe_fd, payload.data(), payload.size());
+    if (written == static_cast<ssize_t>(payload.size())) {
+        signal_messages_written.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
 
-                try {
-                    json j = json::parse(line);
-                    if (!j.contains("symbol") || !j.contains("price")) continue;
+    signal_write_failures.fetch_add(1, std::memory_order_relaxed);
+    close_signal_pipe();
+    return false;
+}
 
-                    std::string sym = j.value("symbol", "");
-                    double price = json_to_double(j["price"]);
-                    if (sym.empty() || price <= 0.0) continue;
-                    price_updates_received.fetch_add(1, std::memory_order_relaxed);
+void apply_price_update(const std::string& sym, double price) {
+    if (sym.empty() || price <= 0.0) return;
+    price_updates_received.fetch_add(1, std::memory_order_relaxed);
 
-                    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                      std::chrono::system_clock::now().time_since_epoch())
-                                      .count();
+    auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                      std::chrono::system_clock::now().time_since_epoch())
+                      .count();
 
-                    std::unique_lock<std::shared_mutex> lock(contexts_mutex);
-                    auto it = contexts.find(sym);
-                    if (it != contexts.end()) {
-                        it->second.indicators.update(price);
-                        it->second.kline_mgr.update(price, now_ms);
-                        price_updates_applied.fetch_add(1, std::memory_order_relaxed);
-                    } else {
-                        price_updates_unknown_symbol.fetch_add(1, std::memory_order_relaxed);
-                    }
-                } catch (const std::exception& e) {
-                    price_bad_messages.fetch_add(1, std::memory_order_relaxed);
-                    spdlog::warn("price_pipe bad message: {}", e.what());
-                }
-            }
-
-            leftover = data;
-            if (leftover.size() > 8192) leftover.clear();
-        }
-
-        close(fd);
-        sleep(1);
+    std::unique_lock<std::shared_mutex> lock(contexts_mutex);
+    auto it = contexts.find(sym);
+    if (it != contexts.end()) {
+        it->second.indicators.update(price);
+        it->second.kline_mgr.update(price, now_ms);
+        price_updates_applied.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        price_updates_unknown_symbol.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
-void trade_metrics_reader() {
-    const char* pipe_path = "/tmp/trade_metrics_pipe";
-    while (keep_running) {
-        int fd = -1;
-        if (!open_read_fifo(pipe_path, fd)) continue;
+std::string build_stream_path(const std::vector<std::string>& symbols, const std::string& mode) {
+    std::ostringstream path;
+    path << "/stream?streams=";
+    for (size_t i = 0; i < symbols.size(); ++i) {
+        if (i > 0) path << "/";
+        std::string lower = symbols[i];
+        std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+        path << lower << "@" << mode;
+    }
+    return path.str();
+}
 
-        char buf[4096];
-        std::string leftover;
-        while (keep_running) {
-            ssize_t n = 0;
-            if (!read_fifo_chunk(fd, pipe_path, buf, sizeof(buf), n)) break;
-            if (n <= 0) continue;
+bool handle_market_message(const std::string& payload) {
+    try {
+        json msg = json::parse(payload);
+        json data = msg.value("data", msg);
+        if (!data.contains("s") || !data.contains("p")) return false;
 
-            std::string data = leftover + std::string(buf, static_cast<size_t>(n));
-            size_t pos = 0;
-            while ((pos = data.find('\n')) != std::string::npos) {
-                std::string line = data.substr(0, pos);
-                data.erase(0, pos + 1);
-                if (line.empty()) continue;
-
-                try {
-                    json j = json::parse(line);
-                    std::string sym = j.value("symbol", "");
-                    if (sym.empty()) continue;
-
-                    int active_buy = j.value("active_buy_count", 0);
-                    double large_ratio = j.value("large_buy_ratio", 0.0);
-                    double buy_ratio = j.value("active_buy_ratio", 0.0);
-
-                    std::unique_lock<std::shared_mutex> lock(contexts_mutex);
-                    auto it = contexts.find(sym);
-                    if (it != contexts.end()) {
-                        it->second.active_buy_count = active_buy;
-                        it->second.large_buy_ratio = large_ratio;
-                        it->second.active_buy_ratio = buy_ratio;
-                    }
-                } catch (const std::exception& e) {
-                    spdlog::warn("trade_metrics bad message: {}", e.what());
-                }
-            }
-
-            leftover = data;
-            if (leftover.size() > 8192) leftover.clear();
-        }
-
-        close(fd);
-        sleep(1);
+        std::string symbol = data.value("s", "");
+        double price = json_to_double(data["p"]);
+        apply_price_update(symbol, price);
+        ws_messages_received.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    } catch (const std::exception& e) {
+        price_bad_messages.fetch_add(1, std::memory_order_relaxed);
+        spdlog::warn("market message parse failed: {}", e.what());
+        return false;
     }
 }
 
-void feedback_listener() {
-    const char* fifo_path = "/tmp/quant_feedback";
+void run_binance_stream_once(const std::vector<std::string>& symbols, const std::string& mode) {
+    net::io_context ioc;
+    ssl::context ctx(ssl::context::tlsv12_client);
+    ctx.set_default_verify_paths();
+
+    tcp::resolver resolver(ioc);
+    websocket::stream<beast::ssl_stream<tcp::socket>> ws(ioc, ctx);
+    const std::string host = "fstream.binance.com";
+    const std::string port = "443";
+    const std::string target = build_stream_path(symbols, mode);
+
+    if (!SSL_set_tlsext_host_name(ws.next_layer().native_handle(), host.c_str())) {
+        beast::error_code ec{static_cast<int>(::ERR_get_error()), net::error::get_ssl_category()};
+        throw beast::system_error{ec};
+    }
+
+    auto const results = resolver.resolve(host, port);
+    net::connect(beast::get_lowest_layer(ws), results);
+    ws.next_layer().handshake(ssl::stream_base::client);
+    ws.set_option(websocket::stream_base::decorator([](websocket::request_type& req) {
+        req.set(beast::http::field::user_agent, "extreme-reversal-engine");
+    }));
+    ws.handshake(host, target);
+
+    spdlog::info("Binance stream connected mode={} symbols={}", mode, symbols.size());
+
+    beast::flat_buffer buffer;
     while (keep_running) {
-        int fd = -1;
-        if (!open_read_fifo(fifo_path, fd)) continue;
+        buffer.clear();
+        ws.read(buffer);
+        handle_market_message(beast::buffers_to_string(buffer.data()));
+    }
 
-        char buf[1024];
-        std::string leftover;
-        while (keep_running) {
-            ssize_t n = 0;
-            if (!read_fifo_chunk(fd, fifo_path, buf, sizeof(buf), n)) break;
-            if (n <= 0) continue;
+    beast::error_code ec;
+    ws.close(websocket::close_code::normal, ec);
+}
 
-            std::string data = leftover + std::string(buf, static_cast<size_t>(n));
-            size_t pos = 0;
-            while ((pos = data.find('\n')) != std::string::npos) {
-                std::string line = data.substr(0, pos);
-                data.erase(0, pos + 1);
-                if (line.empty()) continue;
-
-                try {
-                    json j = json::parse(line);
-                    std::string sym = j.value("symbol", "");
-                    std::string side = j.value("side", "");
-                    double pnl = j.value("pnl", 0.0);
-                    spdlog::info("feedback received: {} {} pnl={:.2f}%", sym, side, pnl);
-                } catch (const std::exception& e) {
-                    spdlog::warn("feedback bad message: {}", e.what());
-                }
+void market_data_loop(std::vector<std::string> symbols) {
+    const std::vector<std::string> modes = {"aggTrade", "trade", "markPrice@1s"};
+    while (keep_running) {
+        for (const auto& mode : modes) {
+            uint64_t before = ws_messages_received.load(std::memory_order_relaxed);
+            try {
+                run_binance_stream_once(symbols, mode);
+            } catch (const std::exception& e) {
+                spdlog::warn("Binance stream error mode={}: {}", mode, e.what());
             }
 
-            leftover = data;
-            if (leftover.size() > 8192) leftover.clear();
+            uint64_t after = ws_messages_received.load(std::memory_order_relaxed);
+            if (after > before) break;
+            spdlog::warn("Binance stream mode={} produced no messages, trying fallback", mode);
+            std::this_thread::sleep_for(std::chrono::seconds(3));
         }
-
-        close(fd);
-        sleep(1);
     }
 }
 
@@ -350,7 +342,7 @@ void check_active_layer(SymbolContext& ctx, const std::string& sym, int64_t now_
     }
 
     a_active_signals.fetch_add(1, std::memory_order_relaxed);
-    std::cout << a_msg.dump() << std::endl;
+    write_signal_message(a_msg);
 }
 
 void run_detection() {
@@ -397,7 +389,7 @@ void run_detection() {
                         b_msg["stop_loss"] = p * 1.02;
                     }
 
-                    std::cout << b_msg.dump() << std::endl;
+                    write_signal_message(b_msg);
                     breakout_signals.fetch_add(1, std::memory_order_relaxed);
                 } catch (const std::exception& e) {
                     spdlog::warn("detection error [{}]: {}", sym, e.what());
@@ -462,29 +454,29 @@ int main() {
     }
     spdlog::info("engine initialized, symbols={}", symbols.size());
 
-    std::thread price_thread(price_pipe_reader);
-    std::thread metrics_thread(trade_metrics_reader);
-    std::thread feedback_thread(feedback_listener);
+    std::thread market_thread(market_data_loop, symbols);
     std::thread detect_thread(run_detection);
-    spdlog::info("all threads started");
+    spdlog::info("market data and detection threads started");
 
     while (keep_running) {
         std::this_thread::sleep_for(std::chrono::seconds(30));
         std::shared_lock<std::shared_mutex> lock(contexts_mutex);
         spdlog::info(
-            "heartbeat, symbols={}, price_received={}, price_applied={}, unknown_symbol={}, bad_price_msg={}, a_active={}, breakout={}",
+            "heartbeat, symbols={}, ws_messages={}, price_received={}, price_applied={}, unknown_symbol={}, bad_price_msg={}, a_active={}, breakout={}, signals_written={}, signal_write_failures={}",
             contexts.size(),
+            ws_messages_received.load(std::memory_order_relaxed),
             price_updates_received.load(std::memory_order_relaxed),
             price_updates_applied.load(std::memory_order_relaxed),
             price_updates_unknown_symbol.load(std::memory_order_relaxed),
             price_bad_messages.load(std::memory_order_relaxed),
             a_active_signals.load(std::memory_order_relaxed),
-            breakout_signals.load(std::memory_order_relaxed));
+            breakout_signals.load(std::memory_order_relaxed),
+            signal_messages_written.load(std::memory_order_relaxed),
+            signal_write_failures.load(std::memory_order_relaxed));
     }
 
-    if (price_thread.joinable()) price_thread.join();
-    if (metrics_thread.joinable()) metrics_thread.join();
-    if (feedback_thread.joinable()) feedback_thread.join();
+    if (market_thread.joinable()) market_thread.join();
     if (detect_thread.joinable()) detect_thread.join();
+    close_signal_pipe();
     return 0;
 }
