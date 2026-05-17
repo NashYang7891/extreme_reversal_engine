@@ -19,6 +19,7 @@ exchange = ccxt.binance({
     'enableRateLimit': True,
     'options': {'defaultType': 'future'},
 })
+exchange.options['warnOnFetchOpenOrdersWithoutSymbol'] = False
 
 LEVERAGE = 5
 ORDER_USDT = 30.0
@@ -163,7 +164,15 @@ def sync_positions_on_start():
                     last_b_signal[symbol] = time.time()
                     print(f"📥 恢复持仓: {symbol} {side} @ {entry_price:.6f} Qty:{amount}")
 
-        orders = exchange.fetch_open_orders()
+        orders = []
+        if live_positions:
+            for sym in live_positions:
+                try:
+                    sym_orders = exchange.fetch_open_orders(sym)
+                    if sym_orders:
+                        orders.extend(sym_orders)
+                except Exception as e:
+                    print(f"⚠ 拉取 {sym} 挂单失败: {e}")
         for order in orders:
             sym = order.get('symbol')
             if order.get('type') == 'STOP_MARKET' and order.get('reduceOnly') and sym in positions:

@@ -16,6 +16,7 @@ PIPE_PATH = "/tmp/price_pipe"
 # FIFO 重连参数
 PIPE_OPEN_RETRY_SEC = 1.0
 PIPE_REOPEN_LOCK = threading.Lock()
+PIPE_WAIT_LOG_EVERY = 10
 
 pipe_fd = None
 
@@ -51,6 +52,7 @@ def init_pipe_blocking():
     - 结合重试循环实现启动自恢复。
     """
     global pipe_fd
+    wait_count = 0
     while True:
         try:
             ensure_fifo_exists()
@@ -59,7 +61,12 @@ def init_pipe_blocking():
             print(f"[pipe] writer connected: {PIPE_PATH}", flush=True)
             return
         except Exception as e:
-            print(f"[pipe] open failed, retry in {PIPE_OPEN_RETRY_SEC:.1f}s: {e}", flush=True)
+            wait_count += 1
+            if wait_count == 1 or wait_count % PIPE_WAIT_LOG_EVERY == 0:
+                print(
+                    f"[pipe] waiting reader... retry {wait_count}, interval {PIPE_OPEN_RETRY_SEC:.1f}s, err={e}",
+                    flush=True,
+                )
             time.sleep(PIPE_OPEN_RETRY_SEC)
 
 
