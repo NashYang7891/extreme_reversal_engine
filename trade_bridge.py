@@ -12,6 +12,12 @@ import websocket
 # 配置
 MIN_24H_VOLUME = 80000000
 PIPE_PATH = "/tmp/price_pipe"
+FIXED_SYMBOLS = (
+    "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT",
+    "ADAUSDT", "AVAXUSDT", "LINKUSDT", "LTCUSDT", "BCHUSDT", "TRXUSDT",
+    "DOTUSDT", "UNIUSDT", "NEARUSDT", "APTUSDT", "ARBUSDT", "OPUSDT",
+    "FILUSDT", "ETCUSDT", "SUIUSDT", "WIFUSDT", "PEPEUSDT", "1000SHIBUSDT",
+)
 
 # FIFO 重连参数
 PIPE_OPEN_RETRY_SEC = 1.0
@@ -123,6 +129,11 @@ def write_price(symbol, price):
 
 
 def fetch_symbols():
+    print(f"[ws] using fixed symbol list aligned with engine: {len(FIXED_SYMBOLS)}", flush=True)
+    return list(FIXED_SYMBOLS)
+
+
+def fetch_symbols_from_binance():
     url = "https://fapi.binance.com/fapi/v1/ticker/24hr"
     try:
         resp = requests.get(url, timeout=10)
