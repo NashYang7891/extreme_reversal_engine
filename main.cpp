@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <curl/curl.h>          // 必须添加这一行
 #include "indicators.h"
 
 using json = nlohmann::json;
@@ -92,7 +93,7 @@ public:
 // ---------- 上下文 ----------
 struct SymbolContext {
     Indicators indicators;
-    KLineManager kline_mgr{300};  // 5分钟K线
+    KLineManager kline_mgr{300};   // 改为5分钟（300秒）
     int64_t last_breakout_kline_ts{0};
     // 成交指标字段（从 trade_metrics_pipe 读取）
     std::atomic<int> active_buy_count{0};
@@ -254,18 +255,19 @@ void run_detection() {
     }
 }
 
-// ---------- 获取监控币种 ----------
+// ---------- 获取监控币种（使用 curl）----------
 std::vector<std::string> fetch_top_symbols(double min_vol = 80000000.0) {
     CURL *curl = curl_easy_init();
     std::vector<std::string> result;
     if (curl) {
         std::string response;
         curl_easy_setopt(curl, CURLOPT_URL, "https://fapi.binance.com/fapi/v1/ticker/24hr");
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, [](void* contents, size_t size, size_t nmemb, std::string* s) -> size_t {
-            size_t total = size * nmemb;
-            s->append((char*)contents, total);
-            return total;
-        });
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION,
+            [](void* contents, size_t size, size_t nmemb, std::string* s) -> size_t {
+                size_t total = size * nmemb;
+                s->append((char*)contents, total);
+                return total;
+            });
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
         CURLcode res = curl_easy_perform(curl);
         if (res == CURLE_OK) {
@@ -282,9 +284,15 @@ std::vector<std::string> fetch_top_symbols(double min_vol = 80000000.0) {
         }
         curl_easy_cleanup(curl);
     }
+    // 如果获取失败（结果为空），返回一个兜底列表
+    if (result.empty()) {
+        result = {"BTCUSDT","ETHUSDT","SOLUSDT","XRPUSDT","DOGEUSDT","BNBUSDT"};
+    }
+    spdlog::info("监控币种数量: {}", result.size());
     return result;
 }
 
+// ---------- 主函数 ----------
 int main() {
     setvbuf(stdout, NULL, _IONBF, 0);
     std::cout.setf(std::ios::unitbuf);
